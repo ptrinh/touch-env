@@ -115,9 +115,18 @@ If you use Claude Code, also add `"touchenv *"` to `sandbox.excludedCommands` in
 - **The intent is what the asker says about itself.** Anyone can write anything there. Open **More detail** and
   check the command.
 - **Your keys stay on your Mac** unless you add `--sync`. touch-env itself has no internet access.
-- **Synced keys are protected a little differently.** iCloud Keychain does not accept the "ask for Touch ID on every
-  read" lock that macOS puts on local keys. Only touchenv can read a synced key, and touchenv always asks for your
-  finger first, but the lock is touchenv's, not the Mac's. Apple encrypts synced keys end to end.
+- **Synced keys are weaker than local keys.** iCloud Keychain does not accept the "ask for Touch ID on every read"
+  lock that macOS puts on local keys, so for a synced key the only lock is touchenv asking for your finger.
+
+  | If… | Local key | Synced key (`--sync`) |
+  |---|---|---|
+  | Ordinary malware runs as you (no admin rights) | Safe | Safe: only the signed touchenv can open it, and touchenv asks first |
+  | An attacker gets admin rights and turns off macOS protections (SIP), or uses a macOS bug | Still asks for your finger: the Mac's security chip enforces it | **Can be read without your finger**, by tampering with touchenv |
+  | Another Mac on your Apple Account is hacked | Not there | **Exposed**: the key is on every Mac you sync to |
+  | You approve a command | That command gets the key | Same |
+
+  Apple encrypts synced keys end to end. Keep your most important keys (signing keys, cloud admin tokens) local, and
+  use `--sync` only for keys you'd rather have on every Mac than guard to the last line.
 - **No Touch ID?** Your Mac asks for your login password instead.
 - **Other apps can't see the keys at all.** Not even Apple's own `security` tool can read them. There is also no
   "Always Allow" button you could click by mistake.
