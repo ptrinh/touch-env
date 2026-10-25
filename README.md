@@ -2,12 +2,10 @@
 
 **Lock your passwords and API keys behind your fingerprint, so AI agents can't read them without your touch.**
 
-Each time something needs one of your secrets, your Mac shows this:
+<p align="center"><img src="docs/touch-id-prompt.png" width="260" alt="Touch ID prompt: touchenv is trying to give Claude Code the secret OPENAI_API_KEY for the command: python3 report.py"></p>
 
-> **give Claude Code the secret OPENAI_API_KEY for the command: python report.py**
-> 👆 Touch ID
-
-Touch the sensor and that one command gets the key. Don't touch, and nobody gets it.
+Each time something needs one of your secrets, your Mac shows this. Touch the sensor and that one command gets the
+key. Don't touch, and nobody gets it.
 
 ## Why
 
@@ -32,7 +30,14 @@ touch-env works like a **hardware security key for your secrets**:
 
 ## Install
 
-You need macOS 13 or later.
+You need macOS 13 or later. With [Homebrew](https://brew.sh):
+
+```sh
+brew install --cask ptrinh/tap/touchenv
+touchenv --version
+```
+
+<details><summary>Without Homebrew</summary>
 
 1. Download `touchenv-…-macos.zip` from [Releases](https://github.com/ptrinh/touch-env/releases/latest).
 2. Open **Terminal** and paste:
@@ -45,6 +50,8 @@ You need macOS 13 or later.
    ```
 
 3. Open a new Terminal window and check that it works: `touchenv --version`
+
+</details>
 
 ## Use
 

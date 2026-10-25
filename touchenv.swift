@@ -20,7 +20,7 @@ import Foundation
 import LocalAuthentication
 import Security
 
-let version = "1.0.0"
+let version = "1.0.1"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -41,10 +41,28 @@ func die(_ message: String, _ code: Int32 = 1) -> Never {
 
 // MARK: Who is asking
 
+/// The name the process was started as (argv[0]), not its file name: Claude Code's file is named after its
+/// version (…/claude/versions/2.1.310) but it runs as "claude". Falls back to the file name.
 func executableName(_ pid: pid_t) -> String? {
-    var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-    guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
-    return URL(fileURLWithPath: String(cString: buffer)).lastPathComponent
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = 0
+    if sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size {
+        var buffer = [UInt8](repeating: 0, count: size)
+        if sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 {
+            // Layout: argc (Int32), the executable path, NUL padding, then argv[0].
+            var i = MemoryLayout<Int32>.size
+            while i < size && buffer[i] != 0 { i += 1 }
+            while i < size && buffer[i] == 0 { i += 1 }
+            var end = i
+            while end < size && buffer[end] != 0 { end += 1 }
+            if end > i, let argv0 = String(bytes: buffer[i..<end], encoding: .utf8) {
+                return URL(fileURLWithPath: argv0).lastPathComponent
+            }
+        }
+    }
+    var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+    return URL(fileURLWithPath: String(cString: path)).lastPathComponent
 }
 
 func parentPid(_ pid: pid_t) -> pid_t? {
