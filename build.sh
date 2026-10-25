@@ -29,6 +29,8 @@ swiftc -O -target arm64-apple-macos13 touchenv.swift -o "$work/touchenv-arm64"
 swiftc -O -target x86_64-apple-macos13 touchenv.swift -o "$work/touchenv-x86_64"
 lipo -create "$work/touchenv-arm64" "$work/touchenv-x86_64" -output "$app/Contents/MacOS/touchenv"
 cp "$TOUCHENV_PROFILE" "$app/Contents/embedded.provisionprofile"
+mkdir -p "$app/Contents/Resources"
+cp Resources/* "$app/Contents/Resources/"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

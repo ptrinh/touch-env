@@ -2,7 +2,7 @@
 
 **Lock your passwords and API keys behind your fingerprint, so AI agents can't read them without your touch.**
 
-<p align="center"><img src="docs/touch-id-prompt.png" width="260" alt="Touch ID prompt: touchenv is trying to give Claude Code the secret OPENAI_API_KEY for the command: python3 report.py"></p>
+<p align="center"><img src="docs/touch-id-prompt.png" width="260" alt="Touch ID prompt: Allow Claude Code to access OPENAI_API_KEY? Intent: make the monthly sales report. More detail shows the command."></p>
 
 Each time something needs one of your secrets, your Mac shows this. Touch the sensor and that one command gets the
 key. Don't touch, and nobody gets it.
@@ -76,6 +76,13 @@ touchenv run OPENAI_API_KEY -- python report.py
 touchenv run MY_KEY:file -- fastlane beta     # :file means the command gets the key as a file path
 ```
 
+**Say why.** Add `--intent` and the prompt shows that line under the question. Click **More detail** in the
+prompt to see the exact command:
+
+```sh
+touchenv run --intent "make the monthly sales report" OPENAI_API_KEY -- python report.py
+```
+
 **Other commands:**
 
 | Command | What it does | Asks for Touch ID? |
@@ -89,7 +96,7 @@ touchenv run MY_KEY:file -- fastlane beta     # :file means the command gets the
 Add this line to your assistant's instructions, for example `CLAUDE.md` or `AGENTS.md`:
 
 > My secrets are in touchenv. Never read key files. To run a command that needs one, use
-> `touchenv run NAME -- <command>` and I'll approve it with Touch ID.
+> `touchenv run --intent "<why, in a few words>" NAME -- <command>` and I'll approve it with Touch ID.
 
 If you use Claude Code, also add `"touchenv *"` to `sandbox.excludedCommands` in `~/.claude/settings.json`.
 
@@ -97,6 +104,8 @@ If you use Claude Code, also add `"touchenv *"` to `sandbox.excludedCommands` in
 
 - **Read the prompt before you touch.** Once you approve, that command can use the key however it wants. If the
   command looks strange, don't touch.
+- **The intent is what the asker says about itself.** Anyone can write anything there. Open **More detail** and
+  check the command.
 - **Your keys never leave your Mac.** They are not synced to iCloud, and touch-env has no internet access.
 - **No Touch ID?** Your Mac asks for your login password instead.
 - **Other apps can't see the keys at all.** Not even Apple's own `security` tool can read them. There is also no
@@ -114,6 +123,10 @@ touch-env is one Swift file, [`touchenv.swift`](touchenv.swift).
 - They sit in a keychain access group that only the signed app holds. This is why it ships as a signed `.app` with a
   provisioning profile.
 - The prompt names the nearest parent process that isn't a shell.
+- The prompt is touchenv's own window with Apple's `LAAuthenticationView` inside it, so only a finger approves (there
+  is no Allow button). "Use Password…", or a Mac without Touch ID, falls back to the standard macOS dialog.
+- The Touch ID disc is the one macOS uses (LocalAuthenticationCoreUI). `Resources/` keeps a copy for when a
+  macOS release moves it.
 - `NAME:file` writes the key to a `0600` file in a private temp folder. The folder is deleted when the command ends.
 
 **Building it yourself** needs a paid Apple Developer account:

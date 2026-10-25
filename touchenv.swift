@@ -1,5 +1,6 @@
 // touchenv — secrets in the macOS Keychain, every read behind Touch ID (or the Mac password).
 //
+//   touchenv [cmd] --intent TEXT ...   one line on why, shown in the prompt (set, get, rm, run)
 //   touchenv set NAME          secret from stdin (typed with no echo, or piped: touchenv set NAME < file)
 //   touchenv get NAME          print the secret
 //   touchenv run NAME[:file] [NAME2[:file] ...] -- command args...
@@ -12,15 +13,19 @@
 // Items are generic passwords (service "touchenv") in the Data Protection keychain, in the keychain access group
 // the signed touchenv.app holds (its only keychain-access-groups entitlement), with a userPresence access control:
 // macOS itself asks for Touch ID (or the Mac password) on every read, this device only, never synced.
-// The Touch ID prompt names who asks (the nearest parent process that is not a shell), the secrets and the command.
+// The Touch ID prompt is touchenv's own window with the sensor embedded (LAAuthenticationView): who asks (the nearest
+// parent process that is not a shell), which secrets, the stated intent, and the command behind "More detail".
+// Without Touch ID, or on "Use Password…", the macOS dialog asks instead.
 // Build and sign with ./build.sh.
 
+import AppKit
 import Darwin
 import Foundation
 import LocalAuthentication
+import LocalAuthenticationEmbeddedUI
 import Security
 
-let version = "1.0.1"
+let version = "1.1.0"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -31,8 +36,10 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         the path of a private temp file, removed when CMD ends
   touchenv ls                           list names
   touchenv rm NAME                      delete
+
+  --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.
 """
-let context = LAContext()
+var context = LAContext()
 
 func die(_ message: String, _ code: Int32 = 1) -> Never {
     FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
@@ -98,22 +105,165 @@ func shortCommand(_ argv: [String]) -> String {
     return joined.count > 160 ? String(joined.prefix(157)) + "…" : joined
 }
 
-// MARK: Keychain
+// MARK: Prompt
 
-func authenticate(_ reason: String) {
+enum Outcome { case approved, denied, password }
+
+/// touchenv's own window: the question, the intent, the command behind "More detail", and the Touch ID sensor
+/// embedded, so macOS shows no dialog of its own. There is no Allow button: only a finger approves.
+final class Prompt: NSObject {
+    let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+    let detailToggle = NSButton(title: "More detail ›", target: nil, action: nil)
+    var detailField: NSTextField?
+    var chosen: Outcome?
+    var outcome = Outcome.denied
+
+    init(title: String, intent: String?, detail: String?) {
+        super.init()
+        // Laid out like the macOS authentication dialog: icon top left, text left aligned, buttons stacked full width.
+        let width: CGFloat = 228
+        func label(_ text: String, _ font: NSFont, _ color: NSColor = .labelColor) -> NSTextField {
+            let field = NSTextField(wrappingLabelWithString: text)
+            field.font = font
+            field.textColor = color
+            field.preferredMaxLayoutWidth = width
+            field.widthAnchor.constraint(equalToConstant: width).isActive = true
+            return field
+        }
+        // The system view drives Touch ID but pulses while it waits. It must stay visible to read a finger, so the
+        // dialog's own still icon (the Touch ID disc badged with the app icon) sits over it on an opaque cover.
+        let reader = LAAuthenticationView(context: context, controlSize: .large)
+        let cover = NSView()
+        cover.wantsLayer = true
+        cover.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        // The system's own disc first; the copy in Resources if a macOS release moves it.
+        let disc = NSImageView(image: Bundle(path: "/System/Library/PrivateFrameworks/LocalAuthenticationCoreUI.framework")?
+            .image(forResource: "touchID") ?? Bundle.main.image(forResource: "touchID")
+            ?? NSImage(systemSymbolName: "touchid", accessibilityDescription: "Touch ID")!)
+        disc.imageScaling = .scaleProportionallyUpOrDown
+        disc.contentTintColor = .systemRed
+        let badge = NSImageView(image: NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath))
+        badge.imageScaling = .scaleProportionallyUpOrDown
+        let sensor = NSView()
+        let frames: [(NSView, CGFloat, CGFloat, CGFloat)] = [(reader, 0, 6, 64), (cover, 0, 0, 74), (disc, 0, 6, 64),
+                                                            (badge, 38, 0, 36)]   // view, x, y from bottom left, size
+        for (view, x, y, size) in frames {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            sensor.addSubview(view)
+            NSLayoutConstraint.activate([view.leadingAnchor.constraint(equalTo: sensor.leadingAnchor, constant: x),
+                                         view.bottomAnchor.constraint(equalTo: sensor.bottomAnchor, constant: -y),
+                                         view.widthAnchor.constraint(equalToConstant: size),
+                                         view.heightAnchor.constraint(equalToConstant: size)])
+        }
+        sensor.widthAnchor.constraint(equalToConstant: 74).isActive = true
+        sensor.heightAnchor.constraint(equalToConstant: 70).isActive = true
+
+        var views: [NSView] = [sensor, label(title, .boldSystemFont(ofSize: 13))]
+        if let intent { views.append(label("Intent: \(intent)", .systemFont(ofSize: 13))) }
+        if let detail {
+            detailToggle.target = self
+            detailToggle.action = #selector(toggleDetail)
+            detailToggle.isBordered = false
+            detailToggle.refusesFirstResponder = true
+            detailToggle.contentTintColor = .linkColor
+            detailToggle.font = .systemFont(ofSize: 11)
+            let field = label(detail, .monospacedSystemFont(ofSize: 11, weight: .regular), .secondaryLabelColor)
+            field.isSelectable = true
+            field.isHidden = true
+            views += [detailToggle, field]
+            detailField = field
+        }
+        let footnote = label("Touch ID or use your password to continue with touchenv.", .systemFont(ofSize: 11),
+                             .secondaryLabelColor)
+        views.append(footnote)
+        let password = NSButton(title: "Use Password…", target: self, action: #selector(usePassword))
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+        cancel.keyEquivalent = "\u{1b}"
+        for button in [password, cancel] {
+            button.controlSize = .large
+            button.widthAnchor.constraint(equalToConstant: width).isActive = true
+            views.append(button)
+        }
+
+        let stack = NSStackView(views: views)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.setCustomSpacing(14, after: sensor)
+        stack.setCustomSpacing(20, after: footnote)
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 16, bottom: 16, right: 16)
+        panel.contentView = stack
+        panel.titlebarAppearsTransparent = true
+        panel.titleVisibility = .hidden
+        panel.isMovableByWindowBackground = true
+        panel.level = .floating
+        panel.setContentSize(stack.fittingSize)
+    }
+
+    @objc func toggleDetail() {
+        guard let field = detailField else { return }
+        field.isHidden.toggle()
+        detailToggle.title = field.isHidden ? "More detail ›" : "Less detail ‹"
+        let frame = panel.frame
+        let size = panel.frameRect(forContentRect: NSRect(origin: .zero, size: panel.contentView!.fittingSize)).size
+        panel.setFrame(NSRect(x: frame.minX, y: frame.maxY - size.height, width: size.width, height: size.height),
+                       display: true, animate: true)
+    }
+
+    @objc func usePassword() { chosen = .password; context.invalidate() }
+    @objc func cancel() { chosen = .denied; context.invalidate() }
+
+    func run(reason: String) -> Outcome {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        panel.center()
+        app.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, error in
+            DispatchQueue.main.async {
+                let code = (error as? LAError)?.code
+                if success { self.outcome = .approved }
+                else if let chosen = self.chosen { self.outcome = chosen }
+                else if code == .authenticationFailed || code == .biometryLockout || code == .userFallback {
+                    self.outcome = .password
+                }
+                self.panel.orderOut(nil)
+                app.stop(nil)
+                app.postEvent(NSEvent.otherEvent(with: .applicationDefined, location: .zero, modifierFlags: [],
+                                                 timestamp: 0, windowNumber: 0, context: nil, subtype: 0,
+                                                 data1: 0, data2: 0)!, atStart: true)
+            }
+        }
+        app.run()
+        return outcome
+    }
+}
+
+/// Asks with touchenv's window; falls back to the macOS dialog (with `reason`) without Touch ID or on request.
+func authenticate(_ title: String, intent: String?, detail: String? = nil, reason: String) {
+    if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) {
+        switch Prompt(title: title, intent: intent, detail: detail).run(reason: reason) {
+        case .approved: return
+        case .denied: die("touchenv: not approved")
+        case .password: context = LAContext()
+        }
+    }
     var error: NSError?
     guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
         die("touchenv: cannot ask for Touch ID: \(error?.localizedDescription ?? "unknown")")
     }
     let done = DispatchSemaphore(value: 0)
     var ok = false
-    context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, _ in
+    let full = intent.map { "\(reason) (intent: \($0))" } ?? reason
+    context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: full) { success, _ in
         ok = success
         done.signal()
     }
     done.wait()
     if !ok { die("touchenv: not approved") }
 }
+
+// MARK: Keychain
 
 func query(_ name: String) -> [String: Any] {
     [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: name,
@@ -148,6 +298,13 @@ func validName(_ name: String) -> Bool {
 var args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else { die(usage, 2) }
 args.removeFirst()
+var intent: String?
+if args.first == "--intent" {
+    guard args.count > 1 else { die("usage: touchenv \(command) --intent TEXT ...", 2) }
+    let text = args[1].trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
+    intent = text.isEmpty ? nil : (text.count > 200 ? String(text.prefix(199)) + "…" : text)
+    args.removeFirst(2)
+}
 
 switch command {
 case "set":
@@ -161,7 +318,8 @@ case "set":
     let exists = SecItemCopyMatching(probe as CFDictionary, nil) != errSecItemNotFound
     context.interactionNotAllowed = false
     if exists {
-        authenticate("let \(requester()) replace the secret \(name)")
+        let who = requester()
+        authenticate("Allow \(who) to replace \(name)?", intent: intent, reason: "let \(who) replace the secret \(name)")
         let status = SecItemUpdate(query(name) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status != errSecSuccess { die("touchenv: keychain error \(status)") }
     } else {
@@ -179,12 +337,15 @@ case "set":
 
 case "get":
     guard args.count == 1 else { die("usage: touchenv get NAME", 2) }
-    authenticate("show \(requester()) the secret \(args[0]) in full")
+    let who = requester()
+    authenticate("Show \(who) the secret \(args[0]) in full?", intent: intent,
+                 reason: "show \(who) the secret \(args[0]) in full")
     FileHandle.standardOutput.write(read(args[0]))
 
 case "rm":
     guard args.count == 1 else { die("usage: touchenv rm NAME", 2) }
-    authenticate("let \(requester()) delete the secret \(args[0])")
+    let who = requester()
+    authenticate("Allow \(who) to delete \(args[0])?", intent: intent, reason: "let \(who) delete the secret \(args[0])")
     let status = SecItemDelete(query(args[0]) as CFDictionary)
     if status != errSecSuccess { die("touchenv: keychain error \(status)") }
     print("deleted \(args[0])")
@@ -209,7 +370,11 @@ case "run":
     }
     let argv = Array(args[(split + 1)...])
     let names = specs.map(\.name).joined(separator: ", ")
-    authenticate("give \(requester()) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))")
+    let who = requester()
+    let full = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
+    authenticate("Allow \(who) to access \(names)?", intent: intent,
+                 detail: full.count > 2000 ? String(full.prefix(1999)) + "…" : full,
+                 reason: "give \(who) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))")
 
     var env = ProcessInfo.processInfo.environment
     var tempDir: URL?
