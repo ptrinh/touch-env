@@ -11,14 +11,24 @@ Touch the sensor and that one command gets the key. Don't touch, and nobody gets
 
 ## Why
 
-AI assistants like Claude Code, Codex and Cursor can run commands on your Mac. That means they can open any file
-you can open, including the files where your keys usually live.
+**It happened to a friend.** They were running a Vite dev server (Node.js) on their laptop. They thought it was
+private, because only their Tailscale network could reach it.
 
-Most of the time they don't mean to. But a mistake, or a booby-trapped web page or project the assistant reads, can
-make it copy a key out. Then that key can end up in a chat log or on someone else's server.
+Then another machine on that network was hacked. From there, the attacker reached the dev server and used it to
+read files on the laptop: `.env` files, API tokens, cloud keys. Nobody touched the keyboard. The stolen keys then
+opened the doors to other systems.
 
-touch-env stores your keys in the Mac's Keychain, behind Touch ID. You approve every use, and the prompt says
-**who** is asking, for **which key**, and **what command** will use it.
+The keys were sitting in plain files, and anything that could read a file could take them.
+
+**AI coding assistants add one more way in.** Claude Code, Codex and Cursor run commands as you, so they can open
+every file you can. A mistake, or a booby-trapped web page or project they read, can make them copy a key out.
+
+touch-env works like a **hardware security key for your secrets**:
+- Keys move out of files into the Mac's Keychain, behind Touch ID.
+- Nothing can read a key without your finger on the sensor: not a hacked dev server, not malware, not an AI agent.
+- A file-reading bug finds nothing to steal.
+- Code that asks for a key triggers a prompt on your screen, saying **who** wants **which key** for **what
+  command**. If you didn't start it, don't touch.
 
 ## Install
 
