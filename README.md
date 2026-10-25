@@ -1,4 +1,4 @@
-# touchid-secrets
+# touch-env
 
 **`touchenv`: keep your API keys, tokens and private keys in the macOS Keychain, and make every read ask for
 your fingerprint.** It is for the age of AI coding agents.
@@ -67,7 +67,7 @@ password instead.
 
 ### Prebuilt (no Apple Developer account needed)
 
-Download `touchenv-<version>-macos.zip` from [Releases](https://github.com/ptrinh/touchid-secrets/releases). It is
+Download `touchenv-<version>-macos.zip` from [Releases](https://github.com/ptrinh/touch-env/releases). It is
 signed with Developer ID and notarized by Apple. Then:
 
 ```sh
@@ -93,7 +93,7 @@ provisioning profile.
 3. Run the build:
 
 ```sh
-git clone https://github.com/ptrinh/touchid-secrets && cd touchid-secrets
+git clone https://github.com/ptrinh/touch-env && cd touch-env
 cat > build.local <<'EOF'
 TOUCHENV_TEAM_ID=ABCDE12345
 TOUCHENV_BUNDLE_ID=com.example.touchenv
