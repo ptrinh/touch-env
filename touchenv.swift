@@ -2,17 +2,20 @@
 //
 //   touchenv [cmd] --intent TEXT ...   one line on why, shown in the prompt (set, get, rm, run)
 //   touchenv set NAME          secret from stdin (typed with no echo, or piped: touchenv set NAME < file)
+//   touchenv set --sync NAME   the same, synced to your other Macs through iCloud Keychain
 //   touchenv get NAME          print the secret
 //   touchenv run NAME[:file] [NAME2[:file] ...] -- command args...
 //                              run the command with each secret in env var NAME (one Touch ID for all);
 //                              ":file" puts it in a private temp file instead and NAME holds the path,
 //                              the file is removed when the command ends
-//   touchenv ls                list names (no Touch ID, no values)
+//   touchenv ls                list names, "(iCloud)" after synced ones (no Touch ID, no values)
 //   touchenv rm NAME           delete
 //
 // Items are generic passwords (service "touchenv") in the Data Protection keychain, in the keychain access group
 // the signed touchenv.app holds (its only keychain-access-groups entitlement), with a userPresence access control:
 // macOS itself asks for Touch ID (or the Mac password) on every read, this device only, never synced.
+// Synced items (set --sync) can't carry that access control, so iCloud Keychain will take them: only the signed app
+// can read them, and touchenv asks for Touch ID itself before every read.
 // The Touch ID prompt is touchenv's own window with the sensor embedded (LAAuthenticationView): who asks (the nearest
 // parent process that is not a shell), which secrets, the stated intent, and the command behind "More detail".
 // Without Touch ID, or on "Use Password…", the macOS dialog asks instead.
@@ -25,16 +28,17 @@ import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
 import Security
 
-let version = "1.1.0"
+let version = "1.2.0"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
 
   touchenv set NAME                     store a secret (typed with no echo, or piped: touchenv set NAME < file)
+  touchenv set --sync NAME              the same, synced to your other Macs through iCloud Keychain
   touchenv get NAME                     print it
   touchenv run NAME[:file] ... -- CMD   run CMD with each secret in env var NAME; with :file, NAME holds
                                         the path of a private temp file, removed when CMD ends
-  touchenv ls                           list names
+  touchenv ls                           list names; "(iCloud)" marks synced ones
   touchenv rm NAME                      delete
 
   --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.
@@ -267,7 +271,45 @@ func authenticate(_ title: String, intent: String?, detail: String? = nil, reaso
 
 func query(_ name: String) -> [String: Any] {
     [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: name,
+     kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
      kSecUseDataProtectionKeychain as String: true, kSecUseAuthenticationContext as String: context]
+}
+
+/// Whether the secret syncs through iCloud Keychain; nil when there is none. Reads attributes only, no Touch ID.
+func synced(_ name: String) -> Bool? {
+    var q = query(name)
+    q[kSecReturnAttributes as String] = true
+    context.interactionNotAllowed = true
+    defer { context.interactionNotAllowed = false }
+    var out: CFTypeRef?
+    let status = SecItemCopyMatching(q as CFDictionary, &out)
+    if status == errSecItemNotFound { return nil }
+    return ((out as? [String: Any])?[kSecAttrSynchronizable as String] as? Bool) ?? false
+}
+
+/// Where the secrets live, for the prompt.
+func place(_ names: [String]) -> String {
+    let sync = Set(names.map { synced($0) ?? false })
+    return sync == [true] ? "iCloud Keychain" : sync == [false] ? "your Keychain" : "your Keychain and iCloud Keychain"
+}
+
+func add(_ name: String, _ data: Data, sync: Bool) {
+    var q = query(name)
+    q[kSecValueData as String] = data
+    q[kSecAttrLabel as String] = "touchenv: \(name)"
+    q.removeValue(forKey: kSecUseAuthenticationContext as String)
+    if sync {
+        // iCloud Keychain won't take an access control: touchenv's own prompt guards every read instead.
+        q[kSecAttrSynchronizable as String] = true
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+    } else {
+        q.removeValue(forKey: kSecAttrSynchronizable as String)
+        // The system asks for Touch ID (or the Mac password) on every read, whoever reads.
+        q[kSecAttrAccessControl as String] = SecAccessControlCreateWithFlags(
+            nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .userPresence, nil)!
+    }
+    let status = SecItemAdd(q as CFDictionary, nil)
+    if status != errSecSuccess { die("touchenv: keychain error \(status)") }
 }
 
 func read(_ name: String) -> Data {
@@ -299,64 +341,72 @@ var args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else { die(usage, 2) }
 args.removeFirst()
 var intent: String?
-if args.first == "--intent" {
-    guard args.count > 1 else { die("usage: touchenv \(command) --intent TEXT ...", 2) }
-    let text = args[1].trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
-    intent = text.isEmpty ? nil : (text.count > 200 ? String(text.prefix(199)) + "…" : text)
-    args.removeFirst(2)
+var sync = false
+while let option = args.first, option.hasPrefix("--"), option != "--" {
+    if option == "--sync", command == "set" {
+        sync = true
+        args.removeFirst()
+    } else if option == "--intent", args.count > 1 {
+        let text = args[1].trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
+        intent = text.isEmpty ? nil : (text.count > 200 ? String(text.prefix(199)) + "…" : text)
+        args.removeFirst(2)
+    } else {
+        die("touchenv: unknown option \(option)", 2)
+    }
 }
 
 switch command {
 case "set":
-    guard args.count == 1, validName(args[0]) else { die("usage: touchenv set NAME  (NAME = env var style)", 2) }
+    guard args.count == 1, validName(args[0]) else { die("usage: touchenv set [--sync] NAME  (NAME = env var style)", 2) }
     let name = args[0]
     let data = readStdin()
     if data.isEmpty { die("touchenv: empty secret, nothing stored") }
-    var probe = query(name)
-    probe[kSecReturnAttributes as String] = true
-    context.interactionNotAllowed = true
-    let exists = SecItemCopyMatching(probe as CFDictionary, nil) != errSecItemNotFound
-    context.interactionNotAllowed = false
-    if exists {
+    if let wasSynced = synced(name) {
         let who = requester()
-        authenticate("Allow \(who) to replace \(name)?", intent: intent, reason: "let \(who) replace the secret \(name)")
-        let status = SecItemUpdate(query(name) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+        let target = sync ? "iCloud Keychain" : "your Keychain"
+        authenticate("Allow \(who) to replace \(name) in \(target)?", intent: intent,
+                     reason: "let \(who) replace the secret \(name) in \(target)")
+        if wasSynced == sync {
+            let status = SecItemUpdate(query(name) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+            if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+        } else {
+            // Syncing on or off changes the item's protection, which an update can't: store it anew.
+            let status = SecItemDelete(query(name) as CFDictionary)
+            if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+            add(name, data, sync: sync)
+        }
     } else {
-        var q = query(name)
-        q[kSecValueData as String] = data
-        q[kSecAttrLabel as String] = "touchenv: \(name)"
-        q.removeValue(forKey: kSecUseAuthenticationContext as String)
-        // The system asks for Touch ID (or the Mac password) on every read, whoever reads.
-        q[kSecAttrAccessControl as String] = SecAccessControlCreateWithFlags(
-            nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .userPresence, nil)!
-        let status = SecItemAdd(q as CFDictionary, nil)
-        if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+        add(name, data, sync: sync)
     }
-    print("stored \(name) (\(data.count) bytes)")
+    print("stored \(name) (\(data.count) bytes)\(sync ? ", synced through iCloud Keychain" : "")")
 
 case "get":
     guard args.count == 1 else { die("usage: touchenv get NAME", 2) }
     let who = requester()
-    authenticate("Show \(who) the secret \(args[0]) in full?", intent: intent,
+    authenticate("Show \(who) \(args[0]) from \(place([args[0]])) in full?", intent: intent,
                  reason: "show \(who) the secret \(args[0]) in full")
     FileHandle.standardOutput.write(read(args[0]))
 
 case "rm":
     guard args.count == 1 else { die("usage: touchenv rm NAME", 2) }
     let who = requester()
-    authenticate("Allow \(who) to delete \(args[0])?", intent: intent, reason: "let \(who) delete the secret \(args[0])")
+    authenticate("Allow \(who) to delete \(args[0]) from \(place([args[0]]))?", intent: intent,
+                 reason: "let \(who) delete the secret \(args[0])")
     let status = SecItemDelete(query(args[0]) as CFDictionary)
     if status != errSecSuccess { die("touchenv: keychain error \(status)") }
     print("deleted \(args[0])")
 
 case "ls":
     let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
                             kSecUseDataProtectionKeychain as String: true,
                             kSecReturnAttributes as String: true, kSecMatchLimit as String: kSecMatchLimitAll]
     var out: CFTypeRef?
     if SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let items = out as? [[String: Any]] {
-        items.compactMap { $0[kSecAttrAccount as String] as? String }.sorted().forEach { print($0) }
+        items.compactMap { item -> String? in
+            guard let name = item[kSecAttrAccount as String] as? String else { return nil }
+            return (item[kSecAttrSynchronizable as String] as? Bool ?? false) ? "\(name) (iCloud)" : name
+        }.sorted().forEach { print($0) }
     }
 
 case "run":
@@ -372,7 +422,7 @@ case "run":
     let names = specs.map(\.name).joined(separator: ", ")
     let who = requester()
     let full = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
-    authenticate("Allow \(who) to access \(names)?", intent: intent,
+    authenticate("Allow \(who) to read \(names) from \(place(specs.map(\.name)))?", intent: intent,
                  detail: full.count > 2000 ? String(full.prefix(1999)) + "…" : full,
                  reason: "give \(who) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))")
 

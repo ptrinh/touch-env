@@ -2,7 +2,7 @@
 
 **Lock your passwords and API keys behind your fingerprint, so AI agents can't read them without your touch.**
 
-<p align="center"><img src="docs/touch-id-prompt.png" width="260" alt="Touch ID prompt: Allow Claude Code to access OPENAI_API_KEY? Intent: make the monthly sales report. More detail shows the command."></p>
+<p align="center"><img src="docs/touch-id-prompt.png" width="260" alt="Touch ID prompt: Allow Claude Code to read OPENAI_API_KEY from your Keychain? Intent: make the monthly sales report. More detail shows the command."></p>
 
 Each time something needs one of your secrets, your Mac shows this. Touch the sensor and that one command gets the
 key. Don't touch, and nobody gets it.
@@ -67,6 +67,14 @@ touchenv set OPENAI_API_KEY
 touchenv set MY_KEY < ~/Downloads/AuthKey.p8
 ```
 
+**Use a key on all your Macs.** Add `--sync` and the key travels to your other Macs through iCloud Keychain:
+
+```sh
+touchenv set --sync OPENAI_API_KEY
+```
+
+Each Mac needs touchenv installed. `touchenv ls` marks synced keys with `(iCloud)`.
+
 After saving, delete the original. Keep a backup somewhere offline, such as a USB stick.
 
 **Use a key.** Put `touchenv run NAME --` in front of the command:
@@ -106,7 +114,10 @@ If you use Claude Code, also add `"touchenv *"` to `sandbox.excludedCommands` in
   command looks strange, don't touch.
 - **The intent is what the asker says about itself.** Anyone can write anything there. Open **More detail** and
   check the command.
-- **Your keys never leave your Mac.** They are not synced to iCloud, and touch-env has no internet access.
+- **Your keys stay on your Mac** unless you add `--sync`. touch-env itself has no internet access.
+- **Synced keys are protected a little differently.** iCloud Keychain does not accept the "ask for Touch ID on every
+  read" lock that macOS puts on local keys. Only touchenv can read a synced key, and touchenv always asks for your
+  finger first, but the lock is touchenv's, not the Mac's. Apple encrypts synced keys end to end.
 - **No Touch ID?** Your Mac asks for your login password instead.
 - **Other apps can't see the keys at all.** Not even Apple's own `security` tool can read them. There is also no
   "Always Allow" button you could click by mistake.
@@ -119,7 +130,8 @@ touch-env is one Swift file, [`touchenv.swift`](touchenv.swift).
 
 **How it works:**
 - Keys are stored in the Data Protection keychain with a `userPresence` access control and
-  `WhenUnlockedThisDeviceOnly`.
+  `WhenUnlockedThisDeviceOnly`. Keys saved with `--sync` are `kSecAttrSynchronizable` and `WhenUnlocked`, with no
+  access control (iCloud Keychain refuses one); touchenv's own prompt guards their reads.
 - They sit in a keychain access group that only the signed app holds. This is why it ships as a signed `.app` with a
   provisioning profile.
 - The prompt names the nearest parent process that isn't a shell.
