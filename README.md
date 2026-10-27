@@ -30,7 +30,7 @@ touchenv set --sync OPENAI_API_KEY           # save and sync to your other Macs 
 touchenv run OPENAI_API_KEY -- python report.py
 touchenv run MY_KEY:file -- fastlane beta    # the command gets a temp file path, deleted afterwards
 touchenv run --intent "monthly report" OPENAI_API_KEY -- python report.py   # shows why in the prompt
-touchenv ls                                  # names only, no Touch ID
+touchenv ls                                  # names only
 touchenv get NAME · touchenv rm NAME
 ```
 

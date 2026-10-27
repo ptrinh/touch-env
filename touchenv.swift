@@ -8,7 +8,7 @@
 //                              run the command with each secret in env var NAME (one Touch ID for all);
 //                              ":file" puts it in a private temp file instead and NAME holds the path,
 //                              the file is removed when the command ends
-//   touchenv ls                list names, "(iCloud)" after synced ones (no Touch ID, no values)
+//   touchenv ls                list names, "(iCloud)" after synced ones (Touch ID: macOS guards even names; no values)
 //   touchenv rm NAME           delete
 //
 // Items are generic passwords (service "touchenv") in the Data Protection keychain, in the keychain access group
@@ -28,7 +28,7 @@ import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
 import Security
 
-let version = "1.2.0"
+let version = "1.2.1"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -275,21 +275,53 @@ func query(_ name: String) -> [String: Any] {
      kSecUseDataProtectionKeychain as String: true, kSecUseAuthenticationContext as String: context]
 }
 
-/// Whether the secret syncs through iCloud Keychain; nil when there is none. Reads attributes only, no Touch ID.
-func synced(_ name: String) -> Bool? {
-    var q = query(name)
-    q[kSecReturnAttributes as String] = true
-    context.interactionNotAllowed = true
-    defer { context.interactionNotAllowed = false }
+// Any look at a local item, even its name, needs Touch ID: unless the context has passed it, macOS shows its own
+// "touchenv needs to authenticate" dialog. Synced items carry no access control and can be looked at freely.
+
+/// Names of the secrets in iCloud Keychain. No Touch ID.
+func syncedNames() -> Set<String> {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                            kSecAttrSynchronizable as String: true, kSecUseDataProtectionKeychain as String: true,
+                            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
+                            kSecReturnAttributes as String: true, kSecMatchLimit as String: kSecMatchLimitAll]
     var out: CFTypeRef?
-    let status = SecItemCopyMatching(q as CFDictionary, &out)
-    if status == errSecItemNotFound { return nil }
-    return ((out as? [String: Any])?[kSecAttrSynchronizable as String] as? Bool) ?? false
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let found = out as? [[String: Any]] else { return [] }
+    return Set(found.compactMap { $0[kSecAttrAccount as String] as? String })
+}
+
+/// Whether the secret syncs through iCloud Keychain; nil when there is none. No Touch ID: a local item answers
+/// "interaction not allowed" when it exists.
+func synced(_ name: String) -> Bool? {
+    if syncedNames().contains(name) { return true }
+    let probe = LAContext()
+    probe.interactionNotAllowed = true
+    var q = query(name)
+    q[kSecAttrSynchronizable as String] = false
+    q[kSecUseAuthenticationContext as String] = probe
+    return SecItemCopyMatching(q as CFDictionary, nil) == errSecItemNotFound ? nil : false
+}
+
+/// Every secret's name and whether it syncs, read with the context that has passed Touch ID.
+func items() -> [String: Bool] {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+                            kSecUseDataProtectionKeychain as String: true, kSecUseAuthenticationContext as String: context,
+                            kSecReturnAttributes as String: true, kSecMatchLimit as String: kSecMatchLimitAll]
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let found = out as? [[String: Any]] else { return [:] }
+    var result: [String: Bool] = [:]
+    for item in found {
+        if let name = item[kSecAttrAccount as String] as? String {
+            result[name] = item[kSecAttrSynchronizable as String] as? Bool ?? false
+        }
+    }
+    return result
 }
 
 /// Where the secrets live, for the prompt.
 func place(_ names: [String]) -> String {
-    let sync = Set(names.map { synced($0) ?? false })
+    let all = syncedNames()
+    let sync = Set(names.map { all.contains($0) })
     return sync == [true] ? "iCloud Keychain" : sync == [false] ? "your Keychain" : "your Keychain and iCloud Keychain"
 }
 
@@ -397,17 +429,9 @@ case "rm":
     print("deleted \(args[0])")
 
 case "ls":
-    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
-                            kSecUseDataProtectionKeychain as String: true,
-                            kSecReturnAttributes as String: true, kSecMatchLimit as String: kSecMatchLimitAll]
-    var out: CFTypeRef?
-    if SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let items = out as? [[String: Any]] {
-        items.compactMap { item -> String? in
-            guard let name = item[kSecAttrAccount as String] as? String else { return nil }
-            return (item[kSecAttrSynchronizable as String] as? Bool ?? false) ? "\(name) (iCloud)" : name
-        }.sorted().forEach { print($0) }
-    }
+    let who = requester()
+    authenticate("Allow \(who) to see the names of your secrets?", intent: intent, reason: "show \(who) the names of your secrets")
+    items().sorted { $0.key < $1.key }.forEach { print($0.value ? "\($0.key) (iCloud)" : $0.key) }
 
 case "run":
     guard let split = args.firstIndex(of: "--"), split > 0, split < args.count - 1 else {
