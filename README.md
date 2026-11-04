@@ -33,6 +33,7 @@ touchenv run --intent "monthly report" OPENAI_API_KEY -- python report.py   # sh
 touchenv ls                                  # names only
 touchenv get NAME · touchenv rm NAME
 touchenv lock                                # end every 5-minute approval now
+touchenv import --begin · touchenv export --to tenv1:… > keys.tenv · touchenv import keys.tenv   # new Mac, below
 ```
 
 Delete the original files after saving.
@@ -42,6 +43,27 @@ Delete the original files after saving.
 > My secrets are in touchenv. Never read key files. Use `touchenv run --intent "<why>" NAME -- <command>`.
 
 Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
+
+AI agents (Claude Code, Codex, Cursor's agent, Gemini CLI, aider, Goose, opencode) **must** pass `--intent`: without
+one, touchenv refuses before any prompt and tells the agent how to ask again, so every prompt says why. Typed in
+your own terminal, `--intent` is optional; without it the prompt says **No reason given** and shows the command.
+
+## Moving to a new Mac
+
+Keys stay on the Mac they were saved on: Migration Assistant and Time Machine don't carry them. Move them with
+touchenv itself, both Macs on 1.4.0 or later:
+
+1. **New Mac:** `touchenv import --begin`. It prints a `tenv1:…` line and a check code like `K7QM-2XRD-9FTA`.
+2. **Old Mac:** `touchenv export --to tenv1:… > keys.tenv` (add names to send only some). The `tenv1:…` line isn't
+   secret: AirDrop, Universal Clipboard or a chat is fine. **Touch only if the prompt shows the same check code.**
+3. Copy `keys.tenv` to the new Mac (AirDrop) and run `touchenv import keys.tenv`. One touch; then touchenv deletes
+   the file. **Delete `keys.tenv` on the old Mac too**, and empty its Trash.
+
+`--replace` overwrites keys the new Mac already has (otherwise they're skipped); `--local` keeps none synced.
+
+The file opens only on that Mac, once, within an hour: the key that opens it is made in the new Mac's Secure
+Enclave and deleted after the import. A copy left behind is useless. The check code is what stops a tricked agent
+exporting to someone else's key: the prompt names the receiving Mac's code, and only you can compare it.
 
 ## Good to know
 

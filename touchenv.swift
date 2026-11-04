@@ -11,6 +11,11 @@
 //   touchenv ls                list names, "(iCloud)" after synced ones (Touch ID: macOS guards even names; no values)
 //   touchenv rm NAME           delete
 //   touchenv lock              end every 5-minute approval now
+//   touchenv import --begin    on a new Mac: make a one-time receiving key, print it as tenv1:… and a check code
+//   touchenv export --to tenv1:… [NAME ...] > keys.tenv
+//                              on the old Mac: every secret (or those named) encrypted to that key, one Touch ID
+//   touchenv import keys.tenv  on the new Mac: store them (--replace overwrites, --local keeps none synced),
+//                              then delete keys.tenv and the receiving key
 //
 // Items are generic passwords (service "touchenv") in the Data Protection keychain, in the keychain access group
 // the signed touchenv.app holds (its only keychain-access-groups entitlement), with a userPresence access control:
@@ -24,16 +29,21 @@
 // Ticked, touchenv starts a background copy of itself (touchenv agent) that keeps those secrets in memory for 5
 // minutes and hands them to later touchenv runs from the same requester (same pid and start time). Both ends check
 // that the other is touchenv signed like itself. A menu bar timer shows the approval; each use flashes a notice.
+// export/import: the receiving key lives in the new Mac's Secure Enclave (a keychain item, this device only, when there
+// is none) and is deleted after one import or an hour. The file: "TENV" 1 | receiving key (33 bytes) | ephemeral key
+// (65) | AES-GCM over JSON, key from ECDH + HKDF-SHA256, the header authenticated. Export never uses a 5-minute
+// approval, and its prompt shows the receiving key's check code: approve only if the new Mac shows the same.
 // Build and sign with ./build.sh.
 
 import AppKit
+import CryptoKit
 import Darwin
 import Foundation
 import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
 import Security
 
-let version = "1.3.0"
+let version = "1.4.0"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -46,6 +56,14 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
   touchenv ls                           list names; "(iCloud)" marks synced ones
   touchenv rm NAME                      delete
   touchenv lock                         end every "Don't ask again for 5 minutes" approval now
+
+  Moving to a new Mac:
+  touchenv import --begin               (new Mac) prints tenv1:… and a check code
+  touchenv export --to tenv1:… [NAME ...] > keys.tenv
+                                        (old Mac) all secrets, or those named, encrypted for that Mac only
+  touchenv import [--replace] [--local] keys.tenv
+                                        (new Mac) store them, then delete the file; --replace overwrites,
+                                        --local keeps none synced
 
   --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.
 """
@@ -95,12 +113,14 @@ func startTime(_ pid: pid_t) -> UInt64? {
     bsdInfo(pid).map { UInt64($0.pbi_start_tvsec) * 1_000_000 + UInt64($0.pbi_start_tvusec) }
 }
 
-struct Requester { let pid: pid_t; let start: UInt64; let name: String }
+struct Requester { let pid: pid_t; let start: UInt64; let name: String; var isAgent = false }
 
 /// The nearest ancestor that is not a shell or a wrapper: the agent, or the terminal when you typed it yourself.
 func requester(from first: pid_t = getppid()) -> Requester {
     let passThrough: Set<String> = ["sh", "zsh", "bash", "fish", "dash", "ksh", "tcsh", "env", "sudo", "login",
                                     "nohup", "time", "timeout", "xargs", "make", "script", "tmux", "screen"]
+    // AI agents (by executable name, not the apps of the same name): they must say why (--intent).
+    let agents: Set<String> = ["claude", "codex", "cursor-agent", "gemini", "aider", "goose", "opencode"]
     let known = ["claude": "Claude Code", "codex": "Codex", "cursor-agent": "Cursor", "Cursor": "Cursor",
                  "gemini": "Gemini CLI", "aider": "aider", "goose": "Goose", "opencode": "opencode",
                  "ghostty": "Ghostty", "Terminal": "Terminal", "iTerm2": "iTerm", "Code": "VS Code",
@@ -110,7 +130,7 @@ func requester(from first: pid_t = getppid()) -> Requester {
     for _ in 0..<32 {
         guard pid > 1, let name = executableName(pid) else { break }
         if !passThrough.contains(name.trimmingCharacters(in: CharacterSet(charactersIn: "-"))) {
-            return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? name)
+            return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? name, isAgent: agents.contains(name))
         }
         guard let parent = parentPid(pid) else { break }
         pid = parent
@@ -121,6 +141,17 @@ func requester(from first: pid_t = getppid()) -> Requester {
 func shortCommand(_ argv: [String]) -> String {
     let joined = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
     return joined.count > 160 ? String(joined.prefix(157)) + "…" : joined
+}
+
+/// An AI agent must give a reason (--intent) for anything that asks for Touch ID or reads a secret, so the prompt
+/// always says why. Refused before any prompt: the agent reads the error and asks again with one.
+func requireIntent(_ intent: String?, example: String) {
+    guard intent == nil else { return }
+    let who = requester()
+    if who.isAgent {
+        die("touchenv: \(who.name) must say why, in a few words: \(example)\n"
+            + "  (--intent goes right after the command; the reason is shown in the Touch ID prompt)", 2)
+    }
 }
 
 // MARK: Prompt
@@ -180,6 +211,10 @@ final class Prompt: NSObject {
 
         var views: [NSView] = [sensor, label(title, .boldSystemFont(ofSize: 13))]
         if let intent { views.append(label("Intent: \(intent)", .systemFont(ofSize: 13))) }
+        else if detail != nil {
+            // No reason given: say so, and show the command without a click.
+            views.append(label("No reason given. Check the command:", .systemFont(ofSize: 13), .systemOrange))
+        }
         if let detail {
             detailToggle.target = self
             detailToggle.action = #selector(toggleDetail)
@@ -189,7 +224,8 @@ final class Prompt: NSObject {
             detailToggle.font = .systemFont(ofSize: 11)
             let field = label(detail, .monospacedSystemFont(ofSize: 11, weight: .regular), .secondaryLabelColor)
             field.isSelectable = true
-            field.isHidden = true
+            field.isHidden = intent != nil
+            detailToggle.title = field.isHidden ? "More detail ›" : "Less detail ‹"
             views += [detailToggle, field]
             detailField = field
         }
@@ -668,6 +704,116 @@ final class Agent: NSObject {
     }
 }
 
+// MARK: Moving to another Mac
+
+let importService = "touchenv-import"
+let importLifetime: TimeInterval = 60 * 60
+let fileMagic = Data([0x54, 0x45, 0x4E, 0x56, 0x01])   // "TENV" 1
+let headerLength = fileMagic.count + 33 + 65             // magic | receiving key, compressed | ephemeral key, x9.63
+
+/// The receiving key's public half as text: "tenv1:" and the compressed point in base64url.
+func recipientText(_ key: P256.KeyAgreement.PublicKey) -> String {
+    "tenv1:" + key.compressedRepresentation.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+}
+
+func parseRecipient(_ text: String) -> P256.KeyAgreement.PublicKey? {
+    let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard text.hasPrefix("tenv1:") else { return nil }
+    var b64 = String(text.dropFirst(6)).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+    while b64.count % 4 != 0 { b64 += "=" }
+    guard let data = Data(base64Encoded: b64) else { return nil }
+    return try? P256.KeyAgreement.PublicKey(compressedRepresentation: data)
+}
+
+/// Twelve characters both Macs show, so the old one exports only to the Mac in front of you.
+func checkCode(_ key: P256.KeyAgreement.PublicKey) -> String {
+    let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    var out: [Character] = [], acc = 0, bits = 0
+    for byte in SHA256.hash(data: key.compressedRepresentation) where out.count < 12 {
+        acc = (acc << 8) | Int(byte)
+        bits += 8
+        while bits >= 5 && out.count < 12 {
+            bits -= 5
+            out.append(alphabet[(acc >> bits) & 31])
+        }
+        acc &= (1 << bits) - 1
+    }
+    return stride(from: 0, to: 12, by: 4).map { String(out[$0..<$0 + 4]) }.joined(separator: "-")
+}
+
+enum ReceivingKey {
+    case enclave(SecureEnclave.P256.KeyAgreement.PrivateKey)
+    case software(P256.KeyAgreement.PrivateKey)
+
+    var publicKey: P256.KeyAgreement.PublicKey {
+        switch self {
+        case .enclave(let key): return key.publicKey
+        case .software(let key): return key.publicKey
+        }
+    }
+
+    func sharedSecret(with other: P256.KeyAgreement.PublicKey) throws -> SharedSecret {
+        switch self {
+        case .enclave(let key): return try key.sharedSecretFromKeyAgreement(with: other)
+        case .software(let key): return try key.sharedSecretFromKeyAgreement(with: other)
+        }
+    }
+}
+
+func receivingQuery() -> [String: Any] {
+    [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: importService,
+     kSecAttrAccount as String: "pending", kSecUseDataProtectionKeychain as String: true]
+}
+
+/// A new receiving key, replacing any earlier one: in the Secure Enclave when the Mac has one (the keychain then holds
+/// only a handle that works on this Mac), otherwise the key itself, this device only.
+func newReceivingKey() -> ReceivingKey {
+    SecItemDelete(receivingQuery() as CFDictionary)
+    let key: ReceivingKey
+    let blob: Data
+    if SecureEnclave.isAvailable, let enclaveKey = try? SecureEnclave.P256.KeyAgreement.PrivateKey() {
+        key = .enclave(enclaveKey)
+        blob = Data("se:".utf8) + enclaveKey.dataRepresentation
+    } else {
+        let softwareKey = P256.KeyAgreement.PrivateKey()
+        key = .software(softwareKey)
+        blob = Data("sw:".utf8) + softwareKey.rawRepresentation
+    }
+    var q = receivingQuery()
+    q[kSecValueData as String] = blob
+    q[kSecAttrLabel as String] = "touchenv: key for one import"
+    q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+    let status = SecItemAdd(q as CFDictionary, nil)
+    if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+    return key
+}
+
+func waitingReceivingKey() -> (key: ReceivingKey, created: Date)? {
+    var q = receivingQuery()
+    q[kSecReturnData as String] = true
+    q[kSecReturnAttributes as String] = true
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let item = out as? [String: Any],
+          let blob = item[kSecValueData as String] as? Data else { return nil }
+    let created = item[kSecAttrCreationDate as String] as? Date ?? .distantPast
+    let body = Data(blob.dropFirst(3))
+    switch String(decoding: blob.prefix(3), as: UTF8.self) {
+    case "se:":
+        guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: body) else { return nil }
+        return (.enclave(key), created)
+    case "sw:":
+        guard let key = try? P256.KeyAgreement.PrivateKey(rawRepresentation: body) else { return nil }
+        return (.software(key), created)
+    default: return nil
+    }
+}
+
+func transferKey(_ secret: SharedSecret, header: Data) -> SymmetricKey {
+    secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: header, sharedInfo: Data("touchenv export 1".utf8),
+                                   outputByteCount: 32)
+}
+
 // MARK: Commands
 
 var args = Array(CommandLine.arguments.dropFirst())
@@ -675,9 +821,17 @@ guard let command = args.first else { die(usage, 2) }
 args.removeFirst()
 var intent: String?
 var sync = false
+var recipientArgument: String?
+var begin = false, replace = false, localOnly = false
 while let option = args.first, option.hasPrefix("--"), option != "--" {
     if option == "--sync", command == "set" {
         sync = true
+        args.removeFirst()
+    } else if option == "--to", command == "export", args.count > 1 {
+        recipientArgument = args[1]
+        args.removeFirst(2)
+    } else if command == "import", ["--begin", "--replace", "--local"].contains(option) {
+        if option == "--begin" { begin = true } else if option == "--replace" { replace = true } else { localOnly = true }
         args.removeFirst()
     } else if option == "--intent", args.count > 1 {
         let text = args[1].trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
@@ -695,6 +849,7 @@ case "set":
     let data = readStdin()
     if data.isEmpty { die("touchenv: empty secret, nothing stored") }
     if let wasSynced = synced(name) {
+        requireIntent(intent, example: "touchenv set --intent \"<why>\" \(name)")
         let who = requester().name
         let target = sync ? "iCloud Keychain" : "your Keychain"
         authenticate("Allow \(who) to replace \(name) in \(target)?", intent: intent,
@@ -715,6 +870,7 @@ case "set":
 
 case "get":
     guard args.count == 1 else { die("usage: touchenv get NAME", 2) }
+    requireIntent(intent, example: "touchenv get --intent \"<why>\" \(args[0])")
     let who = requester().name
     authenticate("Show \(who) \(args[0]) from \(place([args[0]])) in full?", intent: intent,
                  reason: "show \(who) the secret \(args[0]) in full")
@@ -722,6 +878,7 @@ case "get":
 
 case "rm":
     guard args.count == 1 else { die("usage: touchenv rm NAME", 2) }
+    requireIntent(intent, example: "touchenv rm --intent \"<why>\" \(args[0])")
     let who = requester().name
     authenticate("Allow \(who) to delete \(args[0]) from \(place([args[0]]))?", intent: intent,
                  reason: "let \(who) delete the secret \(args[0])")
@@ -730,6 +887,7 @@ case "rm":
     print("deleted \(args[0])")
 
 case "ls":
+    requireIntent(intent, example: "touchenv ls --intent \"<why>\"")
     let who = requester().name
     authenticate("Allow \(who) to see the names of your secrets?", intent: intent, reason: "show \(who) the names of your secrets")
     items().sorted { $0.key < $1.key }.forEach { print($0.value ? "\($0.key) (iCloud)" : $0.key) }
@@ -744,6 +902,7 @@ case "run":
         return (parts[0], parts.count == 2)
     }
     let argv = Array(args[(split + 1)...])
+    requireIntent(intent, example: "touchenv run --intent \"<why>\" \(args[..<split].joined(separator: " ")) -- \(shortCommand(argv))")
     let names = specs.map(\.name).joined(separator: ", ")
     let who = requester().name
     let wanted = specs.map(\.name)
@@ -807,6 +966,130 @@ case "run":
 case "lock":
     if askAgent(["op": "lock"]) != nil { print("locked: every 5-minute approval ended") }
     else { print("nothing to lock") }
+
+case "export":
+    guard let recipientArgument, args.allSatisfy(validName) else {
+        die("usage: touchenv export --to tenv1:… [NAME ...] > keys.tenv  (tenv1:… comes from touchenv import --begin on the new Mac)", 2)
+    }
+    guard let recipient = parseRecipient(recipientArgument) else {
+        die("touchenv: \(recipientArgument) is not a tenv1:… key from touchenv import --begin", 2)
+    }
+    if isatty(1) != 0 { die("touchenv: send it to a file: touchenv export --to … > keys.tenv", 2) }
+    requireIntent(intent, example: "touchenv export --intent \"<why>\" --to tenv1:… > keys.tenv")
+    let code = checkCode(recipient)
+    let who = requester().name
+    let what = args.isEmpty ? "all your secrets" : args.joined(separator: ", ")
+    // Never through a 5-minute approval: every export asks.
+    authenticate("Allow \(who) to export \(what) to the Mac showing \(code)? Only if your new Mac shows that code.",
+                 intent: intent, detail: shortCommand(CommandLine.arguments),
+                 reason: "let \(who) export \(what) to the Mac showing \(code)")
+    let all = items()
+    let names = args.isEmpty ? all.keys.sorted() : args
+    if names.isEmpty { die("touchenv: no secrets to export") }
+    var entries: [[String: Any]] = []
+    for name in names {
+        guard let isSynced = all[name] else { die("touchenv: no secret named \(name)") }
+        entries.append(["name": name, "sync": isSynced, "data": read(name).base64EncodedString()])
+    }
+    let payload = try! JSONSerialization.data(withJSONObject: ["from": Host.current().localizedName ?? "another Mac",
+                                                               "secrets": entries])
+    let ephemeral = P256.KeyAgreement.PrivateKey()
+    let header = fileMagic + recipient.compressedRepresentation + ephemeral.publicKey.x963Representation
+    do {
+        let secret = try ephemeral.sharedSecretFromKeyAgreement(with: recipient)
+        let box = try AES.GCM.seal(payload, using: transferKey(secret, header: header), authenticating: header)
+        FileHandle.standardOutput.write(header + box.combined!)
+    } catch { die("touchenv: \(error.localizedDescription)") }
+    let count = "\(names.count) secret\(names.count == 1 ? "" : "s")"
+    FileHandle.standardError.write("""
+        exported \(count) (\(names.joined(separator: ", "))) for the Mac showing \(code).
+        Copy the file there and run: touchenv import <file>. Then delete the file here too.
+
+        """.data(using: .utf8)!)
+
+case "import":
+    if begin {
+        guard args.isEmpty else { die("usage: touchenv import --begin", 2) }
+        let key = newReceivingKey()
+        print("""
+            Ready for one import, for the next hour. On the old Mac, run:
+
+              touchenv export --to \(recipientText(key.publicKey)) > keys.tenv
+
+            Approve there only if its Touch ID prompt shows \(checkCode(key.publicKey)).
+            Then bring keys.tenv here and run: touchenv import keys.tenv
+            """)
+        exit(0)
+    }
+    guard args.count == 1 else { die("usage: touchenv import --begin · touchenv import [--replace] [--local] FILE", 2) }
+    let path = args[0]
+    requireIntent(intent, example: "touchenv import --intent \"<why>\" \(path)")
+    guard let file = FileManager.default.contents(atPath: path) else { die("touchenv: can't read \(path)") }
+    guard file.count > headerLength, file.prefix(fileMagic.count) == fileMagic else {
+        die("touchenv: \(path) is not a file from touchenv export")
+    }
+    let header = file.subdata(in: 0..<headerLength)
+    let recipientData = file.subdata(in: fileMagic.count..<fileMagic.count + 33)
+    guard let waiting = waitingReceivingKey() else {
+        die("touchenv: no import is waiting on this Mac: run touchenv import --begin, then export again with the new tenv1:…")
+    }
+    let key = waiting.key
+    if Date().timeIntervalSince(waiting.created) > importLifetime {
+        SecItemDelete(receivingQuery() as CFDictionary)
+        die("touchenv: the import waiting here expired (an hour): run touchenv import --begin again")
+    }
+    guard recipientData == key.publicKey.compressedRepresentation else {
+        let other = (try? P256.KeyAgreement.PublicKey(compressedRepresentation: recipientData)).map(checkCode) ?? "?"
+        die("touchenv: \(path) was made for the code \(other); the import waiting here is \(checkCode(key.publicKey))")
+    }
+    let payload: Data
+    do {
+        let ephemeral = try P256.KeyAgreement.PublicKey(x963Representation: file.subdata(in: fileMagic.count + 33..<headerLength))
+        let secret = try key.sharedSecret(with: ephemeral)
+        let box = try AES.GCM.SealedBox(combined: file.subdata(in: headerLength..<file.count))
+        payload = try AES.GCM.open(box, using: transferKey(secret, header: header), authenticating: header)
+    } catch { die("touchenv: \(path) can't be opened: damaged, or not made for this Mac") }
+    guard let json = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
+          let entries = json["secrets"] as? [[String: Any]] else { die("touchenv: \(path) holds no secrets") }
+    let from = json["from"] as? String ?? "another Mac"
+    let incoming: [(name: String, data: Data, sync: Bool)] = entries.compactMap { entry in
+        guard let name = entry["name"] as? String, validName(name), let encoded = entry["data"] as? String,
+              let data = Data(base64Encoded: encoded) else { return nil }
+        return (name, data, !localOnly && (entry["sync"] as? Bool ?? false))
+    }
+    if incoming.isEmpty { die("touchenv: \(path) holds no secrets") }
+    let names = incoming.map(\.name)
+    let existing = Set(names.filter { synced($0) != nil })
+    let who = requester().name
+    var title = "Allow \(who) to add \(names.joined(separator: ", ")) from \(from)?"
+    if !existing.isEmpty {
+        let list = existing.sorted().joined(separator: ", ")
+        title += replace ? " Replaces your \(list)." : " Keeps your \(list)."
+    }
+    authenticate(title, intent: intent, reason: "let \(who) add secrets from \(from)")
+    var stored = 0
+    for secret in incoming {
+        if existing.contains(secret.name) {
+            guard replace else {
+                print("skipped \(secret.name): already here (touchenv import --replace to overwrite)")
+                continue
+            }
+            let status = SecItemDelete(query(secret.name) as CFDictionary)
+            if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+        }
+        add(secret.name, secret.data, sync: secret.sync)
+        stored += 1
+        print("stored \(secret.name) (\(secret.data.count) bytes)\(secret.sync ? ", synced through iCloud Keychain" : "")")
+    }
+    // One import per receiving key, and the file has done its job.
+    SecItemDelete(receivingQuery() as CFDictionary)
+    do {
+        try FileManager.default.removeItem(atPath: path)
+        print("deleted \(path)")
+    } catch {
+        print("couldn't delete \(path) (\(error.localizedDescription)): delete it yourself")
+    }
+    print("\(stored) secret\(stored == 1 ? "" : "s") from \(from). Now delete keys.tenv on \(from) too, and empty its Trash.")
 
 case "agent":
     Agent().run()
