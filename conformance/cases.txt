@@ -5,6 +5,7 @@
 # Keychain or Touch ID. Behaviour past that point is covered by each implementation's own tests.
 #
 # Format: exit code | stream:text the output must contain ("-" for none) | arguments, separated by spaces
+# A line that starts with "@mac " or "@windows " applies to that build only (touchenv ssh exists on macOS only).
 2 | err:touchenv  |
 2 | err:touchenv: unknown command frobnicate | frobnicate
 2 | err:touchenv: unknown command agentx | agentx
@@ -46,3 +47,31 @@
 0 | out:--intent TEXT after the command | -h
 0 | - | version
 0 | - | --version
+@mac 2 | err:usage: touchenv ssh add | ssh
+@mac 2 | err:usage: touchenv ssh add | ssh frob
+@mac 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add
+@mac 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add A B C
+@mac 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add --sync bad-name /x
+@mac 2 | err:touchenv: unknown option --local | ssh add --local /x
+@mac 2 | err:touchenv: unknown option --sync | ssh rm --sync A
+@mac 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add /nonexistent/touchenv-test-key
+@mac 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add --sync MY_KEY /nonexistent/touchenv-test-key
+@mac 2 | err:usage: touchenv ssh ls | ssh ls A
+@mac 2 | err:usage: touchenv ssh rm NAME | ssh rm
+@mac 2 | err:usage: touchenv ssh rm NAME | ssh rm A B
+@mac 2 | err:usage: touchenv ssh rm NAME | ssh rm bad-name
+@mac 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load
+@mac 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load --for 1h bad-name
+@mac 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for 25h A
+@mac 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for soon A
+@mac 2 | err:touchenv: unknown option --for | ssh unload --for 1h A
+@mac 2 | err:usage: touchenv ssh unload NAME ... | ssh unload
+@mac 2 | err:usage: touchenv ssh agent install [--config] | ssh agent
+@mac 2 | err:usage: touchenv ssh agent install [--config] | ssh agent frob
+@mac 2 | err:usage: touchenv ssh agent install [--config] | ssh agent install extra
+@mac 2 | err:touchenv: unknown option --bogus | ssh agent status --bogus
+@mac 1 | err:touchenv: ssh agent serve is started by launchd | ssh agent serve
+@mac 0 | out:touchenv ssh add [--sync] [NAME] KEYFILE | help
+@windows 2 | err:touchenv: ssh keys are macOS only | ssh
+@windows 2 | err:touchenv: ssh keys are macOS only | ssh add id_ed25519
+@windows 2 | err:touchenv: ssh keys are macOS only | ssh agent install

@@ -151,6 +151,9 @@ func run(args []string, env *Env) error {
 		return c.export(args)
 	case "import":
 		return c.importCmd(args)
+	case "ssh":
+		// The SSH agent and key commands exist in the macOS build only (README, "SSH keys").
+		return die(2, "touchenv: ssh keys are macOS only for now")
 	case "help", "-h", "--help":
 		fmt.Fprintln(env.Stdout, usage())
 		return nil

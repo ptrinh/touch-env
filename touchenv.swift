@@ -19,6 +19,15 @@
 //                              on the old Mac: every secret (or those named) encrypted to that key, one Touch ID
 //   touchenv import keys.tenv  on the new Mac: store them (--replace overwrites, --local keeps none synced),
 //                              then delete keys.tenv and the receiving key
+//   touchenv ssh add [--sync] [NAME] KEYFILE
+//                              store an SSH private key (any type ssh-keygen reads, decrypted once if it has a
+//                              passphrase; signs with Ed25519, ECDSA P-256/384/521 and RSA); the file is left alone
+//   touchenv ssh ls · ssh rm NAME
+//   touchenv ssh agent install [--config] · uninstall [--config] · status
+//                              touchenv as ssh's agent (IdentityAgent): a LaunchAgent whose socket launchd holds;
+//                              every signature asks for Touch ID, unless a grant or a 5-minute approval covers it
+//   touchenv ssh load [--for 1h] NAME ... · ssh unload NAME ...
+//                              one Touch ID, then the key is in the stock ssh-agent for that long
 //
 // Items are generic passwords (service "touchenv") in the Data Protection keychain, in the keychain access group
 // the signed touchenv.app holds (its only keychain-access-groups entitlement), with a userPresence access control:
@@ -40,6 +49,13 @@
 // is none) and is deleted after one import or an hour. The file: "TENV" 1 | receiving key (33 bytes) | ephemeral key
 // (65) | AES-GCM over JSON, key from ECDH + HKDF-SHA256, the header authenticated. Export never uses a 5-minute
 // approval, and its prompt shows the receiving key's check code: approve only if the new Mac shows the same.
+// SSH keys are ordinary items (the OpenSSH private key text, unencrypted) marked with kSecAttrDescription
+// "touchenv ssh key" and their public key line in kSecAttrComment; the public half is also written to
+// ~/Library/Application Support/touchenv/ssh/NAME.pub, so listing them never asks. The SSH agent (touchenv ssh agent
+// serve, started by launchd on the socket ssh-agent.sock beside it) answers identities from the public halves and, for
+// a signature, asks the background copy for a grant or approval covering the process at the other end of the socket,
+// else shows the prompt (one at a time), reads the key, signs and wipes it. It refuses to add, remove or lock keys,
+// and to sign when the screen is locked or the request came through an ssh session, unless a grant covers it.
 // Build and sign with ./build.sh.
 
 import AppKit
@@ -67,6 +83,14 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         with touchenv run without asking, also while the Mac is locked, until
                                         the time (24h at most) or the uses run out
   touchenv lock                         end every approval now: 5-minute ones and grants
+
+  SSH keys (see touchenv ssh for more):
+  touchenv ssh add [--sync] [NAME] KEYFILE
+                                        store an SSH private key (the file stays: delete it yourself)
+  touchenv ssh ls · touchenv ssh rm NAME
+  touchenv ssh agent install [--config] touchenv as your SSH agent: every signature asks for Touch ID
+  touchenv ssh load [--for 1h] NAME ... one Touch ID, then the key is in ssh-agent until the time runs out
+  touchenv ssh unload NAME ...
 
   Moving to a new Mac:
   touchenv import --begin               (new Mac) prints tenv1:… and a check code
@@ -127,7 +151,7 @@ func startTime(_ pid: pid_t) -> UInt64? {
 struct Requester { let pid: pid_t; let start: UInt64; let name: String; var isAgent = false; var exec = "" }
 
 /// The nearest ancestor that is not a shell or a wrapper: the agent, or the terminal when you typed it yourself.
-func requester(from first: pid_t = getppid()) -> Requester {
+func requester(from first: pid_t = getppid(), through extra: Set<String> = []) -> Requester {
     let passThrough: Set<String> = ["sh", "zsh", "bash", "fish", "dash", "ksh", "tcsh", "env", "sudo", "login",
                                     "nohup", "time", "timeout", "xargs", "make", "script", "tmux", "screen"]
     // AI agents (by executable name, not the apps of the same name): they must say why (--intent).
@@ -140,7 +164,8 @@ func requester(from first: pid_t = getppid()) -> Requester {
     var pid = first
     for _ in 0..<32 {
         guard pid > 1, let name = executableName(pid) else { break }
-        if !passThrough.contains(name.trimmingCharacters(in: CharacterSet(charactersIn: "-"))) {
+        let bare = name.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        if !passThrough.contains(bare) && !extra.contains(bare) {
             return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? name, isAgent: agents.contains(name),
                              exec: name)
         }
@@ -155,8 +180,7 @@ func requester(from first: pid_t = getppid()) -> Requester {
 /// otherwise the app the request came from: the AI app itself, the editor, or the terminal. Icons are read from
 /// the apps installed here; touchenv ships no one's logo. Like the name in the prompt, it tells you who asks; it
 /// proves nothing a program could not fake.
-func requesterIcon() -> NSImage {
-    let who = requester()
+func requesterIcon(_ who: Requester = requester()) -> NSImage {
     let makers = ["claude": ["Claude"], "codex": ["Codex", "ChatGPT"], "cursor-agent": ["Cursor"], "gemini": ["Gemini"],
                   "goose": ["Goose"], "opencode": ["OpenCode"]]
     for app in makers[who.exec] ?? [] {
@@ -236,7 +260,10 @@ final class Prompt: NSObject {
     var chosen: Outcome?
     var outcome = Outcome.denied
 
-    init(title: String, intent: String?, detail: String?, offerSession: Bool) {
+    /// `notes`: lines shown under the title (the SSH sign prompt: the server); `asker`: who asks, when it is not
+    /// this process's parent (the SSH agent asks for the process at the other end of its socket).
+    init(title: String, intent: String?, detail: String?, offerSession: Bool, notes: [String] = [],
+         asker: Requester? = nil) {
         super.init()
         // Laid out like the macOS authentication dialog: icon top left, text left aligned, buttons stacked full width.
         let width: CGFloat = 228
@@ -260,7 +287,7 @@ final class Prompt: NSObject {
             ?? NSImage(systemSymbolName: "touchid", accessibilityDescription: "Touch ID")!)
         disc.imageScaling = .scaleProportionallyUpOrDown
         disc.contentTintColor = .systemRed
-        let badge = NSImageView(image: requesterIcon())
+        let badge = NSImageView(image: requesterIcon(asker ?? requester()))
         badge.imageScaling = .scaleProportionallyUpOrDown
         let sensor = NSView()
         let frames: [(NSView, CGFloat, CGFloat, CGFloat)] = [(reader, 0, 6, 64), (cover, 0, 0, 74), (disc, 0, 6, 64),
@@ -279,12 +306,17 @@ final class Prompt: NSObject {
         let heading = label("", .systemFont(ofSize: 13))
         heading.attributedStringValue = titleText(title)
         var views: [NSView] = [sensor, heading]
+        for note in notes {
+            let line = label("", .systemFont(ofSize: 12))
+            line.attributedStringValue = titleText(note)
+            views.append(line)
+        }
         if let intent {
             let line = label("", .systemFont(ofSize: 13))
             line.attributedStringValue = titleText("\(strong("INTENT:")) \(intent)")
             views.append(line)
         }
-        else if detail != nil {
+        else if detail != nil && notes.isEmpty {
             // No reason given: say so, and show the command without a click.
             views.append(label("No reason given. Check the command:", .systemFont(ofSize: 13), .systemOrange))
         }
@@ -353,14 +385,26 @@ final class Prompt: NSObject {
     @objc func usePassword() { chosen = .password; context.invalidate() }
     @objc func cancel() { chosen = .denied; context.invalidate() }
 
-    func run(reason: String) -> Outcome {
+    /// Shows the window and waits for a finger without blocking: `done` runs on the main thread with the outcome.
+    /// With `timeout`, no answer in that time counts as Cancel.
+    func show(reason: String, timeout: TimeInterval? = nil, done: @escaping (Outcome) -> Void) {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         panel.center()
         app.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, error in
+        var finished = false
+        let asked = context
+        if let timeout {
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                guard let self, !finished else { return }
+                self.chosen = .denied
+                asked.invalidate()
+            }
+        }
+        asked.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, error in
             DispatchQueue.main.async {
+                finished = true
                 let code = (error as? LAError)?.code
                 if success { self.outcome = .approved }
                 else if let chosen = self.chosen { self.outcome = chosen }
@@ -368,11 +412,18 @@ final class Prompt: NSObject {
                     self.outcome = .password
                 }
                 self.panel.orderOut(nil)
-                app.stop(nil)
-                app.postEvent(NSEvent.otherEvent(with: .applicationDefined, location: .zero, modifierFlags: [],
-                                                 timestamp: 0, windowNumber: 0, context: nil, subtype: 0,
-                                                 data1: 0, data2: 0)!, atStart: true)
+                done(self.outcome)
             }
+        }
+    }
+
+    func run(reason: String) -> Outcome {
+        let app = NSApplication.shared
+        show(reason: reason) { _ in
+            app.stop(nil)
+            app.postEvent(NSEvent.otherEvent(with: .applicationDefined, location: .zero, modifierFlags: [],
+                                             timestamp: 0, windowNumber: 0, context: nil, subtype: 0,
+                                             data1: 0, data2: 0)!, atStart: true)
         }
         app.run()
         return outcome
@@ -409,6 +460,37 @@ func authenticate(_ title: String, intent: String?, detail: String? = nil, reaso
     done.wait()
     if !ok { die("touchenv: not approved") }
     return keep
+}
+
+/// The same questions as authenticate(), for a process that keeps running (the SSH agent): nothing blocks the main
+/// thread and nothing exits. A fresh LAContext each time; on approval the global `context` has passed, for the read.
+/// `done(approved, keepFor5Minutes)` runs on the main thread. Call on the main thread, one at a time.
+var activePrompt: Prompt?
+func authenticateAsync(_ title: String, notes: [String], detail: String?, reason: String, asker: Requester,
+                       offerSession: Bool, timeout: TimeInterval, done: @escaping (Bool, Bool) -> Void) {
+    context = LAContext()
+    func systemDialog() {
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { done(false, false); return }
+        let asked = context
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { asked.invalidate() }
+        asked.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, _ in
+            DispatchQueue.main.async { done(success, false) }
+        }
+    }
+    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) else { systemDialog(); return }
+    let prompt = Prompt(title: title, intent: nil, detail: detail, offerSession: offerSession, notes: notes, asker: asker)
+    activePrompt = prompt
+    prompt.show(reason: reason, timeout: timeout) { outcome in
+        activePrompt = nil
+        switch outcome {
+        case .approved: done(true, prompt.keepFor5Minutes)
+        case .denied: done(false, false)
+        case .password:
+            context = LAContext()
+            systemDialog()
+        }
+    }
 }
 
 // MARK: Keychain
@@ -469,8 +551,9 @@ func place(_ names: [String]) -> String {
     return sync == [true] ? "iCloud Keychain" : sync == [false] ? "your Keychain" : "your Keychain and iCloud Keychain"
 }
 
-func add(_ name: String, _ data: Data, sync: Bool) {
+func add(_ name: String, _ data: Data, sync: Bool, extra: [String: Any] = [:]) {
     var q = query(name)
+    q.merge(extra) { _, new in new }
     q[kSecValueData as String] = data
     q[kSecAttrLabel as String] = "touchenv: \(name)"
     q.removeValue(forKey: kSecUseAuthenticationContext as String)
@@ -488,12 +571,18 @@ func add(_ name: String, _ data: Data, sync: Bool) {
     if status != errSecSuccess { die("touchenv: keychain error \(status)") }
 }
 
-func read(_ name: String) -> Data {
+/// The secret, or nil and why; never exits (the SSH agent keeps running).
+func readSecret(_ name: String) -> (data: Data?, status: OSStatus) {
     var q = query(name)
     q[kSecReturnData as String] = true
     var out: CFTypeRef?
     let status = SecItemCopyMatching(q as CFDictionary, &out)
-    guard status == errSecSuccess, let data = out as? Data else {
+    return (status == errSecSuccess ? out as? Data : nil, status)
+}
+
+func read(_ name: String) -> Data {
+    let (data, status) = readSecret(name)
+    guard status == errSecSuccess, let data else {
         die(status == errSecItemNotFound ? "touchenv: no secret named \(name)" : "touchenv: keychain error \(status)")
     }
     return data
@@ -717,10 +806,18 @@ final class Agent: NSObject {
     func handle(_ fd: Int32) {
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        guard peerIsTouchenv(fd), let peer = peerPid(fd), let parent = parentPid(peer),
+        guard peerIsTouchenv(fd), let peer = peerPid(fd), var parent = parentPid(peer),
               let message = receiveMessage(fd), let op = message["op"] as? String else { return }
         // The agent works out the requester itself, from the kernel's process tree; it takes no one's word for it.
-        let who = requester(from: parent)
+        // Except touchenv's SSH agent's (the peer is touchenv, checked above): it asks for the process at the other end
+        // of its own socket, as the kernel told it (LOCAL_PEERPID), named by pid and start time.
+        var who = requester(from: parent)
+        if let asker = message["for"] as? Int, let start = message["forStart"] as? Int {
+            guard asker > 1, startTime(pid_t(asker)).map({ Int($0) }) == start else { sendMessage(fd, ["ok": false]); return }
+            parent = pid_t(asker)
+            who = requester(from: parent, through: sshTools)
+        }
+        let ssh = message["ssh"] as? String
         switch op {
         case "grant":
             guard who.pid > 1, let encoded = message["secrets"] as? [String: String] else { break }
@@ -756,15 +853,11 @@ final class Agent: NSObject {
                 for name in names { out[name] = approval.secrets[name]!.base64EncodedString() }
                 sendMessage(fd, ["ok": true, "secrets": out])
                 let left = Int(approval.expires.timeIntervalSince(now).rounded(.up))
-                showNotice(who: approval.who, names: names, intent: intent, left: "approved for \(clock(left)) more")
+                showNotice(who: approval.who, names: names, intent: intent, left: "approved for \(clock(left)) more", ssh: ssh)
                 return
             }
             // A grant: the asking process must sit below the requester the grant was given to.
-            let above = lineage(parent)
-            guard let index = grants.firstIndex(where: { grant in
-                grant.expires > now && grant.uses > 0 && names.allSatisfy({ grant.secrets[$0] != nil })
-                    && above.contains { $0.pid == grant.pid && $0.start == grant.start }
-            }) else { break }
+            guard let index = Agent.coveringGrant(grants, names: names, above: lineage(parent), now: now) else { break }
             grants[index].uses -= 1
             let grant = grants[index]
             var out: [String: String] = [:]
@@ -773,7 +866,7 @@ final class Agent: NSObject {
             let left = Int(grant.expires.timeIntervalSince(now).rounded(.up))
             showNotice(who: who.name, names: names, intent: intent,
                        left: grant.uses == 0 ? "that was the last use granted"
-                                             : "granted for \(clock(left)) more, \(times(grant.uses)) left")
+                                             : "granted for \(clock(left)) more, \(times(grant.uses)) left", ssh: ssh)
             return
         case "lock":
             approvals.removeAll()
@@ -784,6 +877,14 @@ final class Agent: NSObject {
         default: break
         }
         sendMessage(fd, ["ok": false])
+    }
+
+    /// The grant that covers a process (`above`: it and its ancestors) for every one of `names`, if any.
+    static func coveringGrant(_ grants: [Grant], names: [String], above: [(pid: pid_t, start: UInt64)], now: Date) -> Int? {
+        grants.firstIndex { grant in
+            grant.expires > now && grant.uses > 0 && names.allSatisfy({ grant.secrets[$0] != nil })
+                && above.contains { $0.pid == grant.pid && $0.start == grant.start }
+        }
     }
 
     /// Drops what expired or whose requester ended; quits when nothing is left.
@@ -831,9 +932,9 @@ final class Agent: NSObject {
     }
 
     /// A short notice at the top right each time an approval is used, so it never happens unseen.
-    func showNotice(who: String, names: [String], intent: String?, left: String) {
+    func showNotice(who: String, names: [String], intent: String?, left: String, ssh: String? = nil) {
         notice?.orderOut(nil)
-        var lines = ["\(who) read \(names.joined(separator: ", "))"]
+        var lines = [ssh.map { "\(who) used \(names.joined(separator: ", ")) to \($0)" } ?? "\(who) read \(names.joined(separator: ", "))"]
         if let intent { lines.append("INTENT: \(intent)") }
         lines.append("No Touch ID asked: \(left). Lock in the menu bar.")
         let stack = NSStackView(views: lines.enumerated().map { index, line in
@@ -989,7 +1090,1626 @@ func transferKey(_ secret: SharedSecret, header: Data) -> SymmetricKey {
                                    outputByteCount: 32)
 }
 
+// MARK: SSH keys: the formats
+//
+// Everything that parses comes from outside (a key file, a client on the agent socket), so every length is checked
+// against what is left before anything is allocated, and nothing may follow the last field.
+
+/// Programs between an SSH client and whoever started it: walked past to find who asks, named in the prompt as "via".
+let sshTools: Set<String> = ["ssh", "scp", "sftp", "rsync", "git", "ssh-keygen", "ssh-add"]
+let sshKeyMarker = "touchenv ssh key"   // kSecAttrDescription of the items `touchenv ssh add` stores
+let sshAgentMaxMessage = 256 * 1024     // as OpenSSH's ssh-agent
+let sshDefaultLoad: TimeInterval = 60 * 60
+
+struct SSHFormatError: Error, CustomStringConvertible { let description: String; init(_ d: String) { description = d } }
+
+/// Overwrites secret bytes before they are let go. Best effort: copies Swift or the frameworks made are not reached.
+func wipe(_ bytes: inout [UInt8]) {
+    let count = bytes.count
+    if count > 0 { bytes.withUnsafeMutableBytes { _ = memset_s($0.baseAddress, count, 0, count) } }
+    bytes.removeAll()
+}
+
+struct SSHReader {
+    let bytes: [UInt8]
+    var at = 0
+    init(_ bytes: [UInt8]) { self.bytes = bytes }
+    var left: Int { bytes.count - at }
+    var done: Bool { at == bytes.count }
+
+    mutating func u8() throws -> UInt8 {
+        guard left >= 1 else { throw SSHFormatError("truncated") }
+        at += 1
+        return bytes[at - 1]
+    }
+    mutating func u32() throws -> UInt32 {
+        guard left >= 4 else { throw SSHFormatError("truncated") }
+        defer { at += 4 }
+        return bytes[at..<at + 4].reduce(0) { $0 << 8 | UInt32($1) }
+    }
+    mutating func raw(_ n: Int) throws -> [UInt8] {
+        guard n >= 0, left >= n else { throw SSHFormatError("truncated") }
+        defer { at += n }
+        return Array(bytes[at..<at + n])
+    }
+    /// A length-prefixed string; the length is trusted only as far as the bytes that are really there.
+    mutating func string(max: Int = sshAgentMaxMessage) throws -> [UInt8] {
+        let n = Int(try u32())
+        guard n <= max else { throw SSHFormatError("field too long") }
+        return try raw(n)
+    }
+    mutating func text(max: Int = 1024) throws -> String {
+        guard let s = String(bytes: try string(max: max), encoding: .utf8) else { throw SSHFormatError("not UTF-8") }
+        return s
+    }
+    mutating func bool() throws -> Bool {
+        switch try u8() { case 0: return false; case 1: return true; default: throw SSHFormatError("bad boolean") }
+    }
+    /// An mpint that must be positive: its magnitude, no leading zero.
+    mutating func mpint(maxBytes: Int) throws -> [UInt8] {
+        let field = try string(max: maxBytes + 1)
+        if let first = field.first, first & 0x80 != 0 { throw SSHFormatError("negative number") }
+        if field.count >= 2, field[0] == 0, field[1] & 0x80 == 0 { throw SSHFormatError("badly encoded number") }
+        let magnitude = Array(field.drop { $0 == 0 })
+        guard !magnitude.isEmpty, magnitude.count <= maxBytes else { throw SSHFormatError("number out of range") }
+        return magnitude
+    }
+    func end() throws { if !done { throw SSHFormatError("trailing bytes") } }
+}
+
+struct SSHWriter {
+    var bytes: [UInt8] = []
+    mutating func u8(_ v: UInt8) { bytes.append(v) }
+    mutating func u32(_ v: UInt32) { bytes += [UInt8(v >> 24), UInt8(v >> 16 & 0xff), UInt8(v >> 8 & 0xff), UInt8(v & 0xff)] }
+    mutating func string(_ s: [UInt8]) { u32(UInt32(s.count)); bytes += s }
+    mutating func string(_ s: String) { string(Array(s.utf8)) }
+    mutating func mpint(_ magnitude: [UInt8]) {
+        let m = Array(magnitude.drop { $0 == 0 })
+        string(m.first.map { $0 & 0x80 != 0 } == true ? [0] + m : m)
+    }
+}
+
+enum SSHKeyKind: CaseIterable {
+    case ed25519, ecdsa256, ecdsa384, ecdsa521, rsa
+
+    var typeName: String {
+        switch self {
+        case .ed25519: return "ssh-ed25519"
+        case .ecdsa256: return "ecdsa-sha2-nistp256"
+        case .ecdsa384: return "ecdsa-sha2-nistp384"
+        case .ecdsa521: return "ecdsa-sha2-nistp521"
+        case .rsa: return "ssh-rsa"
+        }
+    }
+    var curve: String { String(typeName.suffix(8)) }               // nistp256…
+    var scalarSize: Int { [.ecdsa256: 32, .ecdsa384: 48, .ecdsa521: 66][self] ?? 0 }
+    var pointSize: Int { 1 + 2 * scalarSize }
+    var label: String { self == .ed25519 ? "ED25519" : self == .rsa ? "RSA" : "ECDSA" }
+    static func named(_ type: String) -> SSHKeyKind? { allCases.first { $0.typeName == type } }
+}
+
+/// What touchenv can't sign with, by the name OpenSSH gives it, for a clear refusal.
+func unsupportedKeyReason(_ type: String) -> String {
+    if type.hasPrefix("sk-") { return "a security-key (FIDO) key: its private half lives on the token, there is nothing to store" }
+    if type.contains("-cert-") { return "a certificate: add the key it certifies instead" }
+    if type == "ssh-dss" { return "a DSA key, which OpenSSH no longer accepts" }
+    return "a \(type) key, which touchenv can't sign with"
+}
+
+struct SSHPublicKey: Equatable {
+    let kind: SSHKeyKind
+    let blob: [UInt8]
+    let bits: Int
+
+    /// Checks a public key blob: the type touchenv signs with, every field the right size, nothing after.
+    init(blob: [UInt8]) throws {
+        var r = SSHReader(blob)
+        let type = try r.text(max: 64)
+        guard let kind = SSHKeyKind.named(type) else { throw SSHFormatError(unsupportedKeyReason(type)) }
+        switch kind {
+        case .ed25519:
+            guard try r.string(max: 32).count == 32 else { throw SSHFormatError("bad Ed25519 key") }
+            bits = 256
+        case .ecdsa256, .ecdsa384, .ecdsa521:
+            guard try r.text(max: 16) == kind.curve else { throw SSHFormatError("curve doesn't match the key type") }
+            let q = try r.string(max: kind.pointSize)
+            guard q.count == kind.pointSize, q[0] == 4, publicPoint(kind, q) else { throw SSHFormatError("bad ECDSA point") }
+            bits = kind == .ecdsa521 ? 521 : kind.scalarSize * 8
+        case .rsa:
+            let e = try r.mpint(maxBytes: 8), n = try r.mpint(maxBytes: 2048)
+            bits = (n.count - 1) * 8 + (8 - n[0].leadingZeroBitCount)
+            guard bits >= 1024, e.last! & 1 == 1 else { throw SSHFormatError("RSA key too small or malformed") }
+        }
+        try r.end()
+        self.kind = kind
+        self.blob = blob
+    }
+
+    var fingerprint: String {
+        "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().replacingOccurrences(of: "=", with: "")
+    }
+    func line(comment: String) -> String { "\(kind.typeName) \(Data(blob).base64EncodedString()) \(comment)" }
+
+    /// The parts after the type: Ed25519's 32 bytes, an ECDSA point, RSA's (e, n).
+    var fields: (ed: [UInt8], point: [UInt8], e: [UInt8], n: [UInt8]) {
+        var r = SSHReader(blob)
+        _ = try? r.string()
+        switch kind {
+        case .ed25519: return ((try? r.string()) ?? [], [], [], [])
+        case .rsa:
+            let e = (try? r.mpint(maxBytes: 8)) ?? [], n = (try? r.mpint(maxBytes: 2048)) ?? []
+            return ([], [], e, n)
+        default:
+            _ = try? r.string()
+            return ([], (try? r.string()) ?? [], [], [])
+        }
+    }
+
+    /// From an OpenSSH public key line ("ssh-ed25519 AAAA… comment").
+    init?(line: String) {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2, let data = Data(base64Encoded: String(parts[1])),
+              let key = try? SSHPublicKey(blob: [UInt8](data)), key.kind.typeName == parts[0] else { return nil }
+        self = key
+    }
+}
+
+func publicPoint(_ kind: SSHKeyKind, _ q: [UInt8]) -> Bool {
+    switch kind {
+    case .ecdsa256: return (try? P256.Signing.PublicKey(x963Representation: q)) != nil
+    case .ecdsa384: return (try? P384.Signing.PublicKey(x963Representation: q)) != nil
+    case .ecdsa521: return (try? P521.Signing.PublicKey(x963Representation: q)) != nil
+    default: return false
+    }
+}
+
+// MARK: SSH keys: RSA arithmetic and DER, for Security.framework
+//
+// SecKeyCreateWithData takes an RSA private key as PKCS#1, which carries d mod (p-1) and d mod (q-1); OpenSSH's
+// format doesn't. Two remainders are all the big-number arithmetic needed.
+
+/// a mod m, both big-endian magnitudes, m > 0: shift-and-subtract, one bit at a time.
+func bigMod(_ a: [UInt8], _ m: [UInt8]) -> [UInt8] {
+    let width = (m.count + 3) / 4 + 1
+    func limbs(_ x: [UInt8]) -> [UInt32] {
+        var out = [UInt32](repeating: 0, count: width)
+        for (i, byte) in x.reversed().enumerated() { out[i / 4] |= UInt32(byte) << (8 * UInt32(i % 4)) }
+        return out
+    }
+    let mod = limbs(m)
+    var r = [UInt32](repeating: 0, count: width)
+    for byte in a {
+        for bit in stride(from: 7, through: 0, by: -1) {
+            var carry = UInt32(byte >> UInt8(bit) & 1)
+            for i in 0..<width { let v = r[i]; r[i] = v << 1 | carry; carry = v >> 31 }
+            var geq = true
+            for i in stride(from: width - 1, through: 0, by: -1) where r[i] != mod[i] { geq = r[i] > mod[i]; break }
+            if geq {
+                var borrow: UInt64 = 0
+                for i in 0..<width {
+                    let d = UInt64(r[i]) &- UInt64(mod[i]) &- borrow
+                    r[i] = UInt32(truncatingIfNeeded: d)
+                    borrow = d >> 63
+                }
+            }
+        }
+    }
+    var out: [UInt8] = []
+    for limb in r.reversed() { out += [UInt8(limb >> 24), UInt8(limb >> 16 & 0xff), UInt8(limb >> 8 & 0xff), UInt8(limb & 0xff)] }
+    for i in 0..<r.count { r[i] = 0 }
+    return Array(out.drop { $0 == 0 })
+}
+
+func derLength(_ n: Int) -> [UInt8] {
+    if n < 128 { return [UInt8(n)] }
+    var bytes: [UInt8] = []
+    var v = n
+    while v > 0 { bytes.insert(UInt8(v & 0xff), at: 0); v >>= 8 }
+    return [0x80 | UInt8(bytes.count)] + bytes
+}
+func derInteger(_ magnitude: [UInt8]) -> [UInt8] {
+    var m = Array(magnitude.drop { $0 == 0 })
+    if m.isEmpty || m[0] & 0x80 != 0 { m.insert(0, at: 0) }
+    return [0x02] + derLength(m.count) + m
+}
+func derSequence(_ parts: [[UInt8]]) -> [UInt8] {
+    let body = parts.flatMap { $0 }
+    return [0x30] + derLength(body.count) + body
+}
+
+func rsaPublicKey(n: [UInt8], e: [UInt8]) -> SecKey? {
+    let der = derSequence([derInteger(n), derInteger(e)])
+    return SecKeyCreateWithData(Data(der) as CFData, [kSecAttrKeyType: kSecAttrKeyTypeRSA,
+                                                      kSecAttrKeyClass: kSecAttrKeyClassPublic] as CFDictionary, nil)
+}
+
+// MARK: SSH keys: private keys
+
+/// An SSH private key in memory. The secret parts are wiped when it goes.
+final class SSHPrivateKey {
+    let publicKey: SSHPublicKey
+    let comment: String
+    /// The key as the agent protocol adds it (type and fields, the same bytes as in the file's private section).
+    var record: [UInt8]
+    var secret: [UInt8]                    // Ed25519 seed (32), ECDSA scalar (padded), or RSA d
+    var p: [UInt8] = [], q: [UInt8] = [], iqmp: [UInt8] = []
+
+    init(publicKey: SSHPublicKey, comment: String, record: [UInt8], secret: [UInt8]) {
+        self.publicKey = publicKey
+        self.comment = comment
+        self.record = record
+        self.secret = secret
+    }
+    deinit { wipe(&record); wipe(&secret); wipe(&p); wipe(&q); wipe(&iqmp) }
+
+    /// An SSH signature blob over `data`. RSA: rsa-sha2-512 with flag 4, rsa-sha2-256 with flag 2; plain ssh-rsa
+    /// (SHA-1) is refused, as OpenSSH itself has done by default since 8.8.
+    func sign(_ data: [UInt8], flags: UInt32 = 0) throws -> [UInt8] {
+        var out = SSHWriter()
+        switch publicKey.kind {
+        case .ed25519:
+            let key = try Curve25519.Signing.PrivateKey(rawRepresentation: secret)
+            out.string("ssh-ed25519")
+            out.string([UInt8](try key.signature(for: Data(data))))
+        case .ecdsa256, .ecdsa384, .ecdsa521:
+            let raw: Data
+            switch publicKey.kind {
+            case .ecdsa256: raw = try P256.Signing.PrivateKey(rawRepresentation: secret).signature(for: Data(data)).rawRepresentation
+            case .ecdsa384: raw = try P384.Signing.PrivateKey(rawRepresentation: secret).signature(for: Data(data)).rawRepresentation
+            default: raw = try P521.Signing.PrivateKey(rawRepresentation: secret).signature(for: Data(data)).rawRepresentation
+            }
+            let half = raw.count / 2
+            var inner = SSHWriter()
+            inner.mpint([UInt8](raw.prefix(half)))
+            inner.mpint([UInt8](raw.suffix(half)))
+            out.string(publicKey.kind.typeName)
+            out.string(inner.bytes)
+        case .rsa:
+            let (algorithm, name): (SecKeyAlgorithm, String)
+            if flags & 4 != 0 { (algorithm, name) = (.rsaSignatureMessagePKCS1v15SHA512, "rsa-sha2-512") }
+            else if flags & 2 != 0 { (algorithm, name) = (.rsaSignatureMessagePKCS1v15SHA256, "rsa-sha2-256") }
+            else { throw SSHFormatError("ssh-rsa (SHA-1) signatures are refused; the server needs rsa-sha2-256 or -512") }
+            guard let key = rsaSecKey() else { throw SSHFormatError("Security.framework refused the RSA key") }
+            var error: Unmanaged<CFError>?
+            guard let signature = SecKeyCreateSignature(key, algorithm, Data(data) as CFData, &error) as Data? else {
+                throw SSHFormatError("RSA signing failed")
+            }
+            out.string(name)
+            out.string([UInt8](signature))
+        }
+        return out.bytes
+    }
+
+    func rsaSecKey() -> SecKey? {
+        let f = publicKey.fields
+        var p1 = p, q1 = q
+        p1[p1.count - 1] -= 1   // p and q are odd (checked on parsing): no borrow
+        q1[q1.count - 1] -= 1
+        var dp = bigMod(secret, p1), dq = bigMod(secret, q1)
+        var der = derSequence([derInteger([0]), derInteger(f.n), derInteger(f.e), derInteger(secret), derInteger(p),
+                               derInteger(q), derInteger(dp), derInteger(dq), derInteger(iqmp)])
+        defer { wipe(&p1); wipe(&q1); wipe(&dp); wipe(&dq); wipe(&der) }
+        return SecKeyCreateWithData(Data(der) as CFData, [kSecAttrKeyType: kSecAttrKeyTypeRSA,
+                                                          kSecAttrKeyClass: kSecAttrKeyClassPrivate] as CFDictionary, nil)
+    }
+
+    /// Signs and verifies a random message: catches a private half that doesn't belong to the public one.
+    func selfTest() -> Bool {
+        let probe = (0..<32).map { _ in UInt8.random(in: 0...255) }
+        guard let signature = try? sign(probe, flags: 2) else { return false }
+        return verifySSHSignature(publicBlob: publicKey.blob, signature: signature, data: probe)
+    }
+}
+
+/// Reads one key record (type, fields) from a private section, up to but not including its comment.
+func readPrivateRecord(_ r: inout SSHReader) throws -> (SSHPublicKey, [UInt8], secret: [UInt8], rsa: [[UInt8]]) {
+    let start = r.at
+    let type = try r.text(max: 64)
+    guard let kind = SSHKeyKind.named(type) else { throw SSHFormatError(unsupportedKeyReason(type)) }
+    var pub = SSHWriter()
+    pub.string(type)
+    switch kind {
+    case .ed25519:
+        let pk = try r.string(max: 32), sk = try r.string(max: 64)
+        guard pk.count == 32, sk.count == 64, Array(sk[32...]) == pk else { throw SSHFormatError("bad Ed25519 key") }
+        pub.string(pk)
+        let key = try SSHPublicKey(blob: pub.bytes)
+        guard (try? Curve25519.Signing.PrivateKey(rawRepresentation: Array(sk[..<32])).publicKey.rawRepresentation)
+                .map({ [UInt8]($0) == pk }) == true else { throw SSHFormatError("Ed25519 private and public halves differ") }
+        return (key, Array(r.bytes[start..<r.at]), Array(sk[..<32]), [])
+    case .ecdsa256, .ecdsa384, .ecdsa521:
+        guard try r.text(max: 16) == kind.curve else { throw SSHFormatError("curve doesn't match the key type") }
+        let q = try r.string(max: kind.pointSize)
+        let d = try r.mpint(maxBytes: kind.scalarSize)
+        pub.string(kind.curve)
+        pub.string(q)
+        let key = try SSHPublicKey(blob: pub.bytes)
+        let scalar = [UInt8](repeating: 0, count: kind.scalarSize - d.count) + d
+        let derived: Data?
+        switch kind {
+        case .ecdsa256: derived = try? P256.Signing.PrivateKey(rawRepresentation: scalar).publicKey.x963Representation
+        case .ecdsa384: derived = try? P384.Signing.PrivateKey(rawRepresentation: scalar).publicKey.x963Representation
+        default: derived = try? P521.Signing.PrivateKey(rawRepresentation: scalar).publicKey.x963Representation
+        }
+        guard derived.map({ [UInt8]($0) == q }) == true else { throw SSHFormatError("ECDSA private and public halves differ") }
+        return (key, Array(r.bytes[start..<r.at]), scalar, [])
+    case .rsa:
+        let n = try r.mpint(maxBytes: 2048), e = try r.mpint(maxBytes: 8), d = try r.mpint(maxBytes: 2048)
+        let iqmp = try r.mpint(maxBytes: 1024), p = try r.mpint(maxBytes: 1024), q = try r.mpint(maxBytes: 1024)
+        guard p.last! & 1 == 1, q.last! & 1 == 1, p.count > 1, q.count > 1 else { throw SSHFormatError("bad RSA key") }
+        pub.mpint(e)
+        pub.mpint(n)
+        let key = try SSHPublicKey(blob: pub.bytes)
+        return (key, Array(r.bytes[start..<r.at]), d, [p, q, iqmp])
+    }
+}
+
+/// The base64 inside "-----BEGIN OPENSSH PRIVATE KEY-----" … "-----END …", decoded into bytes that can be wiped.
+func dearmor(_ text: [UInt8], label: String) -> [UInt8]? {
+    let begin = Array("-----BEGIN \(label)-----".utf8), end = Array("-----END \(label)-----".utf8)
+    func find(_ needle: [UInt8], from: Int) -> Int? {
+        guard text.count >= needle.count, from <= text.count - needle.count else { return nil }
+        return (from...(text.count - needle.count)).first { text[$0..<$0 + needle.count].elementsEqual(needle) }
+    }
+    guard let b = find(begin, from: 0), let e = find(end, from: b + begin.count) else { return nil }
+    // Only whitespace around the armor.
+    let blank: Set<UInt8> = [9, 10, 13, 32]
+    guard text[..<b].allSatisfy(blank.contains), text[(e + end.count)...].allSatisfy(blank.contains) else { return nil }
+    var out: [UInt8] = [], acc: UInt32 = 0, bits = 0, padding = 0
+    for c in text[(b + begin.count)..<e] {
+        let v: UInt32
+        switch c {
+        case 65...90: v = UInt32(c - 65)
+        case 97...122: v = UInt32(c - 71)
+        case 48...57: v = UInt32(c + 4)
+        case 43: v = 62
+        case 47: v = 63
+        case 61: padding += 1; continue
+        case 9, 10, 13, 32: continue
+        default: return nil
+        }
+        if padding > 0 { return nil }
+        acc = acc << 6 | v
+        bits += 6
+        if bits >= 8 { bits -= 8; out.append(UInt8(acc >> UInt32(bits) & 0xff)) }
+    }
+    acc = 0
+    return padding <= 2 ? out : nil
+}
+
+enum SSHKeyFile {
+    case openssh(SSHPrivateKey)
+    /// Needs ssh-keygen to turn it into an unencrypted OpenSSH key; `passphrase`: whether it is encrypted.
+    case convert(passphrase: Bool)
+}
+
+/// Reads a private key file's text. Unencrypted OpenSSH keys are parsed here; anything else ssh-keygen can read
+/// (encrypted keys, the older PEM and PKCS#8 formats) comes back as .convert.
+func parseSSHKeyFile(_ text: [UInt8]) throws -> SSHKeyFile {
+    let s = String(decoding: text.prefix(200), as: UTF8.self)
+    if s.contains("BEGIN SSH2 ENCRYPTED PRIVATE KEY") || s.contains("PuTTY-User-Key-File") {
+        throw SSHFormatError("not an OpenSSH key file: convert it with ssh-keygen or PuTTYgen first")
+    }
+    if !s.contains("BEGIN OPENSSH PRIVATE KEY") {
+        if s.contains("BEGIN DSA PRIVATE KEY") { throw SSHFormatError(unsupportedKeyReason("ssh-dss")) }
+        let pem = ["BEGIN RSA PRIVATE KEY", "BEGIN EC PRIVATE KEY", "BEGIN PRIVATE KEY", "BEGIN ENCRYPTED PRIVATE KEY"]
+        guard pem.contains(where: s.contains) else {
+            if s.hasPrefix("ssh-") || s.hasPrefix("ecdsa-") { throw SSHFormatError("that is a public key (.pub); give the private key file") }
+            throw SSHFormatError("not an SSH private key file")
+        }
+        let all = String(decoding: text, as: UTF8.self)
+        return .convert(passphrase: all.contains("ENCRYPTED"))
+    }
+    guard var bytes = dearmor(text, label: "OPENSSH PRIVATE KEY") else { throw SSHFormatError("damaged key file") }
+    defer { wipe(&bytes) }
+    var r = SSHReader(bytes)
+    guard try r.raw(15) == Array("openssh-key-v1\0".utf8) else { throw SSHFormatError("not an openssh-key-v1 file") }
+    let cipher = try r.text(max: 64), kdf = try r.text(max: 64)
+    let kdfOptions = try r.string(max: 1024)
+    guard try r.u32() == 1 else { throw SSHFormatError("the file holds more than one key") }
+    let publicBlob = try r.string(max: 4096)
+    if cipher != "none" { return .convert(passphrase: true) }
+    guard kdf == "none", kdfOptions.isEmpty else { throw SSHFormatError("unencrypted key with a KDF") }
+    var section = try r.string(max: 65536)
+    defer { wipe(&section) }
+    try r.end()
+    // The key's public type, for a clear refusal before the private section is read.
+    var typeReader = SSHReader(publicBlob)
+    let publicType = try typeReader.text(max: 64)
+    guard SSHKeyKind.named(publicType) != nil else { throw SSHFormatError(unsupportedKeyReason(publicType)) }
+
+    var p = SSHReader(section)
+    let check1 = try p.u32(), check2 = try p.u32()
+    guard check1 == check2 else { throw SSHFormatError("damaged key file (check bytes differ)") }
+    var (key, record, secret, rsa) = try readPrivateRecord(&p)
+    let comment = (try? p.text(max: 4096)) ?? ""
+    // Padding 1, 2, 3… up to the block size (8 without a cipher).
+    var expected: UInt8 = 1
+    while !p.done {
+        guard try p.u8() == expected, expected < 8 else { throw SSHFormatError("damaged key file (padding)") }
+        expected += 1
+    }
+    guard key.blob == publicBlob else { throw SSHFormatError("the file's public and private keys differ") }
+    let out = SSHPrivateKey(publicKey: key, comment: comment, record: record, secret: secret)
+    if key.kind == .rsa { out.p = rsa[0]; out.q = rsa[1]; out.iqmp = rsa[2] }
+    wipe(&record); wipe(&secret)
+    for i in rsa.indices { wipe(&rsa[i]) }
+    guard out.selfTest() else { throw SSHFormatError("the key fails a test signature") }
+    return .openssh(out)
+}
+
+/// Verifies an SSH signature blob made by `publicBlob`'s key over `data`.
+func verifySSHSignature(publicBlob: [UInt8], signature: [UInt8], data: [UInt8]) -> Bool {
+    guard let key = try? SSHPublicKey(blob: publicBlob) else { return false }
+    var r = SSHReader(signature)
+    guard let algorithm = try? r.text(max: 64), let sig = try? r.string(max: 2048), r.done else { return false }
+    let f = key.fields
+    switch key.kind {
+    case .ed25519:
+        guard algorithm == "ssh-ed25519", let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: f.ed) else { return false }
+        return pk.isValidSignature(Data(sig), for: Data(data))
+    case .ecdsa256, .ecdsa384, .ecdsa521:
+        var inner = SSHReader(sig)
+        let size = key.kind.scalarSize
+        guard algorithm == key.kind.typeName, let rr = try? inner.mpint(maxBytes: size), let ss = try? inner.mpint(maxBytes: size),
+              inner.done else { return false }
+        let raw = Data([UInt8](repeating: 0, count: size - rr.count) + rr + [UInt8](repeating: 0, count: size - ss.count) + ss)
+        switch key.kind {
+        case .ecdsa256:
+            guard let pk = try? P256.Signing.PublicKey(x963Representation: f.point),
+                  let s = try? P256.Signing.ECDSASignature(rawRepresentation: raw) else { return false }
+            return pk.isValidSignature(s, for: Data(data))
+        case .ecdsa384:
+            guard let pk = try? P384.Signing.PublicKey(x963Representation: f.point),
+                  let s = try? P384.Signing.ECDSASignature(rawRepresentation: raw) else { return false }
+            return pk.isValidSignature(s, for: Data(data))
+        default:
+            guard let pk = try? P521.Signing.PublicKey(x963Representation: f.point),
+                  let s = try? P521.Signing.ECDSASignature(rawRepresentation: raw) else { return false }
+            return pk.isValidSignature(s, for: Data(data))
+        }
+    case .rsa:
+        let algorithms: [String: SecKeyAlgorithm] = ["rsa-sha2-256": .rsaSignatureMessagePKCS1v15SHA256,
+                                                     "rsa-sha2-512": .rsaSignatureMessagePKCS1v15SHA512]
+        guard let alg = algorithms[algorithm], let pk = rsaPublicKey(n: f.n, e: f.e) else { return false }
+        return SecKeyVerifySignature(pk, alg, Data(data) as CFData, Data(sig) as CFData, nil)
+    }
+}
+
+// MARK: SSH keys: what a signature is for
+
+struct SessionBind { let hostKey: [UInt8]; let sessionID: [UInt8]; let forwarding: Bool }
+
+enum SignPurpose: Equatable {
+    /// An ssh login (SSH_MSG_USERAUTH_REQUEST): the user, the session it belongs to, and for the hostbound method
+    /// the server's key.
+    case login(user: String, sessionID: [UInt8], hostKey: [UInt8]?)
+    /// `ssh-keygen -Y sign` (git commit and tag signing uses namespace "git").
+    case sshsig(namespace: String)
+    case other
+}
+
+/// Reads what the client asks to sign. A login names the key it signs for: it must be the key asked for.
+func signPurpose(_ data: [UInt8], key: [UInt8]) -> SignPurpose? {
+    var r = SSHReader(data)
+    if data.starts(with: Array("SSHSIG".utf8)) {
+        _ = try? r.raw(6)
+        guard let namespace = try? r.text(max: 256), (try? r.string(max: 256)) != nil,
+              (try? r.text(max: 64)) != nil, (try? r.string(max: 128)) != nil, r.done else { return .other }
+        return .sshsig(namespace: namespace)
+    }
+    guard let session = try? r.string(max: 64), !session.isEmpty, (try? r.u8()) == 50,
+          let user = try? r.text(max: 256), (try? r.text(max: 64)) == "ssh-connection",
+          let method = try? r.text(max: 64), method == "publickey" || method == "publickey-hostbound-v00@openssh.com",
+          (try? r.bool()) == true, (try? r.text(max: 64)) != nil, let blob = try? r.string(max: 16384) else { return .other }
+    var hostKey: [UInt8]?
+    if method != "publickey" { guard let k = try? r.string(max: 16384) else { return .other }; hostKey = k }
+    guard r.done else { return .other }
+    return blob == key ? .login(user: user, sessionID: session, hostKey: hostKey) : nil
+}
+
+/// Where an ssh command line connects: its destination as typed, with -l and -p folded in. nil when not ssh-like.
+func sshDestination(_ argv: [String]) -> (text: String, host: String, port: Int?)? {
+    let withArgument = Set("bceilmopBDEFIJLOPQRSwW")
+    var user: String?, port: Int?, i = 1
+    while i < argv.count {
+        let arg = argv[i]
+        if arg == "--" { i += 1; break }
+        guard arg.hasPrefix("-"), arg.count > 1 else { break }
+        var letters = Array(arg.dropFirst())
+        while let letter = letters.first {
+            letters.removeFirst()
+            guard withArgument.contains(letter) else { continue }
+            let value = letters.isEmpty ? (i + 1 < argv.count ? argv[i + 1] : "") : String(letters)
+            if letters.isEmpty { i += 1 }
+            if letter == "l" { user = value }
+            if letter == "p" { port = Int(value) }
+            if letter == "o", value.lowercased().hasPrefix("port=") { port = Int(value.dropFirst(5)) }
+            if letter == "o", value.lowercased().hasPrefix("user=") { user = String(value.dropFirst(5)) }
+            letters = []
+        }
+        i += 1
+    }
+    guard i < argv.count else { return nil }
+    var target = argv[i]
+    if target.hasPrefix("ssh://") {
+        target = String(target.dropFirst(6))
+        if let colon = target.lastIndex(of: ":"), let p = Int(target[target.index(after: colon)...]) {
+            port = p
+            target = String(target[..<colon])
+        }
+    }
+    if let at = target.lastIndex(of: "@") { user = String(target[..<at]); target = String(target[target.index(after: at)...]) }
+    guard !target.isEmpty, target.count < 256 else { return nil }
+    var text = user.map { "\($0)@\(target)" } ?? target
+    if let port, port != 22 { text += " port \(port)" }
+    return (text, target, port)
+}
+
+/// What known_hosts says about a server key: whether `host` is listed with it, and the plain names it is listed under.
+/// Hashed entries (HashKnownHosts) are matched against `host` only; wildcard and negated patterns are skipped.
+func knownHostNames(for hostKey: [UInt8], host: String?, port: Int?, files: [String]) -> (typed: Bool, names: [String]) {
+    let wanted = host.map { h in port.map { p in p == 22 ? h : "[\(h)]:\(p)" } ?? h }
+    var typed = false, names: [String] = []
+    for file in files {
+        guard let data = FileManager.default.contents(atPath: file), data.count < 8 << 20 else { continue }
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard fields.count >= 3, !fields[0].hasPrefix("#"), !fields[0].hasPrefix("@"),
+                  let key = Data(base64Encoded: String(fields[2])), [UInt8](key) == hostKey else { continue }
+            for pattern in fields[0].split(separator: ",").map(String.init) {
+                if pattern.hasPrefix("|1|") {
+                    let parts = pattern.split(separator: "|")
+                    guard parts.count == 3, let wanted, let salt = Data(base64Encoded: String(parts[1])),
+                          let hash = Data(base64Encoded: String(parts[2])) else { continue }
+                    let mac = HMAC<Insecure.SHA1>.authenticationCode(for: Data(wanted.utf8), using: SymmetricKey(data: salt))
+                    if Data(mac) == hash { typed = true }
+                } else if !pattern.contains("*") && !pattern.contains("?") && !pattern.hasPrefix("!") {
+                    if pattern.lowercased() == wanted?.lowercased() { typed = true }
+                    if !names.contains(pattern) { names.append(pattern) }
+                }
+            }
+        }
+    }
+    return (typed, names)
+}
+
+// MARK: SSH keys: the agent protocol
+
+struct SSHIdentity { let name: String; let key: SSHPublicKey; let synced: Bool }
+
+/// One sign request, as the prompt and the approvals see it.
+struct SSHAsk {
+    let identity: SSHIdentity
+    let purpose: SignPurpose
+    let binds: [SessionBind]
+    let peer: pid_t, peerStart: UInt64
+    let who: Requester
+    let via: [String]                 // ssh, git…: the programs between the requester and the socket
+    let remote: Bool                  // came through an sshd session: nobody may be at this Mac
+    let destination: (text: String, host: String, port: Int?)?
+    let commands: [String]            // the command lines of `via`, for "More detail"
+    var knownHostFiles: [String]
+
+    /// "sign in to git@github.com", "sign a git commit or tag"…
+    var action: String {
+        switch purpose {
+        case .login: return "sign in to \(destination?.text ?? "a server")"
+        case .sshsig(let ns): return ns == "git" ? "sign a git commit or tag" : ns == "file" ? "sign a file" : "make an SSH signature (\(ns))"
+        case .other: return "sign data touchenv can't identify"
+        }
+    }
+
+    /// What can be said about the server, honestly.
+    var serverNote: String? {
+        guard case .login = purpose else { return nil }
+        guard let bind = binds.last, let key = try? SSHPublicKey(blob: bind.hostKey) else {
+            return "Server: unknown (this ssh didn't tell the agent which server it reached)."
+        }
+        let forwarded = binds.contains { $0.forwarding } ? " Through agent forwarding (ssh -A)." : ""
+        let known = knownHostNames(for: bind.hostKey, host: destination?.host, port: destination?.port, files: knownHostFiles)
+        if known.typed, let host = destination?.host { return "Server: \(host), its key as in your known_hosts.\(forwarded)" }
+        if let name = known.names.first { return "Server: known in your known_hosts as \(name).\(forwarded)" }
+        return "Server key \(key.fingerprint), not in your known_hosts.\(forwarded)"
+    }
+}
+
+enum SSHRefusal: Error { case refused(String) }
+
+/// Speaks the ssh-agent protocol on one socket. Signing asks `covered` first (a grant or a 5-minute approval: the
+/// key, no prompt), then `ask` (a prompt), one request at a time. Clients can't add, remove or lock keys.
+final class SSHAgentServer {
+    let identities: () -> [SSHIdentity]
+    let covered: (SSHAsk) -> [UInt8]?
+    let ask: (SSHAsk) -> Result<[UInt8], SSHRefusal>
+    let log: (String) -> Void
+    var knownHostFiles: [String]
+    let maxWaiting = 4
+    private let prompts = DispatchQueue(label: "touchenv.ssh.prompts")
+    private let lock = NSLock()
+    private var waiting = 0
+    private(set) var open = 0
+    private(set) var lastActivity = Date()
+
+    init(identities: @escaping () -> [SSHIdentity], covered: @escaping (SSHAsk) -> [UInt8]?,
+         ask: @escaping (SSHAsk) -> Result<[UInt8], SSHRefusal>, log: @escaping (String) -> Void = { _ in },
+         knownHostFiles: [String]) {
+        self.identities = identities
+        self.covered = covered
+        self.ask = ask
+        self.log = log
+        self.knownHostFiles = knownHostFiles
+    }
+
+    var idle: Bool { lock.lock(); defer { lock.unlock() }; return open == 0 && waiting == 0 }
+    var idleSince: Date { lock.lock(); defer { lock.unlock() }; return lastActivity }
+
+    /// Accepts connections until the listening socket fails; one thread each, at most 64 at once.
+    func serve(_ listener: Int32) {
+        while true {
+            let fd = accept(listener, nil, nil)
+            if fd < 0 { if errno == EINTR || errno == ECONNABORTED { continue }; return }
+            var on: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+            lock.lock()
+            let full = open >= 64
+            if !full { open += 1; lastActivity = Date() }
+            lock.unlock()
+            if full { close(fd); continue }
+            Thread.detachNewThread { [self] in
+                connection(fd)
+                close(fd)
+                lock.lock(); open -= 1; lastActivity = Date(); lock.unlock()
+            }
+        }
+    }
+
+    final class Connection {
+        let fd: Int32
+        let peer: pid_t
+        let peerStart: UInt64
+        var binds: [SessionBind] = []
+        var tainted = false
+        init(fd: Int32, peer: pid_t) { self.fd = fd; self.peer = peer; peerStart = startTime(peer) ?? 0 }
+    }
+
+    func connection(_ fd: Int32) {
+        // Whoever is at the other end, as the kernel says: the pid can't be made up.
+        let state = Connection(fd: fd, peer: peerPid(fd) ?? 0)
+        while var header = readFull(fd, 4) {
+            let length = Int(header.reduce(UInt32(0)) { $0 << 8 | UInt32($1) })
+            header.removeAll()
+            guard length >= 1, length <= sshAgentMaxMessage, var body = readFull(fd, length) else { break }
+            var reply = respond(body, state)
+            wipe(&body)
+            var framed = SSHWriter()
+            framed.string(reply)
+            wipe(&reply)
+            guard writeFull(fd, framed.bytes) else { break }
+        }
+    }
+
+    static let failure: [UInt8] = [5]
+    static let success: [UInt8] = [6]
+
+    func respond(_ body: [UInt8], _ state: Connection) -> [UInt8] {
+        var r = SSHReader(body)
+        guard let type = try? r.u8() else { return Self.failure }
+        switch type {
+        case 11:   // SSH_AGENTC_REQUEST_IDENTITIES
+            guard r.done else { return Self.failure }
+            let all = identities()
+            var out = SSHWriter()
+            out.u8(12)
+            out.u32(UInt32(all.count))
+            for identity in all { out.string(identity.key.blob); out.string(identity.name) }
+            return out.bytes
+        case 13:   // SSH_AGENTC_SIGN_REQUEST
+            guard let blob = try? r.string(max: 16384), let data = try? r.string(), let flags = try? r.u32(), r.done else {
+                return Self.failure
+            }
+            return sign(blob: blob, data: data, flags: flags, state)
+        case 27:   // SSH_AGENTC_EXTENSION
+            guard let name = try? r.text(max: 256) else { return Self.failure }
+            guard name == "session-bind@openssh.com" else { return Self.failure }
+            guard let hostKey = try? r.string(max: 16384), let session = try? r.string(max: 64),
+                  let signature = try? r.string(max: 16384), let forwarding = try? r.bool(), r.done,
+                  !session.isEmpty, verifySSHSignature(publicBlob: hostKey, signature: signature, data: session) else {
+                state.tainted = true
+                log("refused: a session-bind that doesn't verify; this connection signs nothing more")
+                return Self.failure
+            }
+            // As ssh-agent: a connection bound for a login can't be bound again, and only so many hops.
+            if state.binds.count >= 16 || state.binds.last.map({ !$0.forwarding }) == true {
+                state.tainted = true
+                return Self.failure
+            }
+            if !state.binds.contains(where: { $0.sessionID == session }) {
+                state.binds.append(SessionBind(hostKey: hostKey, sessionID: session, forwarding: forwarding))
+            }
+            return Self.success
+        case 17, 18, 19, 20, 21, 22, 23, 25, 26:
+            log("refused: a client asked to add, remove or lock keys; touchenv's agent does none of that")
+            return Self.failure
+        default:
+            return Self.failure
+        }
+    }
+
+    func describe(_ identity: SSHIdentity, _ purpose: SignPurpose, _ state: Connection) -> SSHAsk {
+        // Walk up from the client through ssh, git and shells to the app that asked.
+        var via: [String] = [], commands: [String] = [], remote = false
+        var destination: (text: String, host: String, port: Int?)?
+        var pid = state.peer
+        for _ in 0..<32 {
+            guard pid > 1, let name = executableName(pid) else { break }
+            if ["sshd", "sshd-session", "sshd-auth"].contains(name) { remote = true }
+            if sshTools.contains(name) {
+                if !via.contains(name) { via.insert(name, at: 0) }
+                let argv = processArguments(pid)
+                if commands.count < 3, !argv.isEmpty { commands.insert(shortCommand(argv), at: 0) }
+                if name == "ssh", destination == nil { destination = sshDestination(argv) }
+            }
+            guard let parent = parentPid(pid) else { break }
+            pid = parent
+        }
+        return SSHAsk(identity: identity, purpose: purpose, binds: state.binds, peer: state.peer, peerStart: state.peerStart,
+                      who: requester(from: state.peer, through: sshTools), via: via, remote: remote,
+                      destination: destination, commands: commands, knownHostFiles: knownHostFiles)
+    }
+
+    func sign(blob: [UInt8], data: [UInt8], flags: UInt32, _ state: Connection) -> [UInt8] {
+        guard !state.tainted, let identity = identities().first(where: { $0.key.blob == blob }) else { return Self.failure }
+        guard let purpose = signPurpose(data, key: blob) else {
+            log("refused \(identity.name): the login names a different key")
+            return Self.failure
+        }
+        // A login must belong to the session ssh bound this connection to, and name that server's key.
+        if case .login(_, let session, let hostKey) = purpose, let bind = state.binds.last {
+            guard bind.sessionID == session, hostKey == nil || hostKey! == bind.hostKey else {
+                log("refused \(identity.name): the login is for another session than the one ssh bound")
+                return Self.failure
+            }
+        }
+        if identity.key.kind == .rsa && flags & 6 == 0 {
+            log("refused \(identity.name): ssh-rsa (SHA-1) signature asked for")
+            return Self.failure
+        }
+        let request = describe(identity, purpose, state)
+        var key: [UInt8]
+        if let k = covered(request) {
+            key = k
+            log("signed with \(identity.name) for \(request.who.name): \(request.action) (grant or 5-minute approval)")
+        } else {
+            lock.lock()
+            let busy = waiting >= maxWaiting
+            if !busy { waiting += 1 }
+            lock.unlock()
+            if busy {
+                log("refused \(identity.name) for \(request.who.name): too many requests already waiting")
+                return Self.failure
+            }
+            // One prompt at a time: the others wait here, in order.
+            let result: Result<[UInt8], SSHRefusal> = prompts.sync {
+                if clientLeft(state.fd) { return .failure(.refused("the client left before it was its turn")) }
+                if let k = covered(request) { return .success(k) }
+                return ask(request)
+            }
+            lock.lock(); waiting -= 1; lastActivity = Date(); lock.unlock()
+            switch result {
+            case .success(let k): key = k
+            case .failure(.refused(let why)):
+                log("refused \(identity.name) for \(request.who.name): \(request.action): \(why)")
+                return Self.failure
+            }
+        }
+        defer { wipe(&key) }
+        guard case .openssh(let privateKey)? = try? parseSSHKeyFile(key), privateKey.publicKey.blob == blob,
+              let signature = try? privateKey.sign(data, flags: flags) else {
+            log("failed \(identity.name): the stored key doesn't parse or doesn't match its public half")
+            return Self.failure
+        }
+        var out = SSHWriter()
+        out.u8(14)
+        out.string(signature)
+        return out.bytes
+    }
+}
+
+func readFull(_ fd: Int32, _ count: Int) -> [UInt8]? {
+    var out = [UInt8](repeating: 0, count: count)
+    var got = 0
+    while got < count {
+        let n = out.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress! + got, count - got) }
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 { wipe(&out); return nil }
+        got += n
+    }
+    return out
+}
+
+func writeFull(_ fd: Int32, _ bytes: [UInt8]) -> Bool {
+    var sent = 0
+    while sent < bytes.count {
+        let n = bytes.withUnsafeBytes { write(fd, $0.baseAddress! + sent, bytes.count - sent) }
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 { return false }
+        sent += n
+    }
+    return true
+}
+
+/// Whether the client closed its end (ssh killed, Ctrl-C) while its request waited for an earlier prompt.
+func clientLeft(_ fd: Int32) -> Bool {
+    var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+    guard poll(&p, 1, 0) > 0 else { return false }
+    if p.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 { return true }
+    var byte: UInt8 = 0
+    return recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0
+}
+
+/// A process's arguments (argv), from the kernel.
+func processArguments(_ pid: pid_t) -> [String] {
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4, size < 1 << 20 else { return [] }
+    var buffer = [UInt8](repeating: 0, count: size)
+    guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return [] }
+    let argc = Int(buffer.withUnsafeBytes { $0.load(as: Int32.self) })
+    var i = 4
+    while i < size && buffer[i] != 0 { i += 1 }
+    while i < size && buffer[i] == 0 { i += 1 }
+    var out: [String] = []
+    while out.count < min(argc, 256) && i < size {
+        var end = i
+        while end < size && buffer[end] != 0 { end += 1 }
+        out.append(String(decoding: buffer[i..<end], as: UTF8.self))
+        i = end + 1
+    }
+    return out
+}
+
+// MARK: SSH keys: where things are kept
+
+/// The user's home: tests point it elsewhere.
+var homePath = NSHomeDirectory()
+func supportDir() -> String { homePath + "/Library/Application Support/touchenv" }
+func sshPublicDir() -> String { supportDir() + "/ssh" }
+func sshAgentSocket() -> String { supportDir() + "/ssh-agent.sock" }
+func sshAgentLabel() -> String { "touchenv.ssh-agent" }
+func sshAgentPlist() -> String { homePath + "/Library/LaunchAgents/\(sshAgentLabel()).plist" }
+func sshAgentLog() -> String { homePath + "/Library/Logs/touchenv-ssh-agent.log" }
+func sshConfigPath() -> String { homePath + "/.ssh/config" }
+/// How the socket is written in ~/.ssh/config: quoted, for the space in "Application Support".
+let sshConfigSocket = "\"~/Library/Application Support/touchenv/ssh-agent.sock\""
+let sshConfigMarker = "# touchenv SSH agent (added by touchenv; delete these three lines to stop using it)"
+var sshConfigLines: [String] { [sshConfigMarker, "Host *", "    IdentityAgent \(sshConfigSocket)"] }
+
+/// "~/…" for paths under the home folder, for messages.
+func tilde(_ path: String) -> String { path.hasPrefix(homePath + "/") ? "~" + path.dropFirst(homePath.count) : path }
+
+/// A path in single quotes for a shell command.
+func shellQuoted(_ path: String) -> String {
+    path.allSatisfy({ $0.isLetter || $0.isNumber || "/._-~+".contains($0) }) && !path.hasPrefix("~")
+        ? path : "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// A path for a command to copy: ~/… unquoted when that is safe, otherwise the full path, quoted if need be.
+func shellPath(_ path: String) -> String {
+    let short = tilde(path)
+    return short.hasPrefix("~/") && shellQuoted(String(short.dropFirst())) == String(short.dropFirst()) ? short : shellQuoted(path)
+}
+
+func ensurePrivateDir(_ path: String) -> Bool {
+    (try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true,
+                                              attributes: [.posixPermissions: 0o700])) != nil
+        && chmod(path, 0o700) == 0
+}
+
+func publicKeyPath(_ name: String) -> String { sshPublicDir() + "/\(name).pub" }
+
+/// Writes NAME.pub (not secret) so ssh's IdentityFile can name the key and so listing never needs Touch ID.
+@discardableResult
+func writePublicKey(_ identity: SSHIdentity) -> Bool {
+    guard ensurePrivateDir(sshPublicDir()) else { return false }
+    let text = identity.key.line(comment: identity.name) + "\n"
+    if FileManager.default.contents(atPath: publicKeyPath(identity.name)) == Data(text.utf8) { return true }
+    return FileManager.default.createFile(atPath: publicKeyPath(identity.name), contents: Data(text.utf8),
+                                          attributes: [.posixPermissions: 0o644])
+}
+
+/// The SSH keys touchenv holds, with no Touch ID: synced items from their attributes (iCloud items carry no access
+/// control), local ones from the .pub files `ssh add` wrote, each checked to still exist.
+func sshIdentities() -> [SSHIdentity] {
+    var out: [String: SSHIdentity] = [:]
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                            kSecAttrSynchronizable as String: true, kSecUseDataProtectionKeychain as String: true,
+                            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
+                            kSecAttrDescription as String: sshKeyMarker,
+                            kSecReturnAttributes as String: true, kSecMatchLimit as String: kSecMatchLimitAll]
+    var found: CFTypeRef?
+    if SecItemCopyMatching(q as CFDictionary, &found) == errSecSuccess, let items = found as? [[String: Any]] {
+        for item in items {
+            guard let name = item[kSecAttrAccount as String] as? String, validName(name),
+                  let line = item[kSecAttrComment as String] as? String, let key = SSHPublicKey(line: line) else { continue }
+            out[name] = SSHIdentity(name: name, key: key, synced: true)
+        }
+    }
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: sshPublicDir())) ?? []
+    for file in files where file.hasSuffix(".pub") {
+        let name = String(file.dropLast(4))
+        guard validName(name), out[name] == nil, let data = FileManager.default.contents(atPath: publicKeyPath(name)),
+              data.count < 65536, let key = SSHPublicKey(line: String(decoding: data, as: UTF8.self)),
+              synced(name) == false else { continue }
+        out[name] = SSHIdentity(name: name, key: key, synced: false)
+    }
+    return out.values.sorted { $0.name < $1.name }
+}
+
+/// "SSH_ID_ED25519" from "~/.ssh/id_ed25519".
+func sshName(fromPath path: String) -> String {
+    var base = URL(fileURLWithPath: path).lastPathComponent
+    for ext in [".pem", ".key"] where base.lowercased().hasSuffix(ext) { base = String(base.dropLast(ext.count)) }
+    let upper = String(base.uppercased().map { ($0.isASCII && ($0.isLetter || $0.isNumber)) ? $0 : "_" })
+    return upper.hasPrefix("SSH_") ? upper : "SSH_" + upper
+}
+
+func sshAppendLog(_ line: String) {
+    let path = sshAgentLog()
+    _ = ensurePrivateDir((path as NSString).deletingLastPathComponent)
+    if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int, size > 256 * 1024 {
+        try? FileManager.default.removeItem(atPath: path + ".old")
+        try? FileManager.default.moveItem(atPath: path, toPath: path + ".old")
+    }
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+    guard fd >= 0 else { return }
+    _ = writeFull(fd, Array("\(stamp) \(line)\n".utf8))
+    close(fd)
+}
+
+// MARK: SSH keys: turning other key files into OpenSSH's
+
+/// Runs `/usr/bin/ssh-keygen -p -N ""` on a private copy of the key in a 0700 folder, which it rewrites as an
+/// unencrypted OpenSSH key; returns that text and removes the folder, whatever happens. The passphrase (if any) goes
+/// to ssh-keygen through SSH_ASKPASS: a two-line script in that folder that copies it from an inherited pipe (fd 3),
+/// so it is never in an argument, the environment or a file. Only the decrypted copy touches the disk, briefly.
+func convertWithSSHKeygen(_ original: [UInt8], passphrase: [UInt8]) throws -> [UInt8] {
+    var template = Array((FileManager.default.temporaryDirectory.path + "/touchenv-ssh-XXXXXX").utf8CString)
+    guard let made = mkdtemp(&template) else { throw SSHFormatError("can't make a private temp folder") }
+    let dir = String(cString: made)
+    defer {
+        // Overwrite the copy before it goes.
+        if let size = (try? FileManager.default.attributesOfItem(atPath: dir + "/key"))?[.size] as? Int {
+            let fd = open(dir + "/key", O_WRONLY)
+            if fd >= 0 { _ = writeFull(fd, [UInt8](repeating: 0, count: size)); fsync(fd); close(fd) }
+        }
+        try? FileManager.default.removeItem(atPath: dir)
+    }
+    guard chmod(dir, 0o700) == 0 else { throw SSHFormatError("can't make a private temp folder") }
+    let keyFd = open(dir + "/key", O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    guard keyFd >= 0, writeFull(keyFd, original) else { throw SSHFormatError("can't write the private copy") }
+    close(keyFd)
+    let script = "#!/bin/sh\nexec /bin/cat <&3\n"
+    guard FileManager.default.createFile(atPath: dir + "/askpass", contents: Data(script.utf8),
+                                         attributes: [.posixPermissions: 0o700]) else { throw SSHFormatError("can't write askpass") }
+    var secretPipe: [Int32] = [0, 0], errorPipe: [Int32] = [0, 0]
+    guard pipe(&secretPipe) == 0, pipe(&errorPipe) == 0 else { throw SSHFormatError("pipe failed") }
+    // Above the descriptors the child gets, so no dup2 maps a descriptor onto itself (which would keep close-on-exec).
+    let passIn = fcntl(secretPipe[0], F_DUPFD_CLOEXEC, 10), errorOut = fcntl(errorPipe[1], F_DUPFD_CLOEXEC, 10)
+    close(secretPipe[0])
+    close(errorPipe[1])
+    var attributes: posix_spawnattr_t?
+    posix_spawnattr_init(&attributes)
+    // A new session: no terminal for ssh-keygen to ask on; and no descriptor of ours leaks into it but these.
+    posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+    posix_spawn_file_actions_adddup2(&actions, errorOut, 1)
+    posix_spawn_file_actions_adddup2(&actions, errorOut, 2)
+    posix_spawn_file_actions_adddup2(&actions, passIn, 3)
+    let argumentList: [String] = ["/usr/bin/ssh-keygen", "-q", "-p", "-N", "", "-f", dir + "/key"]
+    let environment: [String] = ["SSH_ASKPASS=\(dir)/askpass", "SSH_ASKPASS_REQUIRE=force", "PATH=/usr/bin:/bin"]
+    let argv: [UnsafeMutablePointer<CChar>?] = argumentList.map { strdup($0) } + [nil]
+    let env: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
+    var pid = pid_t()
+    let spawned = posix_spawn(&pid, "/usr/bin/ssh-keygen", &actions, &attributes, argv, env)
+    argv.forEach { free($0) }
+    env.forEach { free($0) }
+    posix_spawn_file_actions_destroy(&actions)
+    posix_spawnattr_destroy(&attributes)
+    // Only the child holds these now: its exit closes the error pipe.
+    close(passIn)
+    close(errorOut)
+    if spawned == 0 {
+        signal(SIGPIPE, SIG_IGN)
+        _ = writeFull(secretPipe[1], passphrase + [10])
+    }
+    close(secretPipe[1])
+    var errors = Data()
+    var chunk = [UInt8](repeating: 0, count: 4096)
+    while case let n = Darwin.read(errorPipe[0], &chunk, chunk.count), n > 0, errors.count < 65536 { errors.append(chunk, count: n) }
+    close(errorPipe[0])
+    guard spawned == 0 else { throw SSHFormatError("can't run /usr/bin/ssh-keygen") }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+    let message = String(decoding: errors, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard status == 0 else {
+        if message.contains("incorrect passphrase") || message.contains("Bad passphrase") {
+            throw SSHFormatError("wrong passphrase")
+        }
+        throw SSHFormatError("ssh-keygen couldn't read it" + (message.isEmpty ? "" : ": " + message))
+    }
+    guard let data = FileManager.default.contents(atPath: dir + "/key") else { throw SSHFormatError("ssh-keygen wrote nothing") }
+    return [UInt8](data)
+}
+
+// MARK: SSH keys: talking to ssh-agent (touchenv ssh load) and to touchenv's own agent
+
+func connectUnix(_ path: String) -> Int32? {
+    guard path.utf8.count < 104 else { return nil }
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return nil }
+    var on: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+    var timeout = timeval(tv_sec: 10, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+    var address = socketAddress(path)
+    let connected = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    guard connected == 0 else { close(fd); return nil }
+    return fd
+}
+
+/// One request, one reply, in the agent protocol's framing.
+func agentRequest(_ fd: Int32, _ body: [UInt8]) -> [UInt8]? {
+    var framed = SSHWriter()
+    framed.string(body)
+    defer { wipe(&framed.bytes) }
+    guard writeFull(fd, framed.bytes), let header = readFull(fd, 4) else { return nil }
+    let length = Int(header.reduce(UInt32(0)) { $0 << 8 | UInt32($1) })
+    guard length >= 1, length <= sshAgentMaxMessage else { return nil }
+    return readFull(fd, length)
+}
+
+/// Whether the process behind a socket is signed by Apple (/usr/bin/ssh-agent, or launchd holding its socket).
+func peerIsApple(_ fd: Int32) -> Bool {
+    var token = audit_token_t()
+    var length = socklen_t(MemoryLayout<audit_token_t>.size)
+    guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &length) == 0 else { return false }
+    let tokenData = withUnsafeBytes(of: &token) { Data($0) }
+    var peer: SecCode?, requirement: SecRequirement?
+    guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributeAudit: tokenData] as CFDictionary, [], &peer) == errSecSuccess,
+          let peer, SecRequirementCreateWithString("anchor apple" as CFString, [], &requirement) == errSecSuccess else { return false }
+    return SecCodeCheckValidity(peer, [], requirement) == errSecSuccess
+}
+
+/// SSH_AGENTC_ADD_ID_CONSTRAINED with a lifetime: the key as ssh-add -t would send it.
+func addIdentityMessage(_ key: SSHPrivateKey, comment: String, seconds: UInt32) -> [UInt8] {
+    var w = SSHWriter()
+    w.u8(25)
+    w.bytes += key.record
+    w.string(comment)
+    w.u8(1)            // SSH_AGENT_CONSTRAIN_LIFETIME
+    w.u32(seconds)
+    return w.bytes
+}
+
+// MARK: SSH keys: the agent install, and the next steps after ssh add
+
+func sshAgentInstalled() -> Bool { FileManager.default.fileExists(atPath: sshAgentPlist()) }
+
+func launchctl(_ args: [String]) -> Int32 {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = args
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return -1 }
+    process.waitUntilExit()
+    return process.terminationStatus
+}
+
+func sshAgentLoaded() -> Bool { launchctl(["print", "gui/\(getuid())/\(sshAgentLabel())"]) == 0 }
+
+/// The touchenv binary inside touchenv.app (not the ~/.local/bin link): launchd must start the signed app.
+func appExecutable() -> String? {
+    var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(getpid(), &path, UInt32(path.count)) > 0 else { return nil }
+    let p = String(cString: path)
+    return p.hasSuffix(".app/Contents/MacOS/touchenv") ? p : nil
+}
+
+func sshAgentPlistText(executable: String) -> String {
+    func esc(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
+    }
+    return """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>Label</key><string>\(sshAgentLabel())</string>
+      <key>ProgramArguments</key><array><string>\(esc(executable))</string><string>ssh</string><string>agent</string><string>serve</string></array>
+      <key>Sockets</key><dict><key>SSH</key><dict>
+        <key>SockPathName</key><string>\(esc(sshAgentSocket()))</string>
+        <key>SockPathMode</key><integer>384</integer>
+      </dict></dict>
+      <key>LimitLoadToSessionType</key><string>Aqua</string>
+      <key>ProcessType</key><string>Interactive</string>
+    </dict></plist>
+
+    """
+}
+
+/// Writes the LaunchAgent and loads it: launchd makes the socket now and at every login, and starts
+/// `touchenv ssh agent serve` when ssh connects.
+func installSSHAgent() throws {
+    guard let executable = appExecutable() else {
+        throw SSHFormatError("run the touchenv inside touchenv.app (the Homebrew or release install) to install the agent")
+    }
+    guard sshAgentSocket().utf8.count < 104 else { throw SSHFormatError("the socket path is too long for a Unix socket") }
+    guard ensurePrivateDir(supportDir()) else { throw SSHFormatError("can't create \(tilde(supportDir()))") }
+    try? FileManager.default.createDirectory(atPath: (sshAgentPlist() as NSString).deletingLastPathComponent,
+                                             withIntermediateDirectories: true)
+    _ = launchctl(["bootout", "gui/\(getuid())/\(sshAgentLabel())"])
+    unlink(sshAgentSocket())
+    guard FileManager.default.createFile(atPath: sshAgentPlist(), contents: Data(sshAgentPlistText(executable: executable).utf8),
+                                         attributes: [.posixPermissions: 0o644]) else {
+        throw SSHFormatError("can't write \(tilde(sshAgentPlist()))")
+    }
+    guard launchctl(["bootstrap", "gui/\(getuid())", sshAgentPlist()]) == 0 else {
+        throw SSHFormatError("launchctl bootstrap failed; see: launchctl print gui/\(getuid())/\(sshAgentLabel())")
+    }
+}
+
+/// Whether ~/.ssh/config already sends ssh to touchenv's socket, and whether it names another agent too.
+func sshConfigState(_ text: String?) -> (pointsHere: Bool, otherAgent: Bool) {
+    var here = false, other = false
+    for raw in (text ?? "").split(whereSeparator: \.isNewline) {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard line.lowercased().hasPrefix("identityagent") else { continue }
+        if line.contains("touchenv/ssh-agent.sock") { here = true } else { other = true }
+    }
+    return (here, other)
+}
+
+/// Appends the three lines to ~/.ssh/config after copying it to config.touchenv-backup. Never rewrites what is there.
+func addSSHConfigLines() throws -> String? {
+    let path = sshConfigPath()
+    let dir = (path as NSString).deletingLastPathComponent
+    var backup: String?
+    if FileManager.default.fileExists(atPath: path) {
+        backup = path + ".touchenv-backup"
+        try? FileManager.default.removeItem(atPath: backup!)
+        try FileManager.default.copyItem(atPath: path, toPath: backup!)
+    } else if !FileManager.default.fileExists(atPath: dir) {
+        guard ensurePrivateDir(dir) else { throw SSHFormatError("can't create \(tilde(dir))") }
+    }
+    let existing = FileManager.default.contents(atPath: path) ?? Data()
+    var text = existing.isEmpty || existing.last == 10 ? "" : "\n"
+    if !existing.isEmpty { text += "\n" }
+    text += sshConfigLines.joined(separator: "\n") + "\n"
+    let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+    guard fd >= 0, writeFull(fd, Array(text.utf8)) else { if fd >= 0 { close(fd) }; throw SSHFormatError("can't write \(tilde(path))") }
+    close(fd)
+    return backup
+}
+
+/// Removes exactly the lines addSSHConfigLines wrote (after a backup), nothing else. Whether they were there.
+func removeSSHConfigLines() throws -> Bool {
+    let path = sshConfigPath()
+    guard let data = FileManager.default.contents(atPath: path) else { return false }
+    let text = String(decoding: data, as: UTF8.self)
+    let block = sshConfigLines.joined(separator: "\n") + "\n"
+    guard let range = text.range(of: block) else { return false }
+    var rest = text
+    rest.removeSubrange(range)
+    if rest.hasSuffix("\n\n") { rest.removeLast() }
+    try? FileManager.default.removeItem(atPath: path + ".touchenv-backup")
+    try FileManager.default.copyItem(atPath: path, toPath: path + ".touchenv-backup")
+    try Data(rest.utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
+    chmod(path, 0o600)
+    return true
+}
+
+/// Asks a yes/no question on the terminal; `yes` is the answer to Return alone.
+func confirm(_ question: String, yes: Bool) -> Bool {
+    FileHandle.standardOutput.write(Data("\(question) \(yes ? "[Y/n]" : "[y/N]") ".utf8))
+    guard let line = readLine() else { return false }
+    let answer = line.trimmingCharacters(in: .whitespaces).lowercased()
+    return answer.isEmpty ? yes : answer == "y" || answer == "yes"
+}
+
+/// After `touchenv ssh add`: what to do next, in the order that keeps the old key file until the new way works.
+/// `interactive`: offer to do the first two steps here. Reads nothing secret; changes nothing unless answered yes.
+struct SSHSetupState { var agentInstalled: Bool; var configText: String? }
+
+func sshNextSteps(name: String, keyPath: String, state: SSHSetupState, interactive: Bool,
+                  install: () throws -> Void = installSSHAgent, addLines: () throws -> String? = addSSHConfigLines,
+                  ask: (String, Bool) -> Bool = confirm, say: (String) -> Void = { print($0) }) {
+    var installed = state.agentInstalled
+    var config = sshConfigState(state.configText)
+    if !installed && interactive && ask("Set up the touchenv SSH agent now?", true) {
+        do { try install(); installed = true; say("installed the touchenv SSH agent (\(tilde(sshAgentPlist())))") }
+        catch { say("touchenv: couldn't install the agent: \(error)") }
+    }
+    if installed && !config.pointsHere && interactive {
+        let existing = state.configText != nil
+        say("These lines would go at the end of \(tilde(sshConfigPath()))\(existing ? " (a copy goes to config.touchenv-backup first)" : ""):")
+        sshConfigLines.forEach { say("    " + $0) }
+        if ask("Add them to \(tilde(sshConfigPath()))?", false) {
+            do {
+                _ = try addLines()
+                config.pointsHere = true
+                say("added them to \(tilde(sshConfigPath()))")
+            } catch { say("touchenv: couldn't edit \(tilde(sshConfigPath())): \(error)") }
+        }
+    }
+    say("")
+    var steps: [String] = []
+    if installed && config.pointsHere {
+        say("The touchenv SSH agent is set up and \(tilde(sshConfigPath())) points ssh at it.")
+    } else {
+        if !installed { steps.append("Install the touchenv SSH agent:  touchenv ssh agent install") }
+        if !config.pointsHere {
+            steps.append("Point ssh at it: add to \(tilde(sshConfigPath())) (or run touchenv ssh agent install --config):\n"
+                         + "         Host *\n             IdentityAgent \(sshConfigSocket)")
+        }
+    }
+    if config.otherAgent {
+        steps.append("\(tilde(sshConfigPath())) names another IdentityAgent too: ssh uses the first that applies to a host.")
+    }
+    let socket = tilde(sshAgentSocket()).hasPrefix("~/") ? "~/\"\(tilde(sshAgentSocket()).dropFirst(2))\"" : shellQuoted(sshAgentSocket())
+    steps.append("Try it:  ssh -T git@github.com   (or: SSH_AUTH_SOCK=\(socket) ssh-add -L)\n"
+                 + "       A Touch ID prompt names the app that asks, \(name) and the server; nothing signs without your finger.")
+    steps.append("Rather use the stock ssh-agent?  touchenv ssh load --for 8h \(name)")
+    steps.append("When that works: \(tilde(keyPath)) is still on disk, untouched. Checks will flag it until you delete it:\n"
+                 + "         rm \(shellPath(keyPath))")
+    if !(installed && config.pointsHere) { say("Next:") }
+    for (i, step) in steps.enumerated() { say(" \(i + 1). \(step)") }
+}
+
+// MARK: SSH keys: the agent process
+
+func screenLocked() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
+    if session["CGSSessionScreenIsLocked"] as? Bool == true { return true }
+    return session[kCGSessionOnConsoleKey as String] as? Bool == false
+}
+
+/// The prompt for one sign request: who, which key (bold), what for, the server; the command lines under More detail.
+func sshPromptText(_ a: SSHAsk) -> (title: String, notes: [String], detail: String?, reason: String) {
+    let via = a.via.isEmpty ? "" : " (\(a.via.joined(separator: ", ")))"
+    let title = "Allow \(a.who.name)\(via) to \(a.action) with \(strong(a.identity.name)) from \(a.identity.synced ? "iCloud Keychain" : "your Keychain")?"
+    var notes: [String] = []
+    if let server = a.serverNote { notes.append(server) }
+    if case .login(let user, _, _) = a.purpose, a.destination == nil { notes.append("As user \(user).") }
+    let detail = a.commands.isEmpty ? nil : a.commands.joined(separator: "\n")
+    return (title, notes, detail, "let \(a.who.name) \(a.action) with the SSH key \(a.identity.name)")
+}
+
+func serveSSHAgent() -> Never {
+    let fds = UnsafeMutablePointer<UnsafeMutablePointer<Int32>>.allocate(capacity: 1)
+    var count = 0
+    guard launch_activate_socket("SSH", fds, &count) == 0, count > 0 else {
+        die("touchenv: ssh agent serve is started by launchd: touchenv ssh agent install")
+    }
+    let listeners = (0..<count).map { fds.pointee[$0] }
+    free(fds.pointee)
+    signal(SIGPIPE, SIG_IGN)
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let server = SSHAgentServer(
+        identities: sshIdentities,
+        covered: { a in
+            guard let reply = askAgent(["op": "get", "names": [a.identity.name], "for": Int(a.peer),
+                                        "forStart": Int(a.peerStart), "ssh": a.action]),
+                  reply["ok"] as? Bool == true, let encoded = (reply["secrets"] as? [String: String])?[a.identity.name],
+                  let data = Data(base64Encoded: encoded) else { return nil }
+            return [UInt8](data)
+        },
+        ask: { a in
+            if a.remote { return .failure(.refused("it came through an ssh session to this Mac, where nobody may be at the screen; a grant would cover it")) }
+            if screenLocked() { return .failure(.refused("the screen is locked; a grant would cover it")) }
+            let text = sshPromptText(a)
+            let answered = DispatchSemaphore(value: 0)
+            var approved = false, keep = false
+            DispatchQueue.main.async {
+                authenticateAsync(text.title, notes: text.notes, detail: text.detail, reason: text.reason, asker: a.who,
+                                  offerSession: true, timeout: 60) { ok, k in
+                    approved = ok
+                    keep = k
+                    answered.signal()
+                }
+            }
+            if answered.wait(timeout: .now() + 120) == .timedOut { return .failure(.refused("no answer")) }
+            guard approved else { return .failure(.refused("not approved")) }
+            let (data, status) = readSecret(a.identity.name)
+            guard let data else { return .failure(.refused("keychain error \(status)")) }
+            if keep, startAgent() {
+                _ = askAgent(["op": "grant", "secrets": [a.identity.name: data.base64EncodedString()],
+                              "for": Int(a.peer), "forStart": Int(a.peerStart)])
+            }
+            return .success([UInt8](data))
+        },
+        log: sshAppendLog,
+        knownHostFiles: [homePath + "/.ssh/known_hosts", homePath + "/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts"])
+    for fd in listeners { Thread.detachNewThread { server.serve(fd) } }
+    // launchd keeps the socket; with nothing to do for 15 minutes, this process can go and be started again.
+    Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+        if server.idle && Date().timeIntervalSince(server.idleSince) > 15 * 60 && activePrompt == nil { exit(0) }
+    }
+    app.run()
+    exit(0)
+}
+
 // MARK: Commands
+
+/// One line, and no control characters: they could restyle the prompt (see strong).
+func cleanIntent(_ raw: String) -> String? {
+    let text = String(String.UnicodeScalarView(raw.replacingOccurrences(of: "\n", with: " ").unicodeScalars
+        .filter { !CharacterSet.controlCharacters.contains($0) })).trimmingCharacters(in: .whitespaces)
+    return text.isEmpty ? nil : (text.count > 200 ? String(text.prefix(199)) + "…" : text)
+}
+
+let sshUsage = """
+usage: touchenv ssh add [--sync] [NAME] KEYFILE · touchenv ssh ls · touchenv ssh rm NAME
+       touchenv ssh load [--for 1h] NAME ... · touchenv ssh unload NAME ...
+       touchenv ssh agent install [--config] · touchenv ssh agent uninstall [--config] · touchenv ssh agent status
+"""
+
+func sshCommand(_ arguments: [String], intent globalIntent: String?) -> Never {
+    var rest = arguments
+    guard let sub = rest.first else { die(sshUsage, 2) }
+    rest.removeFirst()
+    var intent = globalIntent, syncKey = false, loadFor: TimeInterval?, configFlag = false
+    if sub == "agent", let action = rest.first, !action.hasPrefix("--") {
+        rest.removeFirst()
+        rest.insert(action, at: rest.firstIndex { !$0.hasPrefix("--") } ?? rest.count)   // options may come after it
+    }
+    while let option = rest.first, option.hasPrefix("--"), option != "--" {
+        if option == "--sync", sub == "add" {
+            syncKey = true
+            rest.removeFirst()
+        } else if option == "--for", sub == "load", rest.count > 1 {
+            guard let length = parseLength(rest[1]), length <= maxGrantLength else {
+                die("touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most", 2)
+            }
+            loadFor = length
+            rest.removeFirst(2)
+        } else if option == "--config", sub == "agent" {
+            configFlag = true
+            rest.removeFirst()
+        } else if option == "--intent", rest.count > 1 {
+            intent = cleanIntent(rest[1])
+            rest.removeFirst(2)
+        } else {
+            die("touchenv: unknown option \(option)", 2)
+        }
+    }
+
+    switch sub {
+    case "add":
+        guard (1...2).contains(rest.count), rest.count == 1 || validName(rest[0]) else {
+            die("usage: touchenv ssh add [--sync] [NAME] KEYFILE  (NAME = env var style; from the file's name if left out)", 2)
+        }
+        let path = rest.last!
+        let absolute = URL(fileURLWithPath: path).standardizedFileURL.path
+        let name = rest.count == 2 ? rest[0] : sshName(fromPath: path)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: absolute, isDirectory: &isDirectory), !isDirectory.boolValue,
+              let size = (try? FileManager.default.attributesOfItem(atPath: absolute))?[.size] as? Int,
+              let data = FileManager.default.contents(atPath: absolute) else { die("touchenv: can't read \(path)") }
+        guard size <= 65536 else { die("touchenv: \(path) is too big to be an SSH private key") }
+        var text = [UInt8](data)
+        var stored: [UInt8] = []
+        let key: SSHPrivateKey
+        do {
+            switch try parseSSHKeyFile(text) {
+            case .openssh(let parsed):
+                key = parsed
+                stored = text
+            case .convert(let needsPassphrase):
+                var passphrase: [UInt8] = []
+                if needsPassphrase {
+                    guard isatty(0) != 0 else {
+                        die("touchenv: \(path) is protected by a passphrase: run this in a terminal to type it once")
+                    }
+                    var buffer = [CChar](repeating: 0, count: 1024)
+                    guard readpassphrase("Passphrase for \(tilde(absolute)) (not shown): ", &buffer, buffer.count,
+                                         Int32(RPP_REQUIRE_TTY)) != nil else { die("touchenv: no passphrase") }
+                    passphrase = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+                    _ = memset_s(&buffer, buffer.count, 0, buffer.count)
+                }
+                var converted = try convertWithSSHKeygen(text, passphrase: passphrase)
+                wipe(&passphrase)
+                guard case .openssh(let parsed) = try parseSSHKeyFile(converted) else {
+                    wipe(&converted)
+                    throw SSHFormatError("ssh-keygen didn't give an unencrypted OpenSSH key")
+                }
+                key = parsed
+                stored = converted
+                wipe(&converted)
+            }
+        } catch { die("touchenv: \(path): \(error)") }
+        wipe(&text)
+        if synced(name) != nil {
+            die("touchenv: there is already a secret named \(name): give another name (touchenv ssh add NAME \(path))")
+        }
+        let identity = SSHIdentity(name: name, key: key.publicKey, synced: syncKey)
+        add(name, Data(stored), sync: syncKey, extra: [kSecAttrDescription as String: sshKeyMarker,
+                                                       kSecAttrComment as String: key.publicKey.line(comment: name)])
+        wipe(&stored)
+        if !writePublicKey(identity) { print("touchenv: couldn't write \(tilde(publicKeyPath(name)))") }
+        let k = key.publicKey
+        print("stored \(name): \(k.kind.label) \(k.bits) \(k.fingerprint)\(key.comment.isEmpty ? "" : " \(key.comment)"), "
+              + (syncKey ? "synced through iCloud Keychain" : "on this Mac only"))
+        print("public key: \(tilde(publicKeyPath(name)))")
+        let state = SSHSetupState(agentInstalled: sshAgentInstalled(),
+                                  configText: try? String(contentsOfFile: sshConfigPath(), encoding: .utf8))
+        sshNextSteps(name: name, keyPath: absolute, state: state, interactive: isatty(0) != 0 && isatty(1) != 0)
+        exit(0)
+
+    case "ls":
+        guard rest.isEmpty else { die("usage: touchenv ssh ls", 2) }
+        let all = sshIdentities()
+        if all.isEmpty { print("no SSH keys in touchenv; add one: touchenv ssh add ~/.ssh/id_ed25519") }
+        let width = all.map(\.name.count).max() ?? 0
+        for identity in all {
+            writePublicKey(identity)   // synced from another Mac: give it its .pub here too
+            let k = identity.key
+            print(identity.name.padding(toLength: width, withPad: " ", startingAt: 0)
+                  + "  \(k.kind.label) \(k.bits)  \(k.fingerprint)  \(identity.synced ? "iCloud" : "this Mac")")
+        }
+        exit(0)
+
+    case "rm":
+        guard rest.count == 1, validName(rest[0]) else { die("usage: touchenv ssh rm NAME", 2) }
+        let name = rest[0]
+        guard sshIdentities().contains(where: { $0.name == name }) else {
+            die(synced(name) == nil ? "touchenv: no SSH key named \(name)"
+                : "touchenv: \(name) isn't an SSH key from touchenv ssh add (touchenv rm \(name) deletes any secret)")
+        }
+        requireIntent(intent, example: "touchenv ssh rm --intent \"<why>\" \(name)")
+        let who = requester().name
+        authenticate("Allow \(who) to delete the SSH key \(strong(name)) from \(place([name]))?", intent: intent,
+                     reason: "let \(who) delete the SSH key \(name)")
+        let status = SecItemDelete(query(name) as CFDictionary)
+        if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+        unlink(publicKeyPath(name))
+        print("deleted \(name). If it is loaded into ssh-agent too: ssh-add -D, or wait for its time to run out.")
+        exit(0)
+
+    case "load", "unload":
+        guard !rest.isEmpty, rest.allSatisfy(validName) else {
+            die(sub == "load" ? "usage: touchenv ssh load [--for 1h] NAME ...  (24h at most)" : "usage: touchenv ssh unload NAME ...", 2)
+        }
+        var names: [String] = []
+        for name in rest where !names.contains(name) { names.append(name) }
+        guard let socketPath = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"], !socketPath.isEmpty else {
+            die("touchenv: SSH_AUTH_SOCK isn't set, so there is no ssh-agent to \(sub == "load" ? "load into" : "unload from")")
+        }
+        if URL(fileURLWithPath: socketPath).resolvingSymlinksInPath().path == URL(fileURLWithPath: sshAgentSocket()).resolvingSymlinksInPath().path {
+            die("touchenv: SSH_AUTH_SOCK is touchenv's own agent, which never holds keys; ssh \(sub) is for the stock ssh-agent")
+        }
+        let identities = sshIdentities()
+        var chosen: [SSHIdentity] = []
+        for name in names {
+            guard let identity = identities.first(where: { $0.name == name }) else {
+                die("touchenv: no SSH key named \(name) (touchenv ssh ls lists them)")
+            }
+            chosen.append(identity)
+        }
+        guard let fd = connectUnix(socketPath) else { die("touchenv: can't reach ssh-agent at \(socketPath)") }
+        defer { close(fd) }
+        if sub == "unload" {
+            for identity in chosen {
+                var w = SSHWriter()
+                w.u8(18)   // SSH_AGENTC_REMOVE_IDENTITY
+                w.string(identity.key.blob)
+                print(agentRequest(fd, w.bytes) == SSHAgentServer.success ? "unloaded \(identity.name)"
+                                                                        : "\(identity.name) wasn't loaded")
+            }
+            exit(0)
+        }
+        // The key goes only to Apple's ssh-agent, on this very connection: no ssh-add, no file, no argument.
+        guard peerIsApple(fd) else {
+            die("touchenv: \(socketPath) isn't Apple's ssh-agent; touchenv hands keys to that one only")
+        }
+        let length = loadFor ?? sshDefaultLoad
+        requireIntent(intent, example: "touchenv ssh load --intent \"<why>\" --for 1h \(names.joined(separator: " "))")
+        let who = requester().name
+        let it = names.count == 1 ? "it" : "them"
+        authenticate("Allow \(who) to load \(strong(names)) into ssh-agent for \(spokenLength(length))? Until then any program "
+                     + "running as you can sign with \(it) without asking.", intent: intent,
+                     reason: "let \(who) load \(names.joined(separator: ", ")) into ssh-agent for \(spokenLength(length))")
+        for identity in chosen {
+            var text = [UInt8](read(identity.name))
+            defer { wipe(&text) }
+            guard case .openssh(let key)? = try? parseSSHKeyFile(text), key.publicKey == identity.key else {
+                die("touchenv: \(identity.name) doesn't hold the SSH key its public half says")
+            }
+            var message = addIdentityMessage(key, comment: identity.name, seconds: UInt32(length))
+            let reply = agentRequest(fd, message)
+            wipe(&message)
+            guard reply == SSHAgentServer.success else { die("touchenv: ssh-agent refused \(identity.name)") }
+        }
+        let until = DateFormatter.localizedString(from: Date().addingTimeInterval(length), dateStyle: .none, timeStyle: .short)
+        print("loaded \(names.joined(separator: ", ")) into ssh-agent until \(until). "
+              + "touchenv ssh unload \(names.joined(separator: " ")) takes \(it) out sooner.")
+        exit(0)
+
+    case "agent":
+        let agentUsage = "usage: touchenv ssh agent install [--config] · touchenv ssh agent uninstall [--config] · touchenv ssh agent status"
+        guard rest.count == 1 else { die(agentUsage, 2) }
+        switch rest[0] {
+        case "install":
+            do { try installSSHAgent() } catch { die("touchenv: \(error)") }
+            print("installed: launchd holds \(tilde(sshAgentSocket())) from now on, and at every login, and starts touchenv when ssh connects.")
+            let config = sshConfigState(try? String(contentsOfFile: sshConfigPath(), encoding: .utf8))
+            if config.pointsHere {
+                print("\(tilde(sshConfigPath())) already points ssh at it.")
+            } else if configFlag {
+                do {
+                    let backup = try addSSHConfigLines()
+                    print("added to the end of \(tilde(sshConfigPath()))\(backup.map { " (the old one: \(tilde($0)))" } ?? ""):")
+                    sshConfigLines.forEach { print("    " + $0) }
+                } catch { die("touchenv: \(error)") }
+            } else {
+                print("Point ssh at it: add to \(tilde(sshConfigPath())) (or run this again with --config):")
+                sshConfigLines.dropFirst().forEach { print("    " + $0) }
+                print("To offer only one key to a host:\n    Host github.com\n        IdentityFile \"~/Library/Application Support/touchenv/ssh/NAME.pub\"\n        IdentitiesOnly yes")
+            }
+            if config.otherAgent { print("Note: \(tilde(sshConfigPath())) names another IdentityAgent too; ssh uses the first that applies.") }
+        case "uninstall":
+            _ = launchctl(["bootout", "gui/\(getuid())/\(sshAgentLabel())"])
+            let had = sshAgentInstalled()
+            try? FileManager.default.removeItem(atPath: sshAgentPlist())
+            unlink(sshAgentSocket())
+            print(had ? "uninstalled the touchenv SSH agent" : "the touchenv SSH agent wasn't installed")
+            if configFlag {
+                do {
+                    print(try removeSSHConfigLines() ? "removed touchenv's lines from \(tilde(sshConfigPath())) (the old one: config.touchenv-backup)"
+                                                    : "\(tilde(sshConfigPath())) has no lines from touchenv")
+                } catch { die("touchenv: \(error)") }
+            } else if sshConfigState(try? String(contentsOfFile: sshConfigPath(), encoding: .utf8)).pointsHere {
+                print("\(tilde(sshConfigPath())) still names its socket: delete those lines, or run this again with --config.")
+            }
+            print("Your SSH keys stay in touchenv (touchenv ssh ls; touchenv ssh rm NAME).")
+        case "status":
+            let installed = sshAgentInstalled()
+            print("agent: " + (installed ? (sshAgentLoaded() ? "installed and loaded (\(sshAgentLabel()))" : "installed, not loaded: touchenv ssh agent install")
+                                         : "not installed: touchenv ssh agent install"))
+            var answers = "not answering"
+            if let fd = connectUnix(sshAgentSocket()) {
+                if let reply = agentRequest(fd, [11]), reply.first == 12 { answers = "answering" }
+                close(fd)
+            }
+            print("socket: \(tilde(sshAgentSocket())) (\(answers))")
+            let config = sshConfigState(try? String(contentsOfFile: sshConfigPath(), encoding: .utf8))
+            print("\(tilde(sshConfigPath())): " + (config.pointsHere ? "points ssh at it" : "doesn't name it (touchenv ssh agent install --config)")
+                  + (config.otherAgent ? "; names another IdentityAgent too" : ""))
+            let identities = sshIdentities()
+            print("keys: " + (identities.isEmpty ? "none (touchenv ssh add KEYFILE)" : identities.map(\.name).joined(separator: ", ")))
+            if let log = try? String(contentsOfFile: sshAgentLog(), encoding: .utf8) {
+                let recent = log.split(separator: "\n").suffix(5)
+                if !recent.isEmpty { print("recent (\(tilde(sshAgentLog()))):"); recent.forEach { print("  " + $0) } }
+            }
+        case "serve":
+            serveSSHAgent()
+        default:
+            die(agentUsage, 2)
+        }
+        exit(0)
+
+    default:
+        die(sshUsage, 2)
+    }
+}
+
+#if !TOUCHENV_TESTS
 
 var args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else { die(usage, 2) }
@@ -1025,10 +2745,7 @@ while let option = args.first, option.hasPrefix("--"), option != "--" {
         grantUses = uses
         args.removeFirst(2)
     } else if option == "--intent", args.count > 1 {
-        // One line, and no control characters: they could restyle the prompt (see strong).
-        let text = String(String.UnicodeScalarView(args[1].replacingOccurrences(of: "\n", with: " ").unicodeScalars
-            .filter { !CharacterSet.controlCharacters.contains($0) })).trimmingCharacters(in: .whitespaces)
-        intent = text.isEmpty ? nil : (text.count > 200 ? String(text.prefix(199)) + "…" : text)
+        intent = cleanIntent(args[1])
         args.removeFirst(2)
     } else {
         die("touchenv: unknown option \(option)", 2)
@@ -1312,6 +3029,9 @@ case "import":
 case "agent":
     Agent().run()
 
+case "ssh":
+    sshCommand(args, intent: intent)
+
 case "help", "-h", "--help":
     print(usage)
 
@@ -1321,3 +3041,4 @@ case "version", "--version":
 default:
     die("touchenv: unknown command \(command)", 2)
 }
+#endif
