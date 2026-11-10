@@ -1,0 +1,48 @@
+# The touchenv command-line contract, checked against both builds: the Go test in
+# windows/internal/core/conformance_test.go and conformance/run.sh for any binary (the macOS one included).
+#
+# Only cases that end before touchenv looks for a requester, a prompt or a stored secret: run.sh never reaches the
+# Keychain or Touch ID. Behaviour past that point is covered by each implementation's own tests.
+#
+# Format: exit code | stream:text the output must contain ("-" for none) | arguments, separated by spaces
+2 | err:touchenv  |
+2 | err:touchenv: unknown command frobnicate | frobnicate
+2 | err:touchenv: unknown command agentx | agentx
+2 | err:touchenv: unknown option --bogus | get --bogus
+2 | err:touchenv: unknown option --sync | get --sync A
+2 | err:touchenv: unknown option --intent | get --intent
+2 | err:touchenv: unknown option --to | export --to
+2 | err:touchenv: unknown option --begin | export --begin
+2 | err:touchenv: unknown option --replace | set --replace A
+2 | err:usage: touchenv set | set
+2 | err:usage: touchenv set | set 1BAD
+2 | err:usage: touchenv set | set A B
+2 | err:usage: touchenv set | set --intent why
+2 | err:usage: touchenv set | set BAD-NAME
+2 | err:usage: touchenv get NAME | get
+2 | err:usage: touchenv get NAME | get A B
+2 | err:usage: touchenv rm NAME | rm
+2 | err:usage: touchenv rm NAME | rm A B
+2 | err:usage: touchenv run NAME[:file] ... -- command args... | run
+2 | err:usage: touchenv run NAME[:file] ... -- command args... | run A
+2 | err:usage: touchenv run NAME[:file] ... -- command args... | run A --
+2 | err:usage: touchenv run NAME[:file] ... -- command args... | run -- echo
+2 | err:touchenv: bad spec A:fil | run A:fil -- echo
+2 | err:touchenv: bad spec 1A | run 1A -- echo
+2 | err:touchenv: bad spec A::file | run A::file -- echo
+2 | err:touchenv: bad spec A-B | run OK A-B -- echo
+2 | err:touchenv: bad spec A:FILE | run A:FILE -- echo
+2 | err:usage: touchenv export --to tenv1:… [NAME ...] > keys.tenv | export
+2 | err:usage: touchenv export --to tenv1:… [NAME ...] > keys.tenv | export A
+2 | err:usage: touchenv export --to tenv1:… [NAME ...] > keys.tenv | export --to tenv1:x bad-name
+2 | err:touchenv: nope is not a tenv1:… key from touchenv import --begin | export --to nope
+2 | err:touchenv: tenv1:AAAA is not a tenv1:… key from touchenv import --begin | export --to tenv1:AAAA
+2 | err:usage: touchenv import --begin | import
+2 | err:usage: touchenv import --begin | import --begin extra
+2 | err:usage: touchenv import --begin | import a b
+2 | err:usage: touchenv import --begin | import --replace --local
+0 | out:touchenv set NAME | help
+0 | out:touchenv run NAME[:file] ... -- CMD | --help
+0 | out:--intent TEXT after the command | -h
+0 | - | version
+0 | - | --version
