@@ -5,7 +5,10 @@
 # Keychain or Touch ID. Behaviour past that point is covered by each implementation's own tests.
 #
 # Format: exit code | stream:text the output must contain ("-" for none) | arguments, separated by spaces
-# A line that starts with "@mac " or "@windows " applies to that build only (touchenv ssh exists on macOS only).
+# A line starting "windows:" or "macos:" is checked against that build only (commands only one of them has:
+# Windows has service and status, macOS has ssh).
+#
+# grant arrived in macOS touchenv 1.5.0: the grant cases fail against an older macOS build.
 2 | err:touchenv  |
 2 | err:touchenv: unknown command frobnicate | frobnicate
 2 | err:touchenv: unknown command agentx | agentx
@@ -47,31 +50,60 @@
 0 | out:--intent TEXT after the command | -h
 0 | - | version
 0 | - | --version
-@mac 2 | err:usage: touchenv ssh add | ssh
-@mac 2 | err:usage: touchenv ssh add | ssh frob
-@mac 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add
-@mac 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add A B C
-@mac 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add --sync bad-name /x
-@mac 2 | err:touchenv: unknown option --local | ssh add --local /x
-@mac 2 | err:touchenv: unknown option --sync | ssh rm --sync A
-@mac 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add /nonexistent/touchenv-test-key
-@mac 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add --sync MY_KEY /nonexistent/touchenv-test-key
-@mac 2 | err:usage: touchenv ssh ls | ssh ls A
-@mac 2 | err:usage: touchenv ssh rm NAME | ssh rm
-@mac 2 | err:usage: touchenv ssh rm NAME | ssh rm A B
-@mac 2 | err:usage: touchenv ssh rm NAME | ssh rm bad-name
-@mac 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load
-@mac 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load --for 1h bad-name
-@mac 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for 25h A
-@mac 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for soon A
-@mac 2 | err:touchenv: unknown option --for | ssh unload --for 1h A
-@mac 2 | err:usage: touchenv ssh unload NAME ... | ssh unload
-@mac 2 | err:usage: touchenv ssh agent install [--config] | ssh agent
-@mac 2 | err:usage: touchenv ssh agent install [--config] | ssh agent frob
-@mac 2 | err:usage: touchenv ssh agent install [--config] | ssh agent install extra
-@mac 2 | err:touchenv: unknown option --bogus | ssh agent status --bogus
-@mac 1 | err:touchenv: ssh agent serve is started by launchd | ssh agent serve
-@mac 0 | out:touchenv ssh add [--sync] [NAME] KEYFILE | help
-@windows 2 | err:touchenv: ssh keys are macOS only | ssh
-@windows 2 | err:touchenv: ssh keys are macOS only | ssh add id_ed25519
-@windows 2 | err:touchenv: ssh keys are macOS only | ssh agent install
+2 | err:touchenv: unknown option --for | run --for 8h A -- echo
+2 | err:touchenv: unknown option --uses | get --uses 3 A
+2 | err:touchenv: unknown option --keep | run --keep A -- echo
+2 | err:touchenv: unknown option --for | grant --for
+2 | err:touchenv: unknown option --uses | grant --for 8h --uses
+2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | grant --for 25h --uses 1 A
+2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | grant --for 24h1m --uses 1 A
+2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | grant --for 0m --uses 1 A
+2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | grant --for 8 --uses 1 A
+2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | grant --for 1h1h --uses 1 A
+2 | err:touchenv: --uses takes a number from 1 to 500 | grant --for 8h --uses 501 A
+2 | err:touchenv: --uses takes a number from 1 to 500 | grant --for 8h --uses 0 A
+2 | err:touchenv: --uses takes a number from 1 to 500 | grant --for 8h --uses x A
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant A
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --for 8h A
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --uses 3 A
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --for 8h --uses 3
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --for 8h --uses 3 bad-name
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --intent why --for 30m --uses 3 A bad-name
+0 | out:touchenv grant --for 8h --uses 20 NAME | help
+windows: 2 | err:usage: touchenv service install [--offer-5-minutes] · touchenv service uninstall | service
+windows: 2 | err:usage: touchenv service install [--offer-5-minutes] · touchenv service uninstall | service start
+windows: 2 | err:usage: touchenv service install [--offer-5-minutes] · touchenv service uninstall | service install --yes
+windows: 2 | err:touchenv: unknown option --offer-5-minutes | service --offer-5-minutes install
+windows: 2 | err:usage: touchenv status | status now
+windows: 0 | out:touchenv service install | help
+macos: 2 | err:touchenv: unknown command status | status
+macos: 2 | err:touchenv: unknown command service | service install
+macos: 2 | err:usage: touchenv ssh add | ssh
+macos: 2 | err:usage: touchenv ssh add | ssh frob
+macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add
+macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add A B C
+macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add --sync bad-name /x
+macos: 2 | err:touchenv: unknown option --local | ssh add --local /x
+macos: 2 | err:touchenv: unknown option --sync | ssh rm --sync A
+macos: 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add /nonexistent/touchenv-test-key
+macos: 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add --sync MY_KEY /nonexistent/touchenv-test-key
+macos: 2 | err:usage: touchenv ssh ls | ssh ls A
+macos: 2 | err:usage: touchenv ssh rm NAME | ssh rm
+macos: 2 | err:usage: touchenv ssh rm NAME | ssh rm A B
+macos: 2 | err:usage: touchenv ssh rm NAME | ssh rm bad-name
+macos: 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load
+macos: 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load --for 1h bad-name
+macos: 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for 25h A
+macos: 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for soon A
+macos: 2 | err:touchenv: unknown option --for | ssh unload --for 1h A
+macos: 2 | err:usage: touchenv ssh unload NAME ... | ssh unload
+macos: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent
+macos: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent frob
+macos: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent install extra
+macos: 2 | err:touchenv: unknown option --bogus | ssh agent status --bogus
+macos: 1 | err:touchenv: ssh agent serve is started by launchd | ssh agent serve
+macos: 0 | out:touchenv ssh add [--sync] [NAME] KEYFILE | help
+windows: 2 | err:touchenv: ssh keys are macOS only | ssh
+windows: 2 | err:touchenv: ssh keys are macOS only | ssh add id_ed25519
+windows: 2 | err:touchenv: ssh keys are macOS only | ssh agent install

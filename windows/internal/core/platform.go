@@ -63,3 +63,27 @@ type Platform interface {
 	// Environ is touchenv's own environment.
 	Environ() []string
 }
+
+// Service reaches the touchenv service, which holds grants and 5-minute approvals (holder.go). Tests use one that
+// runs a Holder in the same process.
+type Service interface {
+	// Dial connects to the service. ErrNoService when it isn't installed or isn't running; ErrNotService when
+	// something else answers on its pipe.
+	Dial() (io.ReadWriteCloser, error)
+	// AskKeep shows the "Don't ask again for 5 minutes?" question (before Windows Hello): proceed false means the
+	// person cancelled; keep true means they chose 5 minutes.
+	AskKeep(text string) (proceed, keep bool, err error)
+	// StartTray starts the notification-area icon that shows each use and offers Lock Now, unless one runs already.
+	StartTray()
+	// Install installs or updates the service (asking for administrator approval when needed); Uninstall removes
+	// it. Both report to out.
+	Install(offerKeep bool, out io.Writer) error
+	Uninstall(out io.Writer) error
+}
+
+var (
+	// ErrNoService: the touchenv service isn't installed, or isn't running.
+	ErrNoService = errors.New("the touchenv service isn't running")
+	// ErrNotService: something other than the touchenv service answers on its pipe.
+	ErrNotService = errors.New("something other than the touchenv service is answering on \\\\.\\pipe\\touchenv")
+)

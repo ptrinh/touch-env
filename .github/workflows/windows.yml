@@ -52,6 +52,40 @@ jobs:
         run: CGO_ENABLED=0 go build -trimpath -buildvcs=false -o touchenv.exe .
       - name: Command-line contract (same cases as the macOS build)
         run: conformance/run.sh windows/touchenv.exe
+      # The runners are administrators, so the real service can be installed, checked and removed. Nothing here
+      # touches Windows Hello or a secret; the trap removes the service and its folder whatever happens.
+      - name: Service install, upgrade and removal
+        run: |
+          set -eu
+          exe=windows/touchenv.exe
+          if sc.exe query touchenv >/dev/null 2>&1; then echo "a touchenv service already exists on this runner" >&2; exit 1; fi
+          trap '"$exe" service uninstall || sc.exe delete touchenv || true' EXIT
+          "$exe" service install --offer-5-minutes
+          sc.exe qc touchenv | tee qc.txt
+          grep -qF 'NT SERVICE\touchenv' qc.txt
+          grep -qF '\touchenv\touchenv.exe" service run --offer-5-minutes' qc.txt
+          sc.exe qprivs touchenv | tee privs.txt
+          grep -q SeChangeNotifyPrivilege privs.txt
+          test "$(grep -c 'Se[A-Za-z]*Privilege' privs.txt)" = 1
+          sc.exe query touchenv | grep -q RUNNING
+          icacls "C:\Program Files\touchenv"
+          # Reaching it needs an interactive logon (the pipe's DACL); report what this runner's session gets.
+          out=$("$exe" status 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -q ', running\.'; then
+            echo "$out" | grep -q '5-minute approvals: offered'
+            "$exe" lock | grep -qx 'locked: every approval and grant ended'
+          else
+            echo "::warning::this runner's session can't reach the service (not an interactive logon): status and lock not checked"
+          fi
+          "$exe" service install   # an upgrade: same service, 5-minute approvals now off
+          sc.exe qc touchenv | grep -qF 'service run'
+          if sc.exe qc touchenv | grep -qF 'offer-5-minutes'; then echo "reinstall kept --offer-5-minutes" >&2; exit 1; fi
+          "$exe" service uninstall
+          trap - EXIT
+          if sc.exe query touchenv >/dev/null 2>&1; then echo "service still there" >&2; exit 1; fi
+          test ! -e "/c/Program Files/touchenv"
+          "$exe" lock | grep -qx 'nothing to lock'
 
   release:
     needs: test

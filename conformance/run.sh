@@ -5,16 +5,16 @@
 set -u
 bin=${1:?usage: conformance/run.sh path/to/touchenv}
 cases="$(dirname "$0")/cases.txt"
-# Lines marked @mac or @windows run on that platform only.
-case "$(uname -s)" in Darwin) platform=mac ;; *) platform=windows ;; esac
-pass=0 failed=0 skipped=0
+pass=0 failed=0
 out=$(mktemp) err=$(mktemp)
 trap 'rm -f "$out" "$err"' EXIT
+platform=macos
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) platform=windows ;; esac
+case "$bin" in *.exe) platform=windows ;; esac
 while IFS='|' read -r want check args; do
   case "$want" in ''|\#*) continue ;; esac
   case "$want" in
-    @*) tag=${want%% *} want=${want#* }
-        if [ "$tag" != "@$platform" ]; then skipped=$((skipped + 1)); continue; fi ;;
+    windows:*|macos:*) [ "${want%%:*}" = "$platform" ] || continue; want=${want#*:} ;;
   esac
   want=$(echo "$want" | tr -d ' ')
   check=$(echo "$check" | sed 's/^ *//; s/ *$//')
@@ -31,5 +31,5 @@ while IFS='|' read -r want check args; do
     sed 's/^/  | /' "$err" | head -3
   fi
 done <"$cases"
-echo "$pass passed, $failed failed, $skipped for the other platform"
+echo "$pass passed, $failed failed"
 [ "$failed" = 0 ]

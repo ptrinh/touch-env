@@ -22,14 +22,10 @@ func TestConformance(t *testing.T) {
 		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// "@mac " and "@windows " lines are for one build; this core is the Windows build's.
-		if strings.HasPrefix(line, "@") {
-			tag, rest, _ := strings.Cut(line, " ")
-			if tag != "@windows" {
-				continue
-			}
-			line = rest
+		if strings.HasPrefix(line, "macos:") {
+			continue
 		}
+		line = strings.TrimPrefix(line, "windows:")
 		parts := strings.SplitN(line, "|", 3)
 		want, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
 		check := strings.TrimSpace(parts[1])

@@ -6,6 +6,7 @@ import "strings"
 type Requester struct {
 	Name    string
 	IsAgent bool
+	Found   bool // false: no process to name ("a process"), so nothing a grant could cover
 }
 
 // Shells and wrappers between the asker and touchenv (lower case, no ".exe").
@@ -30,6 +31,12 @@ var known = map[string]string{
 
 // ClassifyChain picks the requester from the ancestor chain (nearest first), as touchenv.swift's requester() does.
 func ClassifyChain(chain []Process) Requester {
+	r, _ := classify(chain)
+	return r
+}
+
+// classify also says which entry of the chain is the requester (-1 for none).
+func classify(chain []Process) (Requester, int) {
 	for i, p := range chain {
 		if i >= 32 {
 			break
@@ -49,7 +56,7 @@ func ClassifyChain(chain []Process) Requester {
 		if display == "" {
 			display = base
 		}
-		return Requester{Name: display, IsAgent: agents[name]}
+		return Requester{Name: display, IsAgent: agents[name], Found: true}, i
 	}
-	return Requester{Name: "a process"}
+	return Requester{Name: "a process"}, -1
 }

@@ -391,12 +391,12 @@ func TestRequesterChain(t *testing.T) {
 		chain []string
 		want  Requester
 	}{
-		{[]string{"bash.exe", "claude.exe", "WindowsTerminal.exe"}, Requester{"Claude Code", true}},
-		{[]string{"pwsh.exe", "Code.exe"}, Requester{"VS Code", false}},
-		{[]string{"cmd.exe", "conhost.exe", "codex.EXE"}, Requester{"Codex", true}},
-		{[]string{"-bash"}, Requester{"a process", false}},
-		{[]string{"python.exe", "claude.exe"}, Requester{"python", false}},
-		{nil, Requester{"a process", false}},
+		{[]string{"bash.exe", "claude.exe", "WindowsTerminal.exe"}, Requester{"Claude Code", true, true}},
+		{[]string{"pwsh.exe", "Code.exe"}, Requester{"VS Code", false, true}},
+		{[]string{"cmd.exe", "conhost.exe", "codex.EXE"}, Requester{"Codex", true, true}},
+		{[]string{"-bash"}, Requester{"a process", false, false}},
+		{[]string{"python.exe", "claude.exe"}, Requester{"python", false, true}},
+		{nil, Requester{"a process", false, false}},
 	}
 	for _, c := range cases {
 		var chain []Process

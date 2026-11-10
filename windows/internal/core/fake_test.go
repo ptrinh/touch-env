@@ -144,6 +144,7 @@ type machine struct {
 	h     *fakeHello
 	now   time.Time
 	stdin string
+	svc   *fakeService // nil: no touchenv service
 }
 
 func newMachine(t *testing.T, keyIndex int) *machine {
@@ -165,8 +166,12 @@ type result struct {
 
 func (m *machine) run(args ...string) result {
 	var out, errOut bytes.Buffer
-	code := Main(args, Env{Stdin: strings.NewReader(m.stdin), Stdout: &out, Stderr: &errOut, Platform: m.p,
-		Hello: m.h, Now: func() time.Time { return m.now }})
+	env := Env{Stdin: strings.NewReader(m.stdin), Stdout: &out, Stderr: &errOut, Platform: m.p,
+		Hello: m.h, Now: func() time.Time { return m.now }}
+	if m.svc != nil {
+		env.Service = m.svc
+	}
+	code := Main(args, env)
 	m.stdin = ""
 	return result{code, out.String(), errOut.String(), out.Bytes()}
 }

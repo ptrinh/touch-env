@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -32,6 +34,15 @@ func usage() string {
                                         the path of a private temp file, removed when CMD ends
   touchenv ls                           list names
   touchenv rm NAME                      delete
+  touchenv grant --for 8h --uses 20 NAME ...
+                                        one Windows Hello now; then this app and what it runs read those
+                                        secrets with touchenv run without asking, also while the PC is locked,
+                                        until the time (24h at most) or the uses run out
+  touchenv lock                         end every approval now: 5-minute ones and grants
+  touchenv status                       list grants and 5-minute approvals, and each use
+
+  Grants and 5-minute approvals need the touchenv service (once, as administrator):
+  touchenv service install [--offer-5-minutes] · touchenv service uninstall
 
   Moving to a new PC or Mac:
   touchenv import --begin               (new machine) prints tenv1:… and a check code
@@ -50,6 +61,7 @@ type Env struct {
 	Stderr   io.Writer
 	Platform Platform
 	Hello    Hello
+	Service  Service // nil: no service on this system (grants and 5-minute approvals refused)
 	Now      func() time.Time
 }
 
@@ -92,6 +104,9 @@ type options struct {
 	begin     bool
 	replace   bool
 	localOnly bool
+	length    time.Duration // grant --for
+	lengthArg string
+	uses      int // grant --uses
 }
 
 func run(args []string, env *Env) error {
@@ -119,6 +134,20 @@ func run(args []string, env *Env) error {
 				o.localOnly = true
 			}
 			args = args[1:]
+		case option == "--for" && command == "grant" && len(args) > 1:
+			d, ok := ParseLength(args[1])
+			if !ok || d > MaxGrantLength {
+				return die(2, "touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most")
+			}
+			o.length, o.lengthArg = d, args[1]
+			args = args[2:]
+		case option == "--uses" && command == "grant" && len(args) > 1:
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 1 || n > MaxGrantUses {
+				return die(2, "touchenv: --uses takes a number from 1 to %d", MaxGrantUses)
+			}
+			o.uses = n
+			args = args[2:]
 		case option == "--intent" && len(args) > 1:
 			text := strings.ReplaceAll(strings.TrimSpace(args[1]), "\n", " ")
 			if utf8.RuneCountInString(text) > 200 {
@@ -131,7 +160,7 @@ func run(args []string, env *Env) error {
 		}
 	}
 
-	c := &cmd{env: env, o: o, p: env.Platform, h: env.Hello}
+	c := &cmd{env: env, o: o, p: env.Platform, h: env.Hello, svc: env.Service}
 	switch command {
 	case "set":
 		return c.set(args)
@@ -143,10 +172,14 @@ func run(args []string, env *Env) error {
 		return c.ls(args)
 	case "run":
 		return c.run(args)
+	case "grant":
+		return c.grant(args)
 	case "lock":
-		// No 5-minute approvals on Windows (README: why), so never anything to end.
-		fmt.Fprintln(env.Stdout, "nothing to lock")
-		return nil
+		return c.lock(args)
+	case "status":
+		return c.status(args)
+	case "service":
+		return c.service(args)
 	case "export":
 		return c.export(args)
 	case "import":
@@ -170,6 +203,7 @@ type cmd struct {
 	o   options
 	p   Platform
 	h   Hello
+	svc Service
 }
 
 func (c *cmd) who() Requester { return ClassifyChain(c.p.Ancestors()) }
@@ -413,13 +447,12 @@ func (c *cmd) run(args []string) error {
 		strings.Join(args[:split], " "), shortCommand(argv))); err != nil {
 		return err
 	}
-	var wanted []string
+	var wanted, unique []string
 	for _, s := range specs {
 		wanted = append(wanted, s.name)
-	}
-	s, err := c.existing(wanted)
-	if err != nil {
-		return err
+		if !slices.Contains(unique, s.name) {
+			unique = append(unique, s.name)
+		}
 	}
 	commandLine, err := c.p.CommandLine(argv)
 	if err != nil {
@@ -428,26 +461,28 @@ func (c *cmd) run(args []string) error {
 	if utf8.RuneCountInString(commandLine) > 2000 {
 		commandLine = string([]rune(commandLine)[:1999]) + "…"
 	}
-	title := fmt.Sprintf("Allow %s to read %s?", c.who().Name, strings.Join(wanted, ", "))
-	key, err := s.unlock(c.h, c.promptText(title, commandLine))
-	if err != nil {
-		return err
-	}
 	secrets := map[string][]byte{}
 	defer func() {
 		for _, v := range secrets {
 			wipe(v)
 		}
 	}()
-	for _, name := range wanted {
-		if secrets[name] != nil {
-			continue
+	// A grant or a 5-minute approval, if one covers this requester and every secret asked for.
+	offerKeep := false
+	if reply, err := c.askService(Request{Op: "get", Names: unique, Intent: c.o.intent}); err == nil {
+		offerKeep = reply.OfferKeep
+		if reply.OK && coversAll(reply.Secrets, unique) {
+			secrets = reply.Secrets
+		} else {
+			wipeAll(reply.Secrets)
 		}
-		value, err := OpenSecret(key, name, s.Secrets[name])
-		if err != nil {
-			return die(1, "touchenv: %s can't be opened: the store was changed outside touchenv", name)
+	} else if !errors.Is(err, ErrNoService) {
+		fmt.Fprintf(c.env.Stderr, "touchenv: %v; asking Windows Hello instead\n", err)
+	}
+	if len(secrets) == 0 {
+		if err := c.readForRun(unique, commandLine, offerKeep, secrets); err != nil {
+			return err
 		}
-		secrets[name] = value
 	}
 
 	environ := c.p.Environ()
