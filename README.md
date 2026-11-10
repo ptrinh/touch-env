@@ -2,7 +2,7 @@
 
 **API keys behind your fingerprint: no app, script or AI agent reads them without your touch.**
 
-<p align="center"><img src="docs/touch-id-prompt.png" width="260" alt="Touch ID prompt: Allow Claude Code to read OPENAI_API_KEY from your Keychain? Intent: make the monthly sales report. More detail shows the command. Don't ask again for 5 minutes."></p>
+<p align="center"><img src="docs/touch-id-prompt.png" width="260" alt="Touch ID prompt: Allow Claude Code to read OPENAI_API_KEY from your Keychain? INTENT: make the monthly sales report. More detail shows the command. Don't ask again for 5 minutes."></p>
 
 ## Why
 
@@ -32,7 +32,8 @@ touchenv run MY_KEY:file -- fastlane beta    # the command gets a temp file path
 touchenv run --intent "monthly report" OPENAI_API_KEY -- python report.py   # shows why in the prompt
 touchenv ls                                  # names only
 touchenv get NAME · touchenv rm NAME
-touchenv lock                                # end every 5-minute approval now
+touchenv grant --for 8h --uses 20 MY_KEY     # one touch now, then no asking: for when you step away (below)
+touchenv lock                                # end every approval and grant now
 touchenv import --begin · touchenv export --to tenv1:… > keys.tenv · touchenv import keys.tenv   # new Mac, below
 ```
 
@@ -47,6 +48,24 @@ Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
 AI agents (Claude Code, Codex, Cursor's agent, Gemini CLI, aider, Goose, opencode) **must** pass `--intent`: without
 one, touchenv refuses before any prompt and tells the agent how to ask again, so every prompt says why. Typed in
 your own terminal, `--intent` is optional; without it the prompt says **No reason given** and shows the command.
+
+## Stepping away
+
+Driving an agent from your phone or over SSH, you can't touch the sensor. Before you leave, allow what the task
+needs:
+
+```sh
+touchenv grant --for 8h --uses 20 ASC_KEY OPENAI_API_KEY
+```
+
+One touch, and the prompt spells out the keys and both limits. After that the app you ran it from (that Claude Code
+session, or everything in that terminal app) and the commands it starts get those keys from `touchenv run` without
+asking, **also while the Mac is locked**. It ends at the time (24 hours at most), after that many runs, on
+`touchenv lock` or **Lock Now** in the menu bar, when that app quits, or when you log out. Other apps and other keys
+still ask, and so do `get` and `export`.
+
+Until it ends, anything that app runs can take those keys, as with the 5-minute approval but for longer and with
+nobody watching. Grant the fewest keys, the shortest time and the fewest uses the task needs.
 
 ## Moving to a new Mac
 
@@ -166,7 +185,7 @@ One Swift file, [`touchenv.swift`](touchenv.swift). Local keys: Data Protection 
 `WhenUnlockedThisDeviceOnly`. Synced keys: `kSecAttrSynchronizable`, no access control (iCloud refuses one). Both
 sit in an access group only the signed app holds. The prompt embeds `LAAuthenticationView` (no Allow button); the
 Touch ID icon comes from macOS, with a copy in `Resources/`. 5-minute approvals live in memory in `touchenv agent`,
-keyed by the requester's pid and start time, behind a `0600` Unix socket; each end checks that the other satisfies
+keyed by the requester's pid and start time (a grant also covers the processes below that requester), behind a `0600` Unix socket; each end checks that the other satisfies
 touchenv's designated code requirement.
 
 Building needs a paid Apple Developer account: an App ID, a Developer ID provisioning profile, and the values in the

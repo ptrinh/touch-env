@@ -10,7 +10,10 @@
 //                              the file is removed when the command ends
 //   touchenv ls                list names, "(iCloud)" after synced ones (Touch ID: macOS guards even names; no values)
 //   touchenv rm NAME           delete
-//   touchenv lock              end every 5-minute approval now
+//   touchenv grant --for 8h --uses 20 NAME [NAME2 ...]
+//                              one Touch ID now; then the app that asked, and what it runs, reads those secrets
+//                              with touchenv run without asking, until the time or the uses run out
+//   touchenv lock              end every approval now (5-minute ones and grants)
 //   touchenv import --begin    on a new Mac: make a one-time receiving key, print it as tenv1:… and a check code
 //   touchenv export --to tenv1:… [NAME ...] > keys.tenv
 //                              on the old Mac: every secret (or those named) encrypted to that key, one Touch ID
@@ -29,6 +32,10 @@
 // Ticked, touchenv starts a background copy of itself (touchenv agent) that keeps those secrets in memory for 5
 // minutes and hands them to later touchenv runs from the same requester (same pid and start time). Both ends check
 // that the other is touchenv signed like itself. A menu bar timer shows the approval; each use flashes a notice.
+// grant: the same background copy keeps the named secrets for the length given (24 hours at most) and a number of
+// uses (one per touchenv run). It covers the requester of the grant command and every process below it, checked from
+// the kernel's process tree, and goes on while the screen is locked. It ends at the time, at the last use, on
+// touchenv lock, when that requester quits, or at logout.
 // export/import: the receiving key lives in the new Mac's Secure Enclave (a keychain item, this device only, when there
 // is none) and is deleted after one import or an hour. The file: "TENV" 1 | receiving key (33 bytes) | ephemeral key
 // (65) | AES-GCM over JSON, key from ECDH + HKDF-SHA256, the header authenticated. Export never uses a 5-minute
@@ -43,7 +50,7 @@ import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
 import Security
 
-let version = "1.4.0"
+let version = "1.5.0"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -55,7 +62,11 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         the path of a private temp file, removed when CMD ends
   touchenv ls                           list names; "(iCloud)" marks synced ones
   touchenv rm NAME                      delete
-  touchenv lock                         end every "Don't ask again for 5 minutes" approval now
+  touchenv grant --for 8h --uses 20 NAME ...
+                                        one Touch ID now; then this app and what it runs read those secrets
+                                        with touchenv run without asking, also while the Mac is locked, until
+                                        the time (24h at most) or the uses run out
+  touchenv lock                         end every approval now: 5-minute ones and grants
 
   Moving to a new Mac:
   touchenv import --begin               (new Mac) prints tenv1:… and a check code
@@ -113,7 +124,7 @@ func startTime(_ pid: pid_t) -> UInt64? {
     bsdInfo(pid).map { UInt64($0.pbi_start_tvsec) * 1_000_000 + UInt64($0.pbi_start_tvusec) }
 }
 
-struct Requester { let pid: pid_t; let start: UInt64; let name: String; var isAgent = false }
+struct Requester { let pid: pid_t; let start: UInt64; let name: String; var isAgent = false; var exec = "" }
 
 /// The nearest ancestor that is not a shell or a wrapper: the agent, or the terminal when you typed it yourself.
 func requester(from first: pid_t = getppid()) -> Requester {
@@ -130,12 +141,40 @@ func requester(from first: pid_t = getppid()) -> Requester {
     for _ in 0..<32 {
         guard pid > 1, let name = executableName(pid) else { break }
         if !passThrough.contains(name.trimmingCharacters(in: CharacterSet(charactersIn: "-"))) {
-            return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? name, isAgent: agents.contains(name))
+            return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? name, isAgent: agents.contains(name),
+                             exec: name)
         }
         guard let parent = parentPid(pid) else { break }
         pid = parent
     }
     return Requester(pid: 0, start: 0, name: "a process")
+}
+
+/// The badge on the Touch ID disc: the icon of whoever asks. For an AI agent that runs in a terminal, its maker's
+/// app when this Mac has it (Claude Code shows Claude.app's icon, Codex shows Codex.app's or ChatGPT.app's);
+/// otherwise the app the request came from: the AI app itself, the editor, or the terminal. Icons are read from
+/// the apps installed here; touchenv ships no one's logo. Like the name in the prompt, it tells you who asks; it
+/// proves nothing a program could not fake.
+func requesterIcon() -> NSImage {
+    let who = requester()
+    let makers = ["claude": ["Claude"], "codex": ["Codex", "ChatGPT"], "cursor-agent": ["Cursor"], "gemini": ["Gemini"],
+                  "goose": ["Goose"], "opencode": ["OpenCode"]]
+    for app in makers[who.exec] ?? [] {
+        for folder in ["/Applications", NSHomeDirectory() + "/Applications"] {
+            let path = "\(folder)/\(app).app"
+            if FileManager.default.fileExists(atPath: path) { return NSWorkspace.shared.icon(forFile: path) }
+        }
+    }
+    var pid = who.pid
+    for _ in 0..<32 {
+        guard pid > 1 else { break }
+        if let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular, let icon = app.icon {
+            return icon
+        }
+        guard let parent = parentPid(pid) else { break }
+        pid = parent
+    }
+    return NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath)
 }
 
 func shortCommand(_ argv: [String]) -> String {
@@ -155,6 +194,34 @@ func requireIntent(_ intent: String?, example: String) {
 }
 
 // MARK: Prompt
+
+/// Marks text to show in bold in a prompt's title. Only the secrets' names are marked, so the eye lands on what is
+/// being asked for rather than on the sentence around it.
+func strong(_ text: String) -> String { "\u{1}\(text)\u{2}" }
+func strong(_ names: [String]) -> String { names.map { strong($0) }.joined(separator: ", ") }
+
+/// A prompt's title: regular text, with the parts marked by strong() in bold.
+func titleText(_ marked: String) -> NSAttributedString {
+    let out = NSMutableAttributedString()
+    var bold = false, run = ""
+    func flush() {
+        guard !run.isEmpty else { return }
+        out.append(NSAttributedString(string: run, attributes: [
+            .font: bold ? NSFont.boldSystemFont(ofSize: 13) : NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor]))
+        run = ""
+    }
+    for character in marked {
+        if character == "\u{1}" || character == "\u{2}" {
+            flush()
+            bold = character == "\u{1}"
+        } else {
+            run.append(character)
+        }
+    }
+    flush()
+    return out
+}
 
 enum Outcome { case approved, denied, password }
 
@@ -182,7 +249,7 @@ final class Prompt: NSObject {
             return field
         }
         // The system view drives Touch ID but pulses while it waits. It must stay visible to read a finger, so the
-        // dialog's own still icon (the Touch ID disc badged with the app icon) sits over it on an opaque cover.
+        // dialog's own still icon (the Touch ID disc badged with the asker's icon) sits over it on an opaque cover.
         let reader = LAAuthenticationView(context: context, controlSize: .large)
         let cover = NSView()
         cover.wantsLayer = true
@@ -193,7 +260,7 @@ final class Prompt: NSObject {
             ?? NSImage(systemSymbolName: "touchid", accessibilityDescription: "Touch ID")!)
         disc.imageScaling = .scaleProportionallyUpOrDown
         disc.contentTintColor = .systemRed
-        let badge = NSImageView(image: NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath))
+        let badge = NSImageView(image: requesterIcon())
         badge.imageScaling = .scaleProportionallyUpOrDown
         let sensor = NSView()
         let frames: [(NSView, CGFloat, CGFloat, CGFloat)] = [(reader, 0, 6, 64), (cover, 0, 0, 74), (disc, 0, 6, 64),
@@ -209,8 +276,14 @@ final class Prompt: NSObject {
         sensor.widthAnchor.constraint(equalToConstant: 74).isActive = true
         sensor.heightAnchor.constraint(equalToConstant: 70).isActive = true
 
-        var views: [NSView] = [sensor, label(title, .boldSystemFont(ofSize: 13))]
-        if let intent { views.append(label("Intent: \(intent)", .systemFont(ofSize: 13))) }
+        let heading = label("", .systemFont(ofSize: 13))
+        heading.attributedStringValue = titleText(title)
+        var views: [NSView] = [sensor, heading]
+        if let intent {
+            let line = label("", .systemFont(ofSize: 13))
+            line.attributedStringValue = titleText("\(strong("INTENT:")) \(intent)")
+            views.append(line)
+        }
         else if detail != nil {
             // No reason given: say so, and show the command without a click.
             views.append(label("No reason given. Check the command:", .systemFont(ofSize: 13), .systemOrange))
@@ -259,7 +332,11 @@ final class Prompt: NSObject {
         panel.titlebarAppearsTransparent = true
         panel.titleVisibility = .hidden
         panel.isMovableByWindowBackground = true
-        panel.level = .floating
+        // Stay in front like the macOS dialog does: a panel hides when its app stops being the active one, so a click
+        // anywhere else would make the prompt vanish while touchenv still waits for a finger.
+        panel.level = .modalPanel
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.setContentSize(stack.fittingSize)
     }
 
@@ -434,9 +511,58 @@ func validName(_ name: String) -> Bool {
     name.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil
 }
 
-// MARK: 5-minute approvals
+// MARK: 5-minute approvals and grants
 
 let approvalLength: TimeInterval = 5 * 60
+let maxGrantLength: TimeInterval = 24 * 60 * 60
+let maxGrantUses = 500
+
+/// "8h", "30m" or "1h30m" in seconds; nil for anything else.
+func parseLength(_ text: String) -> TimeInterval? {
+    var total = 0, digits = "", seen = ""
+    for character in text {
+        if ("0"..."9").contains(character), digits.count < 5 {
+            digits.append(character)
+        } else if character == "h" || character == "m", !seen.contains(character), let n = Int(digits) {
+            total += n * (character == "h" ? 3600 : 60)
+            digits = ""
+            seen.append(character)
+        } else {
+            return nil
+        }
+    }
+    return digits.isEmpty && total > 0 ? TimeInterval(total) : nil
+}
+
+/// "8 hours", "1 hour 30 minutes".
+func spokenLength(_ seconds: TimeInterval) -> String {
+    let minutes = Int(seconds) / 60
+    var parts: [String] = []
+    if minutes >= 60 { parts.append("\(minutes / 60) hour\(minutes / 60 == 1 ? "" : "s")") }
+    if minutes % 60 > 0 { parts.append("\(minutes % 60) minute\(minutes % 60 == 1 ? "" : "s")") }
+    return parts.joined(separator: " ")
+}
+
+/// Time left as 4:59 or 7:59:59.
+func clock(_ seconds: Int) -> String {
+    seconds >= 3600 ? String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+                    : String(format: "%d:%02d", seconds / 60, seconds % 60)
+}
+
+func times(_ n: Int) -> String { n == 1 ? "1 time" : "\(n) times" }
+
+/// The process and every process above it, each as pid and start time.
+func lineage(_ first: pid_t) -> [(pid: pid_t, start: UInt64)] {
+    var out: [(pid: pid_t, start: UInt64)] = []
+    var pid = first
+    for _ in 0..<64 {
+        guard pid > 1, let start = startTime(pid) else { break }
+        out.append((pid, start))
+        guard let parent = parentPid(pid) else { break }
+        pid = parent
+    }
+    return out
+}
 
 /// In the temp folder macOS gives each user (private to them), not $TMPDIR, which sandboxes point elsewhere.
 func agentSocketPath() -> String {
@@ -546,10 +672,14 @@ func startAgent() -> Bool {
     return false
 }
 
-/// The background copy: keeps approved secrets in memory, per requester, for 5 minutes, then exits.
+/// The background copy: keeps approved secrets in memory, per requester, for 5 minutes or for a grant's length,
+/// then exits.
 final class Agent: NSObject {
     struct Approval { var start: UInt64; var who: String; var secrets: [String: Data]; var expires: Date }
+    /// From touchenv grant: covers the requester (pid, start) and every process below it.
+    struct Grant { var pid: pid_t; var start: UInt64; var who: String; var secrets: [String: Data]; var expires: Date; var uses: Int }
     var approvals: [pid_t: Approval] = [:]
+    var grants: [Grant] = []
     var listener: DispatchSourceRead?
     var statusItem: NSStatusItem!
     var notice: NSPanel?
@@ -602,17 +732,52 @@ final class Agent: NSObject {
             sendMessage(fd, ["ok": true])
             tick()
             return
+        case "allow":
+            guard who.pid > 1, let encoded = message["secrets"] as? [String: String], !encoded.isEmpty,
+                  let seconds = message["seconds"] as? Double, seconds >= 60,
+                  let uses = message["uses"] as? Int, uses >= 1 else { break }
+            var secrets: [String: Data] = [:]
+            for (name, value) in encoded { secrets[name] = Data(base64Encoded: value) }
+            // A new grant to the same requester for the same secrets replaces the old one.
+            grants.removeAll { $0.pid == who.pid && $0.start == who.start && Set($0.secrets.keys) == Set(secrets.keys) }
+            grants.append(Grant(pid: who.pid, start: who.start, who: who.name, secrets: secrets,
+                                expires: Date().addingTimeInterval(min(seconds, maxGrantLength)),
+                                uses: min(uses, maxGrantUses)))
+            sendMessage(fd, ["ok": true, "who": who.name])
+            tick()
+            return
         case "get":
-            guard let names = message["names"] as? [String], let approval = approvals[who.pid],
-                  approval.start == who.start, approval.expires > Date(),
-                  names.allSatisfy({ approval.secrets[$0] != nil }) else { break }
+            guard let names = message["names"] as? [String], !names.isEmpty else { break }
+            let now = Date()
+            let intent = message["intent"] as? String
+            if let approval = approvals[who.pid], approval.start == who.start, approval.expires > now,
+               names.allSatisfy({ approval.secrets[$0] != nil }) {
+                var out: [String: String] = [:]
+                for name in names { out[name] = approval.secrets[name]!.base64EncodedString() }
+                sendMessage(fd, ["ok": true, "secrets": out])
+                let left = Int(approval.expires.timeIntervalSince(now).rounded(.up))
+                showNotice(who: approval.who, names: names, intent: intent, left: "approved for \(clock(left)) more")
+                return
+            }
+            // A grant: the asking process must sit below the requester the grant was given to.
+            let above = lineage(parent)
+            guard let index = grants.firstIndex(where: { grant in
+                grant.expires > now && grant.uses > 0 && names.allSatisfy({ grant.secrets[$0] != nil })
+                    && above.contains { $0.pid == grant.pid && $0.start == grant.start }
+            }) else { break }
+            grants[index].uses -= 1
+            let grant = grants[index]
             var out: [String: String] = [:]
-            for name in names { out[name] = approval.secrets[name]!.base64EncodedString() }
+            for name in names { out[name] = grant.secrets[name]!.base64EncodedString() }
             sendMessage(fd, ["ok": true, "secrets": out])
-            showNotice(who: approval.who, names: names, intent: message["intent"] as? String, until: approval.expires)
+            let left = Int(grant.expires.timeIntervalSince(now).rounded(.up))
+            showNotice(who: who.name, names: names, intent: intent,
+                       left: grant.uses == 0 ? "that was the last use granted"
+                                             : "granted for \(clock(left)) more, \(times(grant.uses)) left")
             return
         case "lock":
             approvals.removeAll()
+            grants.removeAll()
             sendMessage(fd, ["ok": true])
             DispatchQueue.main.async { self.tick() }
             return
@@ -625,20 +790,30 @@ final class Agent: NSObject {
     func tick() {
         let now = Date()
         approvals = approvals.filter { pid, approval in approval.expires > now && startTime(pid) == approval.start }
-        guard let last = approvals.values.map(\.expires).max() else {
-            // Empty: quit, except in the first seconds, while whoever started the agent is still sending its approval.
-            if now.timeIntervalSince(born) > 10 || statusItem.button?.title.isEmpty == false {
+        grants = grants.filter { $0.expires > now && $0.uses > 0 && startTime($0.pid) == $0.start }
+        guard let last = (approvals.values.map(\.expires) + grants.map(\.expires)).max() else {
+            // Empty: quit, except in the first seconds, while whoever started the agent is still sending its approval,
+            // and while the notice of the last use is still on screen.
+            if notice == nil, now.timeIntervalSince(born) > 10 || statusItem.button?.title.isEmpty == false {
                 unlink(agentSocketPath())
                 exit(0)
             }
             return
         }
         let left = Int(last.timeIntervalSince(now).rounded(.up))
-        statusItem.button?.title = String(format: " %d:%02d", left / 60, left % 60)
+        statusItem.button?.title = " " + clock(left)
         let menu = NSMenu()
         for approval in approvals.values.sorted(by: { $0.who < $1.who }) {
             let names = approval.secrets.keys.sorted().joined(separator: ", ")
             let item = NSMenuItem(title: "\(approval.who) can read \(names) without asking", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+        for grant in grants.sorted(by: { $0.who < $1.who }) {
+            let names = grant.secrets.keys.sorted().joined(separator: ", ")
+            let left = clock(Int(grant.expires.timeIntervalSince(now).rounded(.up)))
+            let item = NSMenuItem(title: "\(grant.who) and what it runs can read \(names) without asking: "
+                                  + "\(times(grant.uses)), \(left) left", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         }
@@ -651,16 +826,16 @@ final class Agent: NSObject {
 
     @objc func lockNow() {
         approvals.removeAll()
+        grants.removeAll()
         tick()
     }
 
     /// A short notice at the top right each time an approval is used, so it never happens unseen.
-    func showNotice(who: String, names: [String], intent: String?, until: Date) {
+    func showNotice(who: String, names: [String], intent: String?, left: String) {
         notice?.orderOut(nil)
-        let left = Int(until.timeIntervalSinceNow.rounded(.up))
         var lines = ["\(who) read \(names.joined(separator: ", "))"]
-        if let intent { lines.append("Intent: \(intent)") }
-        lines.append(String(format: "No Touch ID asked: approved for %d:%02d more. Lock in the menu bar.", left / 60, left % 60))
+        if let intent { lines.append("INTENT: \(intent)") }
+        lines.append("No Touch ID asked: \(left). Lock in the menu bar.")
         let stack = NSStackView(views: lines.enumerated().map { index, line in
             let field = NSTextField(wrappingLabelWithString: line)
             field.font = index == 0 ? .boldSystemFont(ofSize: 13) : .systemFont(ofSize: 12)
@@ -823,6 +998,9 @@ var intent: String?
 var sync = false
 var recipientArgument: String?
 var begin = false, replace = false, localOnly = false
+var grantLength: TimeInterval?
+var grantLengthText = ""
+var grantUses: Int?
 while let option = args.first, option.hasPrefix("--"), option != "--" {
     if option == "--sync", command == "set" {
         sync = true
@@ -833,8 +1011,23 @@ while let option = args.first, option.hasPrefix("--"), option != "--" {
     } else if command == "import", ["--begin", "--replace", "--local"].contains(option) {
         if option == "--begin" { begin = true } else if option == "--replace" { replace = true } else { localOnly = true }
         args.removeFirst()
+    } else if option == "--for", command == "grant", args.count > 1 {
+        guard let length = parseLength(args[1]), length <= maxGrantLength else {
+            die("touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most", 2)
+        }
+        grantLength = length
+        grantLengthText = args[1]
+        args.removeFirst(2)
+    } else if option == "--uses", command == "grant", args.count > 1 {
+        guard let uses = Int(args[1]), (1...maxGrantUses).contains(uses) else {
+            die("touchenv: --uses takes a number from 1 to \(maxGrantUses)", 2)
+        }
+        grantUses = uses
+        args.removeFirst(2)
     } else if option == "--intent", args.count > 1 {
-        let text = args[1].trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
+        // One line, and no control characters: they could restyle the prompt (see strong).
+        let text = String(String.UnicodeScalarView(args[1].replacingOccurrences(of: "\n", with: " ").unicodeScalars
+            .filter { !CharacterSet.controlCharacters.contains($0) })).trimmingCharacters(in: .whitespaces)
         intent = text.isEmpty ? nil : (text.count > 200 ? String(text.prefix(199)) + "…" : text)
         args.removeFirst(2)
     } else {
@@ -852,7 +1045,7 @@ case "set":
         requireIntent(intent, example: "touchenv set --intent \"<why>\" \(name)")
         let who = requester().name
         let target = sync ? "iCloud Keychain" : "your Keychain"
-        authenticate("Allow \(who) to replace \(name) in \(target)?", intent: intent,
+        authenticate("Allow \(who) to replace \(strong(name)) in \(target)?", intent: intent,
                      reason: "let \(who) replace the secret \(name) in \(target)")
         if wasSynced == sync {
             let status = SecItemUpdate(query(name) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
@@ -872,7 +1065,7 @@ case "get":
     guard args.count == 1 else { die("usage: touchenv get NAME", 2) }
     requireIntent(intent, example: "touchenv get --intent \"<why>\" \(args[0])")
     let who = requester().name
-    authenticate("Show \(who) \(args[0]) from \(place([args[0]])) in full?", intent: intent,
+    authenticate("Show \(who) \(strong(args[0])) from \(place([args[0]])) in full?", intent: intent,
                  reason: "show \(who) the secret \(args[0]) in full")
     FileHandle.standardOutput.write(read(args[0]))
 
@@ -880,7 +1073,7 @@ case "rm":
     guard args.count == 1 else { die("usage: touchenv rm NAME", 2) }
     requireIntent(intent, example: "touchenv rm --intent \"<why>\" \(args[0])")
     let who = requester().name
-    authenticate("Allow \(who) to delete \(args[0]) from \(place([args[0]]))?", intent: intent,
+    authenticate("Allow \(who) to delete \(strong(args[0])) from \(place([args[0]]))?", intent: intent,
                  reason: "let \(who) delete the secret \(args[0])")
     let status = SecItemDelete(query(args[0]) as CFDictionary)
     if status != errSecSuccess { die("touchenv: keychain error \(status)") }
@@ -908,14 +1101,14 @@ case "run":
     let wanted = specs.map(\.name)
     signal(SIGPIPE, SIG_IGN)
     var secrets: [String: Data] = [:]
-    // A "Don't ask again for 5 minutes" approval from this requester, if one covers every secret asked for.
+    // A "Don't ask again for 5 minutes" approval or a grant, if one covers this requester and every secret asked for.
     if let reply = askAgent(["op": "get", "names": wanted, "intent": intent ?? NSNull()]), reply["ok"] as? Bool == true,
        let encoded = reply["secrets"] as? [String: String] {
         for (name, value) in encoded { secrets[name] = Data(base64Encoded: value) }
     }
     if !wanted.allSatisfy({ secrets[$0] != nil }) {
         let full = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
-        let keep = authenticate("Allow \(who) to read \(names) from \(place(wanted))?", intent: intent,
+        let keep = authenticate("Allow \(who) to read \(strong(wanted)) from \(place(wanted))?", intent: intent,
                                 detail: full.count > 2000 ? String(full.prefix(1999)) + "…" : full,
                                 reason: "give \(who) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))",
                                 offerSession: true)
@@ -963,8 +1156,33 @@ case "run":
     if let dir = tempDir { try? FileManager.default.removeItem(at: dir) }
     exit(process.terminationReason == .uncaughtSignal ? 128 + process.terminationStatus : process.terminationStatus)
 
+case "grant":
+    guard let length = grantLength, let uses = grantUses, !args.isEmpty, args.allSatisfy(validName) else {
+        die("usage: touchenv grant --for 8h --uses 20 NAME [NAME2 ...]  (both limits are required; 24h at most)", 2)
+    }
+    var wanted: [String] = []
+    for name in args where !wanted.contains(name) { wanted.append(name) }
+    let list = wanted.joined(separator: ", ")
+    requireIntent(intent, example: "touchenv grant --intent \"<why>\" --for \(grantLengthText) --uses \(uses) \(wanted.joined(separator: " "))")
+    let who = requester()
+    // The grant covers the requester and what it runs, so there must be one to name.
+    guard who.pid > 1 else { die("touchenv: can't tell which app is asking, so there is nothing to grant to") }
+    for name in wanted where synced(name) == nil { die("touchenv: no secret named \(name)") }
+    let limits = "for \(spokenLength(length)), up to \(times(uses))"
+    authenticate("Allow \(who.name) and what it runs to read \(strong(wanted)) from \(place(wanted)) without asking, \(limits)? "
+                 + "It stays on while the Mac is locked.", intent: intent,
+                 reason: "let \(who.name) and what it runs read \(list) without asking, \(limits), also while the Mac is locked")
+    var secrets: [String: String] = [:]
+    for name in wanted { secrets[name] = read(name).base64EncodedString() }
+    signal(SIGPIPE, SIG_IGN)
+    guard startAgent(), let reply = askAgent(["op": "allow", "secrets": secrets, "seconds": length, "uses": uses]),
+          reply["ok"] as? Bool == true else { die("touchenv: couldn't start the grant; nothing was allowed") }
+    let until = DateFormatter.localizedString(from: Date().addingTimeInterval(length), dateStyle: .none, timeStyle: .short)
+    print("\(reply["who"] as? String ?? who.name) and what it runs can read \(list) with touchenv run without asking: "
+          + "\(times(uses)), until \(until), also while the Mac is locked. touchenv lock ends it.")
+
 case "lock":
-    if askAgent(["op": "lock"]) != nil { print("locked: every 5-minute approval ended") }
+    if askAgent(["op": "lock"]) != nil { print("locked: every approval and grant ended") }
     else { print("nothing to lock") }
 
 case "export":
@@ -980,7 +1198,7 @@ case "export":
     let who = requester().name
     let what = args.isEmpty ? "all your secrets" : args.joined(separator: ", ")
     // Never through a 5-minute approval: every export asks.
-    authenticate("Allow \(who) to export \(what) to the Mac showing \(code)? Only if your new Mac shows that code.",
+    authenticate("Allow \(who) to export \(args.isEmpty ? what : strong(args)) to the Mac showing \(strong(code))? Only if your new Mac shows that code.",
                  intent: intent, detail: shortCommand(CommandLine.arguments),
                  reason: "let \(who) export \(what) to the Mac showing \(code)")
     let all = items()
@@ -1061,7 +1279,7 @@ case "import":
     let names = incoming.map(\.name)
     let existing = Set(names.filter { synced($0) != nil })
     let who = requester().name
-    var title = "Allow \(who) to add \(names.joined(separator: ", ")) from \(from)?"
+    var title = "Allow \(who) to add \(strong(names)) from \(from)?"
     if !existing.isEmpty {
         let list = existing.sorted().joined(separator: ", ")
         title += replace ? " Replaces your \(list)." : " Keeps your \(list)."
