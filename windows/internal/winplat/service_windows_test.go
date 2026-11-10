@@ -7,8 +7,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -48,12 +50,39 @@ func testPipe(t *testing.T, h *core.Holder) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var traceMu sync.Mutex
+	var traced []string
+	pipeTrace = func(format string, a ...any) {
+		traceMu.Lock()
+		traced = append(traced, fmt.Sprintf(format, a...))
+		traceMu.Unlock()
+	}
+	t.Cleanup(func() {
+		pipeTrace = nil
+		traceMu.Lock()
+		defer traceMu.Unlock()
+		made := 0
+		for _, line := range traced {
+			if strings.HasSuffix(line, "instance made") {
+				made++
+				continue
+			}
+			if strings.Contains(line, "(0xE8)") { // ERROR_NO_DATA: a client left before it was served
+				t.Logf("pipe: %s", line)
+				continue
+			}
+			t.Errorf("pipe: %s", line) // every other error the listeners met, with its code
+		}
+		t.Logf("pipe instances made after the first: %d", made)
+	})
 	stop, _ := windows.CreateEvent(nil, 1, 0, nil)
 	done := make(chan struct{})
 	served := make(chan error, 1)
 	ready := make(chan struct{})
 	go func() {
-		served <- servePipe(path, "D:P(A;;GA;;;SY)(A;;0x12019b;;;"+sid+")", h, stop, done, func() { close(ready) })
+		// The service's DACL, with this test's account standing in for both the service and the interactive
+		// users (a CI runner's logon isn't interactive).
+		served <- servePipe(path, pipeSDDL(sid, sid), h, stop, done, func() { close(ready) })
 	}()
 	select { // never os.Stat a pipe to wait for it: that opens it, and uses up an instance
 	case <-ready:
@@ -122,6 +151,25 @@ func TestPipeServesWithIdentityFromWindows(t *testing.T) {
 			t.Errorf("client %d: %v", i, err)
 		}
 	}
+}
+
+// A service that went deaf after a few requests would leave every user asking Windows Hello again: 50 in a row.
+func TestPipeKeepsAnswering(t *testing.T) {
+	h := &core.Holder{Now: time.Now, Procs: processTable, Alloc: lockedAlloc, Free: lockedFree}
+	path := testPipe(t, h)
+	start := time.Now()
+	for i := 0; i < 50; i++ {
+		conn, err := dial(path, windows.GetCurrentProcessId)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		reply, err := core.Ask(conn, core.Request{Op: "status"})
+		conn.Close()
+		if err != nil || !reply.OK {
+			t.Fatalf("request %d: %v %+v", i, err, reply)
+		}
+	}
+	t.Logf("50 requests in %v", time.Since(start))
 }
 
 func TestClientIdentityIsThisUser(t *testing.T) {
