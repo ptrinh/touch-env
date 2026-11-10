@@ -51,7 +51,17 @@ func testPipe(t *testing.T, h *core.Holder) string {
 	stop, _ := windows.CreateEvent(nil, 1, 0, nil)
 	done := make(chan struct{})
 	served := make(chan error, 1)
-	go func() { served <- servePipe(path, "D:P(A;;GA;;;SY)(A;;0x12019b;;;"+sid+")", h, stop, done) }()
+	ready := make(chan struct{})
+	go func() {
+		served <- servePipe(path, "D:P(A;;GA;;;SY)(A;;0x12019b;;;"+sid+")", h, stop, done, func() { close(ready) })
+	}()
+	select { // never os.Stat a pipe to wait for it: that opens it, and uses up an instance
+	case <-ready:
+	case err := <-served:
+		t.Fatalf("servePipe: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pipe never appeared")
+	}
 	t.Cleanup(func() {
 		close(done)
 		windows.SetEvent(stop)
@@ -65,38 +75,52 @@ func testPipe(t *testing.T, h *core.Holder) string {
 		}
 		windows.CloseHandle(stop)
 	})
-	for i := 0; i < 50; i++ { // wait for the first instance
-		if _, err := os.Stat(path); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	return path
 }
 
 func TestPipeServesWithIdentityFromWindows(t *testing.T) {
 	h := &core.Holder{Now: time.Now, Procs: processTable, Alloc: lockedAlloc, Free: lockedFree}
 	path := testPipe(t, h)
-	// Pretend the test's own process is the service, so dial's server check passes.
-	conn, err := dial(path, windows.GetCurrentProcessId)
-	if err != nil {
-		t.Fatal(err)
+	ask := func(req core.Request) core.Reply {
+		t.Helper()
+		// Pretend the test's own process is the service, so dial's server check passes.
+		conn, err := dial(path, windows.GetCurrentProcessId)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		reply, err := core.Ask(conn, req)
+		if err != nil {
+			t.Fatalf("%s: %v", req.Op, err)
+		}
+		t.Logf("%s: %+v", req.Op, reply)
+		return reply
 	}
-	reply, err := core.Ask(conn, core.Request{Op: "status"})
-	conn.Close()
-	if err != nil || !reply.OK || reply.Version != core.Version {
-		t.Fatalf("%v %+v", err, reply)
+	if reply := ask(core.Request{Op: "status"}); !reply.OK || reply.Version != core.Version {
+		t.Fatalf("status: %+v", reply)
 	}
-	// get is refused: the client is winplat.test.exe, not touchenv.exe. That shows the service looked the client up
-	// in the real process list by the pid Windows gave it.
-	conn, err = dial(path, windows.GetCurrentProcessId)
-	if err != nil {
-		t.Fatal(err)
+	// get is refused: the client is winplat.test.exe, not touchenv.exe. That shows the service identified the
+	// client (an identity failure would say "can't tell who is asking: ...") and looked it up in the real process
+	// list by the pid Windows gave it.
+	if reply := ask(core.Request{Op: "get", Names: []string{"A"}}); reply.OK || reply.Error != "only touchenv.exe may ask the touchenv service" {
+		t.Fatalf("get: %+v", reply)
 	}
-	reply, err = core.Ask(conn, core.Request{Op: "get", Names: []string{"A"}})
-	conn.Close()
-	if err != nil || reply.OK || reply.Error != "only touchenv.exe may ask the touchenv service" {
-		t.Fatalf("%v %+v", err, reply)
+	// Many clients at once: never "not found" or "busy" while the server runs.
+	errs := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		go func() {
+			conn, err := dial(path, windows.GetCurrentProcessId)
+			if err == nil {
+				_, err = core.Ask(conn, core.Request{Op: "status"})
+				conn.Close()
+			}
+			errs <- err
+		}()
+	}
+	for i := 0; i < 20; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("client %d: %v", i, err)
+		}
 	}
 }
 
@@ -171,17 +195,28 @@ func TestDialRefusesAnImpostor(t *testing.T) {
 	var r [8]byte
 	rand.Read(r[:])
 	path := `\\.\pipe\touchenv-test-` + hex.EncodeToString(r[:])
-	server, err := windows.CreateNamedPipe(utf16z(path), windows.PIPE_ACCESS_DUPLEX, windows.PIPE_TYPE_BYTE, 1, 4096, 4096, 0, sa)
-	if err != nil {
-		t.Fatal(err)
+	// A fresh waiting instance for each attempt: an instance whose client closed stays taken until its server
+	// disconnects it, and this impostor never does (it would just look busy).
+	instance := func() {
+		t.Helper()
+		p, err := windows.CreateNamedPipe(utf16z(path), windows.PIPE_ACCESS_DUPLEX, windows.PIPE_TYPE_BYTE,
+			windows.PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, sa)
+		if err != nil {
+			t.Fatalf("CreateNamedPipe: %v", err)
+		}
+		t.Cleanup(func() { windows.CloseHandle(p) })
 	}
-	defer windows.CloseHandle(server)
+	instance()
 	if _, err := dial(path, func() uint32 { return 0 }); !errors.Is(err, core.ErrNotService) {
 		t.Fatalf("no service running: %v", err)
 	}
-	if _, err := dial(path, func() uint32 { return 4 }); !errors.Is(err, core.ErrNotService) {
-		t.Fatalf("another process is the service: %v", err)
+	instance()
+	start := time.Now()
+	_, err := dial(path, func() uint32 { return 4 })
+	if !errors.Is(err, core.ErrNotService) || time.Since(start) > time.Second {
+		t.Fatalf("another process is the service: %v (after %v)", err, time.Since(start))
 	}
+	t.Logf("refused: %v", err)
 	if _, err := dial(path+"-none", func() uint32 { return 0 }); !errors.Is(err, core.ErrNoService) {
 		t.Fatalf("no pipe: %v", err)
 	}
