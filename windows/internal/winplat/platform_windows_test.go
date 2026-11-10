@@ -26,6 +26,17 @@ func sddl(t *testing.T, path string) string {
 	return sd.String()
 }
 
+// only is the DACL that grants sid alone, written the way Windows prints it: it
+// abbreviates well-known accounts (the built-in Administrator on CI runners is "LA").
+func only(t *testing.T, flags, sid string) string {
+	t.Helper()
+	sd, err := windows.SecurityDescriptorFromString("D:P(A;" + flags + ";FA;;;" + sid + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sd.String()
+}
+
 // The store folder, the store file and :file folders grant the user alone, with inheritance cut.
 func TestPrivateACLs(t *testing.T) {
 	base := useTempAppData(t)
@@ -35,7 +46,7 @@ func TestPrivateACLs(t *testing.T) {
 	if err != nil || dir != filepath.Join(base, "touchenv") {
 		t.Fatalf("%q %v", dir, err)
 	}
-	if got := sddl(t, dir); got != "D:P(A;OICI;FA;;;"+sid+")" {
+	if got := sddl(t, dir); got != only(t, "OICI", sid) {
 		t.Fatalf("folder DACL %s", got)
 	}
 	file := filepath.Join(dir, "store.json")
@@ -48,7 +59,7 @@ func TestPrivateACLs(t *testing.T) {
 	if data, _ := os.ReadFile(file); string(data) != "two" {
 		t.Fatalf("%q", data)
 	}
-	if got := sddl(t, file); got != "D:P(A;;FA;;;"+sid+")" {
+	if got := sddl(t, file); got != only(t, "", sid) {
 		t.Fatalf("file DACL %s", got)
 	}
 	leftovers, _ := filepath.Glob(file + ".new-*")
@@ -70,7 +81,7 @@ func TestRunDirCleanupAndSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	sid, _ := userSID()
-	if got := sddl(t, dir); got != "D:P(A;OICI;FA;;;"+sid+")" {
+	if got := sddl(t, dir); got != only(t, "OICI", sid) {
 		t.Fatalf("run folder DACL %s", got)
 	}
 	if err := p.WriteFilePrivate(filepath.Join(dir, "KEY"), []byte("secret")); err != nil {

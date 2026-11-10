@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -40,8 +41,9 @@ func TestStoredFileHoldsNoPlaintext(t *testing.T) {
 	if strings.Contains(string(data), "plaintext-marker-123") {
 		t.Fatal("secret stored in the clear")
 	}
+	// Windows has no mode bits: there the ACL does this job, tested in winplat.
 	info, _ := os.Stat(filepath.Join(m.p.dir, "store.json"))
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("store mode %v", info.Mode())
 	}
 }
