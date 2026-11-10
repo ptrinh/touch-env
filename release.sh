@@ -1,6 +1,8 @@
 #!/bin/sh
 # Maintainer only: builds touchenv.app into dist/, notarizes and staples it, and zips it for a GitHub release.
 #   NOTARY_PROFILE  notarytool keychain profile (xcrun notarytool store-credentials)
+# Windows builds are not made here: publishing the GitHub release (tag v<version>) starts .github/workflows/windows.yml,
+# which tests them and attaches touchenv-<version>-windows-x64.zip and -arm64.zip (+ .sha256) to the same release.
 set -e
 cd "$(dirname "$0")"
 : "${NOTARY_PROFILE:?set NOTARY_PROFILE}"

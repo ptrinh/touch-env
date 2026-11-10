@@ -86,6 +86,42 @@ exporting to someone else's key: the prompt names the receiving Mac's code, and 
 
   Keep signing keys and admin tokens local.
 
+## Windows
+
+**Preview.** Builds and passes its tests, but the Windows Hello part has not yet been tried on a real PC.
+
+Windows 10 or 11, x64 or Arm, with Windows Hello set up (a PIN at least; fingerprint or face too if you like).
+Download `touchenv-<version>-windows-x64.zip` (or `-arm64`) from
+[Releases](https://github.com/ptrinh/touch-env/releases/latest), check it against the `.sha256` file
+(`Get-FileHash touchenv-*.zip`), and put `touchenv.exe` in a folder on your `PATH`. The exe isn't code-signed yet,
+so SmartScreen may warn the first time.
+
+Same commands as on a Mac. Every read asks Windows Hello, and the Hello window shows touchenv's text: who asks,
+which keys, the intent and the command. Differences:
+
+- **No "Don't ask again for 5 minutes".** On Windows another program running as you can read a running program's
+  memory, so keys held for 5 minutes would be readable without a touch. `touchenv lock` says there's nothing to lock.
+- **No `--sync`.** Keys stay on the PC they were saved on.
+- **`ls` doesn't ask.** The names sit in the store file anyway.
+- **Not over Remote Desktop, SSH or from a service.** touchenv refuses rather than ask where you can't answer.
+- **Moving keys** works the same way, and between a Mac and a PC in both directions (`import --begin` on the new
+  one, `export --to` on the old one).
+
+How it's kept: `%LOCALAPPDATA%\touchenv\store.json`, readable only by you. Each key is encrypted to a store key whose
+private half is itself encrypted to an RSA key that Windows Hello holds (in the TPM when the PC has one) and that
+touchenv makes with "ask on every use". A copy of the file is useless anywhere else.
+
+Weaker than on a Mac:
+
+| If… | Mac | Windows |
+|---|---|---|
+| Malware runs as you | Can't use touchenv's key | **Can ask Windows Hello to use it**, with its own prompt text: you'd see a prompt you didn't expect. It can also delete keys or replace one with its own value |
+| Malware runs as admin | Still needs your finger | Not designed to stop it |
+| The PC has no TPM | — | Windows Hello keeps the key in software |
+
+So on Windows, **only touch for a prompt you were expecting**, and read who's asking. AI agents are recognised by
+program name (`claude.exe`, `codex.exe`…); one that runs inside `node.exe` isn't, so it isn't made to give an intent.
+
 ## For developers
 
 One Swift file, [`touchenv.swift`](touchenv.swift). Local keys: Data Protection keychain, `userPresence`,
@@ -98,6 +134,14 @@ touchenv's designated code requirement.
 Building needs a paid Apple Developer account: an App ID, a Developer ID provisioning profile, and the values in the
 header of `build.sh` put in `build.local`. Then `./build.sh`. Your build can't read keys saved by the prebuilt app;
 move them with `old run A:file -- sh -c 'touchenv set A < "$A"'`.
+
+Windows: a Go module in [`windows/`](windows), standard library plus `golang.org/x/sys`. The Hello key is made with
+CNG (`NCryptCreatePersistedKey` in the Microsoft Passport key storage provider, `NgcCacheType` = ask every time,
+the prompt text from `NCRYPT_USE_CONTEXT_PROPERTY`); `internal/core` holds everything that isn't Windows and is
+tested on any OS with a stand-in key. `cd windows && GOOS=windows GOARCH=amd64 go build -o touchenv.exe .`
+Releases: publishing the GitHub release runs [`windows.yml`](.github/workflows/windows.yml), which attaches the
+Windows zips. Both builds are checked against the same command-line cases: `conformance/run.sh path/to/touchenv`.
+On a real PC, go through [`windows/MANUAL-TEST.md`](windows/MANUAL-TEST.md).
 
 ## License
 

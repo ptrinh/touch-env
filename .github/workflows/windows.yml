@@ -1,0 +1,96 @@
+# touchenv for Windows: tests on x64 and arm64 Windows, and on a published release, attaches
+# touchenv-<version>-windows-x64.zip and -arm64.zip (+ .sha256) to that same release, next to the macOS zip.
+# The version comes from touchenv.swift's `let version`, and must match the release tag (v<version>).
+name: windows
+
+on:
+  push:
+    paths: ["windows/**", "conformance/**", "touchenv.swift", ".github/workflows/windows.yml"]
+  pull_request:
+    paths: ["windows/**", "conformance/**", "touchenv.swift", ".github/workflows/windows.yml"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the Windows builds to (e.g. v1.5.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            goarch: amd64
+          - runner: windows-11-arm
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: windows/go.mod
+          cache-dependency-path: windows/go.sum
+      - name: Vet and test (Windows Hello itself can't run on CI)
+        working-directory: windows
+        run: |
+          test "$(go env GOARCH)" = "${{ matrix.goarch }}"
+          go vet ./...
+          go test -count=1 ./...
+      - name: Build
+        working-directory: windows
+        run: CGO_ENABLED=0 go build -trimpath -buildvcs=false -o touchenv.exe .
+      - name: Command-line contract (same cases as the macOS build)
+        run: conformance/run.sh windows/touchenv.exe
+
+  release:
+    needs: test
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: windows/go.mod
+          cache-dependency-path: windows/go.sum
+      - name: Build, zip, checksum
+        run: |
+          version=$(sed -n 's/^let version = "\(.*\)"$/\1/p' touchenv.swift)
+          test -n "$version"
+          if [ "v$version" != "$TAG" ]; then
+            echo "touchenv.swift says $version but the tag is $TAG" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          for arch in amd64:x64 arm64:arm64; do
+            goarch=${arch%%:*} name=${arch#*:}
+            mkdir -p "build/$name"
+            (cd windows && GOOS=windows GOARCH=$goarch CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+              -ldflags "-s -w -X github.com/ptrinh/touch-env/windows/internal/core.Version=$version" \
+              -o "../build/$name/touchenv.exe" .)
+            cp LICENSE "build/$name/"
+            zip="touchenv-$version-windows-$name.zip"
+            (cd "build/$name" && zip -q -X "../../dist/$zip" touchenv.exe LICENSE)
+            (cd dist && sha256sum "$zip" > "$zip.sha256")
+          done
+          ls -l dist
+          cat dist/*.sha256
+      - name: Attach to the release
+        run: gh release upload "$TAG" dist/* --clobber
