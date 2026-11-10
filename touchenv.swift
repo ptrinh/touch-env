@@ -2339,7 +2339,8 @@ func sshNextSteps(name: String, keyPath: String, state: SSHSetupState, interacti
         let existing = state.configText != nil
         say("These lines would go at the end of \(tilde(sshConfigPath()))\(existing ? " (a copy goes to config.touchenv-backup first)" : ""):")
         sshConfigLines.forEach { say("    " + $0) }
-        if ask("Add them to \(tilde(sshConfigPath()))?", false) {
+        // Return alone says yes: the lines were just shown, a backup is made, and without them the agent does nothing.
+        if ask("Add them to \(tilde(sshConfigPath()))?", true) {
             do {
                 _ = try addLines()
                 config.pointsHere = true
