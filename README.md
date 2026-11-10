@@ -88,7 +88,8 @@ exporting to someone else's key: the prompt names the receiving Mac's code, and 
 
 ## Windows
 
-**Preview.** Builds and passes its tests, but the Windows Hello part has not yet been tried on a real PC.
+**Preview.** Builds and passes its tests, but the Windows Hello part, and grants through the touchenv service,
+have not yet been tried on a real PC.
 
 Windows 10 or 11, x64 or Arm, with Windows Hello set up (a PIN at least; fingerprint or face too if you like).
 Download `touchenv-<version>-windows-x64.zip` (or `-arm64`) from
@@ -99,8 +100,9 @@ so SmartScreen may warn the first time.
 Same commands as on a Mac. Every read asks Windows Hello, and the Hello window shows touchenv's text: who asks,
 which keys, the intent and the command. Differences:
 
-- **No "Don't ask again for 5 minutes".** On Windows another program running as you can read a running program's
-  memory, so keys held for 5 minutes would be readable without a touch. `touchenv lock` says there's nothing to lock.
+- **Grants and "Don't ask again for 5 minutes" need the touchenv service**, installed once (below). Without it,
+  `grant` is refused, `lock` says there's nothing to lock, and every `run` asks.
+- **`touchenv status`** lists grants and approvals, and each use.
 - **No `--sync`.** Keys stay on the PC they were saved on.
 - **`ls` doesn't ask.** The names sit in the store file anyway.
 - **Not over Remote Desktop, SSH or from a service.** touchenv refuses rather than ask where you can't answer.
@@ -111,6 +113,40 @@ How it's kept: `%LOCALAPPDATA%\touchenv\store.json`, readable only by you. Each 
 private half is itself encrypted to an RSA key that Windows Hello holds (in the TPM when the PC has one) and that
 touchenv makes with "ask on every use". A copy of the file is useless anywhere else.
 
+### Grants on Windows
+
+```sh
+touchenv service install                     # once: Windows asks for administrator approval
+touchenv grant --for 8h --uses 20 MY_KEY     # then as on a Mac
+touchenv status · touchenv lock
+```
+
+The service runs as its own account, `NT SERVICE\touchenv`, from `C:\Program Files\touchenv`, and keeps grants in
+its memory only. A grant ends at the time, after the last use, on `touchenv lock` (or **Lock Now** on its icon in the
+notification area), when the app you granted quits, or when you log off. It goes on while the PC is locked; a
+5-minute approval ends when you lock it. Each use shows a notification. Installing again (a new version) ends every
+grant. `touchenv service uninstall` removes it all.
+
+**What it can't do on Windows.** On a Mac only touchenv itself, signed, collects a grant, and only from under the app
+you granted. Windows can't tell touchenv apart from another program running as you, and any program running as you
+can start a process under that app or inject code into it. So **while a grant or approval is on, any program running
+as you can get those keys**, up to the uses left. What the service does hold to, because programs running as you
+can't read or change its memory:
+
+- Every use counts, and is listed in `touchenv status`, which those programs can't erase.
+- The time and the number of uses are kept, and `touchenv lock` ends it: after that nothing gets those keys from
+  touchenv without Windows Hello. A key already handed out stays out: change it if you suspect anything.
+- Other Windows accounts, other sessions and the network never get your grants.
+
+It doesn't stand up to malware running as administrator (that can read the service's memory), and on an account
+that is an administrator, malware running as you can usually get there: Microsoft doesn't count the UAC prompt as a
+security boundary. Grant the fewest keys, the shortest time and the fewest uses the task needs.
+
+**"Don't ask again for 5 minutes"** is off unless the service is installed with `touchenv service install
+--offer-5-minutes`. Then each `run` first asks in a small box, No preselected; choose Yes and the Windows Hello
+prompt says so, and that's what you approve. There's no flag for it, so an agent can't choose it for you (it could
+press the button by script, but the Hello prompt would still say what you're approving).
+
 Weaker than on a Mac:
 
 | If… | Mac | Windows |
@@ -118,6 +154,8 @@ Weaker than on a Mac:
 | Malware runs as you | Can't use touchenv's key | **Can ask Windows Hello to use it**, with its own prompt text: you'd see a prompt you didn't expect. It can also delete keys or replace one with its own value |
 | Malware runs as admin | Still needs your finger | Not designed to stop it |
 | The PC has no TPM | — | Windows Hello keeps the key in software |
+| A grant is on and malware runs as you | Gets nothing: only touchenv, under the app you granted, collects it | **Gets those keys**, one use each time; each use is listed in `touchenv status` |
+| A grant is on and malware runs as admin | Not designed to stop it | **Gets those keys** (reads the service's memory) |
 
 So on Windows, **only touch for a prompt you were expecting**, and read who's asking. AI agents are recognised by
 program name (`claude.exe`, `codex.exe`…); one that runs inside `node.exe` isn't, so it isn't made to give an intent.
@@ -138,7 +176,10 @@ move them with `old run A:file -- sh -c 'touchenv set A < "$A"'`.
 Windows: a Go module in [`windows/`](windows), standard library plus `golang.org/x/sys`. The Hello key is made with
 CNG (`NCryptCreatePersistedKey` in the Microsoft Passport key storage provider, `NgcCacheType` = ask every time,
 the prompt text from `NCRYPT_USE_CONTEXT_PROPERTY`); `internal/core` holds everything that isn't Windows and is
-tested on any OS with a stand-in key. `cd windows && GOOS=windows GOARCH=amd64 go build -o touchenv.exe .`
+tested on any OS with a stand-in key. `cd windows && GOOS=windows GOARCH=amd64 go build -o touchenv.exe .` The same exe is the service
+(`touchenv service run`, started by Windows): `internal/core/holder.go` is what it holds and how long, tested anywhere;
+`internal/winplat/service_windows.go` is the named pipe (`\\.\pipe\touchenv`, interactive users only, the client
+identified from its token and pid, never from what it says) and the process list.
 Releases: publishing the GitHub release runs [`windows.yml`](.github/workflows/windows.yml), which attaches the
 Windows zips. Both builds are checked against the same command-line cases: `conformance/run.sh path/to/touchenv`.
 On a real PC, go through [`windows/MANUAL-TEST.md`](windows/MANUAL-TEST.md).

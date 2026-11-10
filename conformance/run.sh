@@ -8,8 +8,14 @@ cases="$(dirname "$0")/cases.txt"
 pass=0 failed=0
 out=$(mktemp) err=$(mktemp)
 trap 'rm -f "$out" "$err"' EXIT
+platform=macos
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) platform=windows ;; esac
+case "$bin" in *.exe) platform=windows ;; esac
 while IFS='|' read -r want check args; do
   case "$want" in ''|\#*) continue ;; esac
+  case "$want" in
+    windows:*|macos:*) [ "${want%%:*}" = "$platform" ] || continue; want=${want#*:} ;;
+  esac
   want=$(echo "$want" | tr -d ' ')
   check=$(echo "$check" | sed 's/^ *//; s/ *$//')
   # shellcheck disable=SC2086  # the arguments are space separated on purpose

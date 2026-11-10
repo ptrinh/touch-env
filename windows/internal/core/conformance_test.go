@@ -22,6 +22,10 @@ func TestConformance(t *testing.T) {
 		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		if strings.HasPrefix(line, "macos:") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "windows:")
 		parts := strings.SplitN(line, "|", 3)
 		want, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
 		check := strings.TrimSpace(parts[1])
