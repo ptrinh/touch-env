@@ -26,11 +26,28 @@ import (
 const (
 	serviceName = "touchenv"
 	pipeName    = `\\.\pipe\touchenv`
-	// Protected DACL: SYSTEM and the service itself in full; interactive users may read and write, but not create
-	// pipe instances (FILE_GENERIC_READ|FILE_GENERIC_WRITE without FILE_CREATE_PIPE_INSTANCE); network logons
-	// denied. No label: Windows treats it as medium, so low-integrity and AppContainer processes can't write to it.
-	pipeSDDL = "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;OW)(A;;0x12019b;;;IU)"
+	// Interactive users may read and write, but not create pipe instances: FILE_GENERIC_READ|FILE_GENERIC_WRITE
+	// without FILE_CREATE_PIPE_INSTANCE (0x4).
+	clientAccess = "0x12019b"
 )
+
+// pipeSDDL: a protected DACL with SYSTEM and the account that serves the pipe (the service's own account) in full,
+// interactive users as clients, network logons denied. The serving account is named outright: every instance after
+// the first needs FILE_CREATE_PIPE_INSTANCE on this DACL, and "OWNER RIGHTS" depends on which owner the token
+// puts on new objects. No label: Windows treats it as medium, so low-integrity and AppContainer processes can't
+// write to it.
+func pipeSDDL(server, clients string) string {
+	return "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;" + server + ")(A;;" + clientAccess + ";;;" + clients + ")"
+}
+
+// pipeTrace, when set (tests), hears every pipe error and every instance made, with Windows' codes.
+var pipeTrace func(format string, a ...any)
+
+func trace(format string, a ...any) {
+	if pipeTrace != nil {
+		pipeTrace(format, a...)
+	}
+}
 
 var (
 	advapi32                      = windows.NewLazySystemDLL("advapi32.dll")
@@ -274,87 +291,138 @@ func pipeAttributes(sddl string) (*windows.SecurityAttributes, error) {
 	return &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}, nil
 }
 
-// servePipe accepts connections until stop is signalled. The first instance is made with
-// FILE_FLAG_FIRST_PIPE_INSTANCE: if anything else holds the name, the service doesn't start (and clients check
-// that the pipe's server is this service's process anyway).
-func servePipe(path, sddl string, h *core.Holder, stopEvent windows.Handle, done <-chan struct{}) error {
+// pipeListeners: instances kept waiting for a client at all times. With only one, there is a moment after each
+// connection when no instance exists, and a client's CreateFile then fails with ERROR_FILE_NOT_FOUND, not
+// ERROR_PIPE_BUSY (CI saw exactly that).
+const pipeListeners = 4
+
+func createInstance(name *uint16, sa *windows.SecurityAttributes, first bool) (windows.Handle, error) {
+	flags := uint32(windows.PIPE_ACCESS_DUPLEX | windows.FILE_FLAG_OVERLAPPED)
+	if first {
+		flags |= windows.FILE_FLAG_FIRST_PIPE_INSTANCE
+	}
+	return windows.CreateNamedPipe(name, flags,
+		windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
+		windows.PIPE_UNLIMITED_INSTANCES, 64<<10, 64<<10, 0, sa)
+}
+
+// servePipe accepts connections until stop is signalled; ready (if not nil) is called once the pipe exists. The
+// first instance is made with FILE_FLAG_FIRST_PIPE_INSTANCE: if anything else holds the name, the service doesn't
+// start (and clients check that the pipe's server is this service's process anyway).
+func servePipe(path, sddl string, h *core.Holder, stopEvent windows.Handle, done <-chan struct{}, ready func()) error {
 	sa, err := pipeAttributes(sddl)
 	if err != nil {
 		return err
 	}
 	name := utf16z(path)
+	first, err := createInstance(name, sa, true)
+	if err != nil {
+		trace("first CreateNamedPipe: %v (0x%X)", err, errnoOf(err))
+		return fmt.Errorf("can't create %s: %w", path, err)
+	}
+	if ready != nil {
+		ready()
+	}
 	slots := make(chan struct{}, 64)
-	first := true
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	for {
-		flags := uint32(windows.PIPE_ACCESS_DUPLEX | windows.FILE_FLAG_OVERLAPPED)
-		if first {
-			flags |= windows.FILE_FLAG_FIRST_PIPE_INSTANCE
+	var handlers, listeners sync.WaitGroup
+	for i := 0; i < pipeListeners; i++ {
+		p := windows.Handle(0)
+		if i == 0 {
+			p = first
 		}
-		p, err := windows.CreateNamedPipe(name, flags,
-			windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
-			windows.PIPE_UNLIMITED_INSTANCES, 64<<10, 64<<10, 0, sa)
-		if err != nil {
-			if first {
-				return fmt.Errorf("can't create %s: %v", path, err)
-			}
-			select {
-			case <-done:
-				return nil
-			case <-time.After(time.Second):
-				continue
-			}
-		}
-		first = false
-		if !waitConnect(p, stopEvent) {
+		listeners.Add(1)
+		go func() {
+			defer listeners.Done()
+			listen(i, p, name, sa, h, stopEvent, done, slots, &handlers)
+		}()
+	}
+	listeners.Wait()
+	handlers.Wait()
+	return nil
+}
+
+// listen keeps one instance waiting: wait for a client, hand it to a goroutine, make the next instance at once.
+// Serving never holds up the next instance.
+func listen(id int, p windows.Handle, name *uint16, sa *windows.SecurityAttributes, h *core.Holder, stopEvent windows.Handle,
+	done <-chan struct{}, slots chan struct{}, handlers *sync.WaitGroup) {
+	defer func() {
+		if p != 0 {
 			windows.CloseHandle(p)
+		}
+	}()
+	for {
+		if p == 0 {
+			var err error
+			if p, err = createInstance(name, sa, false); err != nil {
+				trace("listener %d: CreateNamedPipe: %v (0x%X)", id, err, errnoOf(err))
+				p = 0
+				select {
+				case <-done:
+					return
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
+			}
+			trace("listener %d: instance made", id)
+		}
+		if err := waitConnect(p, stopEvent); err != nil {
+			windows.CloseHandle(p)
+			p = 0
 			select {
 			case <-done:
-				return nil
+				return
 			default:
-				continue
 			}
+			// ERROR_NO_DATA: the client came and went before we got to it. Anything else is worth knowing.
+			trace("listener %d: ConnectNamedPipe: %v (0x%X)", id, err, errnoOf(err))
+			continue
 		}
+		conn := p
+		p = 0
 		select {
 		case slots <- struct{}{}:
 		default: // too many at once: refuse this one rather than queue
-			windows.CloseHandle(p)
+			trace("listener %d: too many clients, one refused", id)
+			windows.CloseHandle(conn)
 			continue
 		}
-		wg.Add(1)
+		handlers.Add(1)
 		go func() {
-			defer wg.Done()
+			defer handlers.Done()
 			defer func() { <-slots }()
-			handleClient(h, p, done)
+			handleClient(h, conn, done)
 		}()
 	}
 }
 
-// waitConnect waits for a client on p, or for stop.
-func waitConnect(p, stopEvent windows.Handle) bool {
+var errStopped = errors.New("stopping")
+
+// waitConnect waits for a client on p, or for stop. ERROR_PIPE_CONNECTED (the client got there first) is a client.
+func waitConnect(p, stopEvent windows.Handle) error {
 	ev, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
-		return false
+		return err
 	}
 	defer windows.CloseHandle(ev)
 	ov := &windows.Overlapped{HEvent: ev}
 	err = windows.ConnectNamedPipe(p, ov)
 	switch {
 	case err == nil, errors.Is(err, windows.ERROR_PIPE_CONNECTED):
-		return true
+		return nil
 	case !errors.Is(err, windows.ERROR_IO_PENDING):
-		return false
+		return err
 	}
-	which, _ := windows.WaitForMultipleObjects([]windows.Handle{ev, stopEvent}, false, windows.INFINITE)
+	which, err := windows.WaitForMultipleObjects([]windows.Handle{ev, stopEvent}, false, windows.INFINITE)
+	var n uint32
 	if which != windows.WAIT_OBJECT_0 {
 		windows.CancelIoEx(p, ov)
-		var n uint32
 		windows.GetOverlappedResult(p, ov, &n, true)
-		return false
+		if which == windows.WAIT_OBJECT_0+1 {
+			return errStopped
+		}
+		return fmt.Errorf("waiting for a client: %d %v", which, err)
 	}
-	var n uint32
-	return windows.GetOverlappedResult(p, ov, &n, true) == nil
+	return windows.GetOverlappedResult(p, ov, &n, true)
 }
 
 func handleClient(h *core.Holder, p windows.Handle, done <-chan struct{}) {
@@ -438,7 +506,20 @@ func (s *service) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 	defer windows.CloseHandle(stopEvent)
 	done := make(chan struct{})
 	served := make(chan error, 1)
-	go func() { served <- servePipe(pipeName, pipeSDDL, h, stopEvent, done) }()
+	listening := make(chan struct{})
+	self, err := userSID() // NT SERVICE\touchenv
+	if err != nil {
+		return true, 1
+	}
+	go func() {
+		served <- servePipe(pipeName, pipeSDDL(self, "IU"), h, stopEvent, done, func() { close(listening) })
+	}()
+	// Running only once the pipe exists, so a client right after "touchenv service install" finds it.
+	select {
+	case <-listening:
+	case <-served: // another program holds the name
+		return true, 1
+	}
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange}

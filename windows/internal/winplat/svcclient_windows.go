@@ -65,7 +65,8 @@ func dial(path string, servicePID func() uint32) (io.ReadWriteCloser, error) {
 	name := utf16z(path)
 	var h windows.Handle
 	var err error
-	for attempt := 0; ; attempt++ {
+	busy, missing := 0, 0
+	for {
 		h, err = windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING,
 			windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
 		if err == nil {
@@ -73,24 +74,42 @@ func dial(path string, servicePID func() uint32) (io.ReadWriteCloser, error) {
 		}
 		switch {
 		case errors.Is(err, windows.ERROR_FILE_NOT_FOUND):
-			if servicePID() != 0 {
-				return nil, errServiceNotAnswering
+			if servicePID() == 0 {
+				return nil, core.ErrNoService
 			}
-			return nil, core.ErrNoService
+			// Running, but no instance waiting this instant (between two clients, or just started): try again
+			// for up to 2 seconds.
+			if missing++; missing <= 40 {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			return nil, fmt.Errorf("%w (CreateFile %s: %v)", errServiceNotAnswering, path, err)
 		case errors.Is(err, windows.ERROR_ACCESS_DENIED):
 			return nil, fmt.Errorf("%w (it only answers programs in a desktop session on this PC, not over SSH or from a service)", core.ErrNoService)
-		case errors.Is(err, windows.ERROR_PIPE_BUSY) && attempt < 3:
-			procWaitNamedPipe.Call(uintptr(unsafe.Pointer(name)), 2000)
-			continue
+		case errors.Is(err, windows.ERROR_PIPE_BUSY):
+			if busy++; busy <= 3 {
+				procWaitNamedPipe.Call(uintptr(unsafe.Pointer(name)), 2000)
+				continue
+			}
 		}
-		return nil, fmt.Errorf("can't reach the touchenv service: %v", err)
+		return nil, fmt.Errorf("can't reach the touchenv service: CreateFile %s: %v (0x%X)", path, err, errnoOf(err))
 	}
 	var server uint32
-	if windows.GetNamedPipeServerProcessId(h, &server) != nil || server == 0 || server != servicePID() {
+	serr := windows.GetNamedPipeServerProcessId(h, &server)
+	want := servicePID()
+	if serr != nil || server == 0 || server != want {
 		windows.CloseHandle(h)
-		return nil, core.ErrNotService
+		return nil, fmt.Errorf("%w (pipe server pid %d, error %v; the service's pid is %d)", core.ErrNotService, server, serr, want)
 	}
 	return os.NewFile(uintptr(h), path), nil
+}
+
+func errnoOf(err error) uint32 {
+	var e windows.Errno
+	if errors.As(err, &e) {
+		return uint32(e)
+	}
+	return 0
 }
 
 const (
