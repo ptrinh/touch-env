@@ -13,7 +13,13 @@
 //   touchenv grant --for 8h --uses 20 NAME [NAME2 ...]
 //                              one Touch ID now; then the app that asked, and what it runs, reads those secrets
 //                              with touchenv run without asking, until the time or the uses run out
-//   touchenv lock              end every approval now (5-minute ones and grants)
+//   touchenv grant --always --for-program PROGRAM [--for 90d] [--uses N] NAME [NAME2 ...]
+//                              a standing grant: one Touch ID now; then that one program reads those secrets with
+//                              get or run without asking, until revoked (see "Standing grants" below)
+//   touchenv grant --list · --revoke PROGRAM · --revoke-all
+//   touchenv lock [--all]      end every approval now (5-minute ones and timed grants; --all: standing ones too)
+//   touchenv log [--since 7d] [--summary] [NAME ...]
+//                              the access log: every read, who asked, the outcome; never a value; kept two years
 //   touchenv import --begin    on a new Mac: make a one-time receiving key, print it as tenv1:… and a check code
 //   touchenv export --to tenv1:… [NAME ...] > keys.tenv
 //                              on the old Mac: every secret (or those named) encrypted to that key, one Touch ID
@@ -45,6 +51,11 @@
 // uses (one per touchenv run). It covers the requester of the grant command and every process below it, checked from
 // the kernel's process tree, and goes on while the screen is locked. It ends at the time, at the last use, on
 // touchenv lock, when that requester quits, or at logout.
+// grant --always: a standing grant to one program (a shell script, by real path and SHA-256, or a signed program, by
+// designated requirement), kept as a Keychain item in touchenv's access group with a copy of the secrets; get and run
+// check the process that ran them against it and read without a prompt (see "Standing grants" below). lock leaves
+// those on unless --all. Every read, grant, revoke, set, rm, export and import is a line in the access log
+// (~/Library/Logs/touchenv-access-YYYY-MM.log, kept two years; see "The access log" below).
 // export/import: the receiving key lives in the new Mac's Secure Enclave (a keychain item, this device only, when there
 // is none) and is deleted after one import or an hour. The file: "TENV" 1 | receiving key (33 bytes) | ephemeral key
 // (65) | AES-GCM over JSON, key from ECDH + HKDF-SHA256, the header authenticated. Export never uses a 5-minute
@@ -82,7 +93,21 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         one Touch ID now; then this app and what it runs read those secrets
                                         with touchenv run without asking, also while the Mac is locked, until
                                         the time (24h at most) or the uses run out
-  touchenv lock                         end every approval now: 5-minute ones and grants
+  touchenv grant --always --for-program PROGRAM [--for 90d] [--uses N] NAME ...
+                                        a standing grant: one Touch ID now; then that one program (a shell
+                                        script, bound to its contents, or a signed program or .app, bound
+                                        to its signature) reads those secrets with get or run without
+                                        asking, from now on, also while the Mac is locked. Anything
+                                        running as you can start that program and get them through
+                                        it: see the README
+  touchenv grant --list                 standing grants, timed grants and 5-minute approvals
+  touchenv grant --revoke PROGRAM · --revoke-all
+                                        end standing grants (no Touch ID)
+  touchenv lock [--all]                 end every 5-minute approval and timed grant now; --all ends
+                                        standing grants too
+  touchenv log [--since 7d] [--summary] [NAME ...]
+                                        the access log: every read, who asked, the outcome; never a value.
+                                        Kept two years (touchenv log --help)
 
   SSH keys (see touchenv ssh for more):
   touchenv ssh add [--sync] [NAME] KEYFILE
@@ -212,8 +237,9 @@ func requireIntent(_ intent: String?, example: String) {
     guard intent == nil else { return }
     let who = requester()
     if who.isAgent {
-        die("touchenv: \(who.name) must say why, in a few words: \(example)\n"
-            + "  (--intent goes right after the command; the reason is shown in the Touch ID prompt)", 2)
+        endAttempt("refused", note: "no --intent from an agent",
+                   message: "touchenv: \(who.name) must say why, in a few words: \(example)\n"
+                       + "  (--intent goes right after the command; the reason is shown in the Touch ID prompt)", code: 2)
     }
 }
 
@@ -442,13 +468,14 @@ func authenticate(_ title: String, intent: String?, detail: String? = nil, reaso
         keep = prompt.keepFor5Minutes
         switch outcome {
         case .approved: return keep
-        case .denied: die("touchenv: not approved")
+        case .denied: endAttempt("cancelled", message: "touchenv: not approved")
         case .password: context = LAContext()
         }
     }
     var error: NSError?
     guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
-        die("touchenv: cannot ask for Touch ID: \(error?.localizedDescription ?? "unknown")")
+        endAttempt("failed", note: "can't ask for Touch ID",
+                   message: "touchenv: cannot ask for Touch ID: \(error?.localizedDescription ?? "unknown")")
     }
     let done = DispatchSemaphore(value: 0)
     var ok = false
@@ -458,7 +485,7 @@ func authenticate(_ title: String, intent: String?, detail: String? = nil, reaso
         done.signal()
     }
     done.wait()
-    if !ok { die("touchenv: not approved") }
+    if !ok { endAttempt("cancelled", message: "touchenv: not approved") }
     return keep
 }
 
@@ -583,7 +610,10 @@ func readSecret(_ name: String) -> (data: Data?, status: OSStatus) {
 func read(_ name: String) -> Data {
     let (data, status) = readSecret(name)
     guard status == errSecSuccess, let data else {
-        die(status == errSecItemNotFound ? "touchenv: no secret named \(name)" : "touchenv: keychain error \(status)")
+        if status == errSecItemNotFound {
+            endAttempt("refused", note: "no secret named \(name)", message: "touchenv: no secret named \(name)")
+        }
+        endAttempt("failed", note: "keychain error \(status)", message: "touchenv: keychain error \(status)")
     }
     return data
 }
@@ -606,14 +636,14 @@ let approvalLength: TimeInterval = 5 * 60
 let maxGrantLength: TimeInterval = 24 * 60 * 60
 let maxGrantUses = 500
 
-/// "8h", "30m" or "1h30m" in seconds; nil for anything else.
+/// "90d", "8h", "30m" or "1h30m" in seconds; nil for anything else.
 func parseLength(_ text: String) -> TimeInterval? {
     var total = 0, digits = "", seen = ""
     for character in text {
         if ("0"..."9").contains(character), digits.count < 5 {
             digits.append(character)
-        } else if character == "h" || character == "m", !seen.contains(character), let n = Int(digits) {
-            total += n * (character == "h" ? 3600 : 60)
+        } else if "dhm".contains(character), !seen.contains(character), let n = Int(digits) {
+            total += n * (character == "d" ? 86400 : character == "h" ? 3600 : 60)
             digits = ""
             seen.append(character)
         } else {
@@ -773,6 +803,8 @@ final class Agent: NSObject {
     var statusItem: NSStatusItem!
     var notice: NSPanel?
     let born = Date()
+    var standingPrograms: [String] = []
+    var standingCheckedAt = Date.distantPast
 
     func run() -> Never {
         let path = agentSocketPath()
@@ -851,7 +883,7 @@ final class Agent: NSObject {
                names.allSatisfy({ approval.secrets[$0] != nil }) {
                 var out: [String: String] = [:]
                 for name in names { out[name] = approval.secrets[name]!.base64EncodedString() }
-                sendMessage(fd, ["ok": true, "secrets": out])
+                sendMessage(fd, ["ok": true, "secrets": out, "via": "5-minute"])
                 let left = Int(approval.expires.timeIntervalSince(now).rounded(.up))
                 showNotice(who: approval.who, names: names, intent: intent, left: "approved for \(clock(left)) more", ssh: ssh)
                 return
@@ -862,16 +894,31 @@ final class Agent: NSObject {
             let grant = grants[index]
             var out: [String: String] = [:]
             for name in names { out[name] = grant.secrets[name]!.base64EncodedString() }
-            sendMessage(fd, ["ok": true, "secrets": out])
+            sendMessage(fd, ["ok": true, "secrets": out, "via": "grant"])
             let left = Int(grant.expires.timeIntervalSince(now).rounded(.up))
             showNotice(who: who.name, names: names, intent: intent,
                        left: grant.uses == 0 ? "that was the last use granted"
                                              : "granted for \(clock(left)) more, \(times(grant.uses)) left", ssh: ssh)
             return
+        case "list":
+            // What is on, for touchenv grant --list: names, who, time and uses left; never a value.
+            let now = Date()
+            var on: [[String: Any]] = []
+            for approval in approvals.values where approval.expires > now {
+                on.append(["who": approval.who, "names": approval.secrets.keys.sorted(), "kind": "5-minute",
+                           "left": Int(approval.expires.timeIntervalSince(now).rounded(.up))])
+            }
+            for grant in grants where grant.expires > now && grant.uses > 0 {
+                on.append(["who": grant.who, "names": grant.secrets.keys.sorted(), "kind": "grant", "uses": grant.uses,
+                           "left": Int(grant.expires.timeIntervalSince(now).rounded(.up))])
+            }
+            sendMessage(fd, ["ok": true, "on": on])
+            return
         case "lock":
+            let ended = grants.map { ($0.who, $0.secrets.keys.sorted()) }
             approvals.removeAll()
             grants.removeAll()
-            sendMessage(fd, ["ok": true])
+            sendMessage(fd, ["ok": true, "ended": ended.map { ["who": $0.0, "names": $0.1] }])
             DispatchQueue.main.async { self.tick() }
             return
         default: break
@@ -904,6 +951,11 @@ final class Agent: NSObject {
         let left = Int(last.timeIntervalSince(now).rounded(.up))
         statusItem.button?.title = " " + clock(left)
         let menu = NSMenu()
+        // Standing grants live in the Keychain, not here; looked up every 30 seconds, names only.
+        if now.timeIntervalSince(standingCheckedAt) > 30 {
+            standingPrograms = standingStore.list().map { tilde($0.program) }
+            standingCheckedAt = now
+        }
         for approval in approvals.values.sorted(by: { $0.who < $1.who }) {
             let names = approval.secrets.keys.sorted().joined(separator: ", ")
             let item = NSMenuItem(title: "\(approval.who) can read \(names) without asking", action: nil, keyEquivalent: "")
@@ -918,6 +970,17 @@ final class Agent: NSObject {
             item.isEnabled = false
             menu.addItem(item)
         }
+        if !standingPrograms.isEmpty {
+            menu.addItem(.separator())
+            let count = standingPrograms.count
+            let item = NSMenuItem(title: "\(count) standing grant\(count == 1 ? "" : "s") (not ended by Lock Now): "
+                                  + standingPrograms.joined(separator: ", "), action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+            let hint = NSMenuItem(title: "touchenv grant --list · touchenv lock --all ends them", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
+        }
         menu.addItem(.separator())
         let lock = NSMenuItem(title: "Lock Now", action: #selector(lockNow), keyEquivalent: "")
         lock.target = self
@@ -926,6 +989,10 @@ final class Agent: NSObject {
     }
 
     @objc func lockNow() {
+        for grant in grants {
+            logAccess(AccessEntry(event: "revoke", secrets: grant.secrets.keys.sorted(), outcome: "lock", who: grant.who,
+                                  note: "timed grant ended by Lock Now in the menu bar"))
+        }
         approvals.removeAll()
         grants.removeAll()
         tick()
@@ -978,6 +1045,808 @@ final class Agent: NSObject {
             if self?.notice === panel { self?.notice = nil }
         }
     }
+}
+
+// MARK: The access log
+
+// Every read of a secret by get and run, and every grant, revoke, lock, set, rm, export and import, is one line in
+// ~/Library/Logs/touchenv-access-YYYY-MM.log (one file per month, 0600, in a folder only you can write): tab-separated
+// time, event, secret names, outcome, who asked, the calling program's path, intent, note. Never a value, never part
+// of one, never a length. Lines older than two years are removed (whole months, and the oldest month's file pruned
+// line by line), checked at most once a day when touchenv writes; all files together stay under accessLogCap, the
+// oldest lines going first, with one line saying so. The SSH agent keeps its own log (touchenv-ssh-agent.log).
+// Any program running as you can edit these files: the log is a record for you, not evidence against malware.
+
+struct AccessEntry: Equatable {
+    var time = accessLogNow()
+    var event: String
+    var secrets: [String] = []
+    var outcome: String
+    var who = ""
+    var program = ""
+    var intent = ""
+    var note = ""
+}
+
+/// The outcomes of a read, as written in the log.
+enum ReadOutcome {
+    static let touchID = "touch-id"          // approved with Touch ID or the Mac's password
+    static let fiveMinute = "5-minute"       // a "Don't ask again for 5 minutes" approval
+    static let grant = "grant"               // a timed grant (touchenv grant --for … --uses …)
+    static let standing = "standing-grant"   // a standing grant (touchenv grant --always …)
+    static let refused = "refused"           // with the reason in the note
+    static let cancelled = "cancelled"       // at the prompt
+    static let failed = "failed"             // a Keychain error, or no way to ask
+}
+
+let accessLogRetention: TimeInterval = 730 * 86400
+var accessLogCap = 64 << 20                 // bytes, all monthly files together
+var accessLogNow: () -> Date = { Date() }
+let accessLogPrefix = "touchenv-access-"
+func accessLogDir() -> String { homePath + "/Library/Logs" }
+
+let logTimeFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.timeZone = .current
+    f.formatOptions = [.withInternetDateTime]
+    return f
+}()
+var logCalendar: Calendar = {
+    var c = Calendar(identifier: .gregorian)
+    c.timeZone = .current
+    return c
+}()
+
+func accessLogFile(for date: Date) -> String {
+    let c = logCalendar.dateComponents([.year, .month], from: date)
+    return accessLogDir() + "/" + accessLogPrefix + String(format: "%04d-%02d.log", c.year!, c.month!)
+}
+
+/// The month a log file covers, from its name.
+func accessLogMonth(_ file: String) -> (start: Date, end: Date)? {
+    guard file.hasPrefix(accessLogPrefix), file.hasSuffix(".log") else { return nil }
+    let parts = file.dropFirst(accessLogPrefix.count).dropLast(4).split(separator: "-")
+    guard parts.count == 2, parts[0].count == 4, parts[1].count == 2, let year = Int(parts[0]), let month = Int(parts[1]),
+          (1...12).contains(month), let start = logCalendar.date(from: DateComponents(year: year, month: month, day: 1)),
+          let end = logCalendar.date(byAdding: .month, value: 1, to: start) else { return nil }
+    return (start, end)
+}
+
+/// A field of a log line: no control or format characters (so no tab or newline to add or split a line, no escape
+/// sequence to restyle a terminal, no bidi override to disguise one), at most `limit` characters.
+func logField(_ raw: String, limit: Int = 200) -> String {
+    var scalars = String.UnicodeScalarView()
+    for scalar in raw.unicodeScalars {
+        switch scalar.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator, .surrogate, .privateUse, .unassigned:
+            scalars.append(" ")
+        default:
+            scalars.append(scalar)
+        }
+    }
+    var text = String(scalars).trimmingCharacters(in: .whitespaces)
+    if text.count > limit { text = String(text.prefix(limit - 1)) + "…" }
+    return text.isEmpty ? "-" : text
+}
+
+func accessLine(_ e: AccessEntry) -> String {
+    let names = e.secrets.filter(validName).joined(separator: ",")
+    return [logTimeFormatter.string(from: e.time), logField(e.event, limit: 20), names.isEmpty ? "-" : names,
+            logField(e.outcome, limit: 30), logField(e.who, limit: 80), logField(e.program, limit: 400),
+            logField(e.intent), logField(e.note, limit: 400)].joined(separator: "\t")
+}
+
+func parseAccessLine<S: StringProtocol>(_ line: S) -> AccessEntry? {
+    let f = String(line).split(separator: Character("\t"), omittingEmptySubsequences: false).map { String($0) }
+    guard f.count == 8, let time = logTimeFormatter.date(from: f[0]) else { return nil }
+    func v(_ s: String) -> String { s == "-" ? "" : s }
+    return AccessEntry(time: time, event: f[1], secrets: f[2] == "-" ? [] : f[2].split(separator: ",").map(String.init),
+                       outcome: f[3], who: v(f[4]), program: v(f[5]), intent: v(f[6]), note: v(f[7]))
+}
+
+/// Why touchenv won't write the log there, or nil. Makes ~/Library/Logs (0700) when there is none.
+func accessLogFolderProblem() -> String? {
+    let dir = accessLogDir()
+    var st = stat()
+    if lstat(dir, &st) != 0 {
+        _ = try? FileManager.default.createDirectory(atPath: (dir as NSString).deletingLastPathComponent,
+                                                     withIntermediateDirectories: true)
+        guard mkdir(dir, 0o700) == 0 || errno == EEXIST, lstat(dir, &st) == 0 else { return "can't make \(dir)" }
+    }
+    guard st.st_mode & S_IFMT == S_IFDIR, st.st_uid == getuid(), st.st_mode & 0o022 == 0 else {
+        return "\(tilde(dir)) is not a folder only you can write"
+    }
+    return nil
+}
+
+/// Opens a file of the log folder: no symbolic link, yours, 0600.
+func openLogFile(_ path: String, _ flags: Int32) -> Int32? {
+    let fd = open(path, flags | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { return nil }
+    var st = stat()
+    guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid() else { close(fd); return nil }
+    if st.st_mode & 0o777 != 0o600 { fchmod(fd, 0o600) }
+    return fd
+}
+
+/// Runs `body` holding the log's lock, so pruning never races an append.
+func withAccessLogLock<T>(_ body: () -> T) -> T {
+    guard let fd = openLogFile(accessLogDir() + "/touchenv-access.lock", O_RDWR | O_CREAT) else { return body() }
+    defer { close(fd) }
+    flock(fd, LOCK_EX)
+    return body()
+}
+
+func appendLogLine(_ line: String, to path: String) {
+    guard let fd = openLogFile(path, O_WRONLY | O_APPEND | O_CREAT) else { return }
+    _ = writeFull(fd, Array((line + "\n").utf8))
+    close(fd)
+}
+
+func fileSize(_ path: String) -> Int { (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int ?? 0 }
+
+/// Replaces a log file's lines with `lines`, through a private temp file and a rename.
+func rewriteLogFile(_ path: String, _ lines: [Substring]) {
+    let temp = path + ".new"
+    unlink(temp)
+    guard let fd = openLogFile(temp, O_WRONLY | O_CREAT | O_EXCL) else { return }
+    let text = lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    let ok = writeFull(fd, Array(text.utf8))
+    close(fd)
+    if ok { rename(temp, path) } else { unlink(temp) }
+}
+
+func logLines(_ path: String) -> [Substring] {
+    guard let data = FileManager.default.contents(atPath: path) else { return [] }
+    return String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true)
+}
+
+/// Removes lines older than two years and, over the cap, the oldest lines, with one line saying how many went.
+/// Call holding the lock.
+func pruneAccessLog(now: Date) {
+    let dir = accessLogDir()
+    let cutoff = now.addingTimeInterval(-accessLogRetention)
+    var files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { accessLogMonth($0) != nil }.sorted()
+    for file in files {
+        let (start, end) = accessLogMonth(file)!
+        let path = dir + "/" + file
+        if end <= cutoff {
+            unlink(path)
+        } else if start < cutoff {
+            let lines = logLines(path)
+            let kept = lines.filter { parseAccessLine($0).map { $0.time >= cutoff } ?? true }
+            if kept.count != lines.count { rewriteLogFile(path, kept) }
+        }
+    }
+    files = files.filter { FileManager.default.fileExists(atPath: dir + "/" + $0) }
+    var total = files.reduce(0) { $0 + fileSize(dir + "/" + $1) }
+    var dropped = 0
+    while total > accessLogCap, files.count > 1 {
+        let path = dir + "/" + files.removeFirst()
+        dropped += logLines(path).count
+        total -= fileSize(path)
+        unlink(path)
+    }
+    if total > accessLogCap, let last = files.last {
+        // One month holds more than the cap: keep its newest lines, up to half the cap.
+        let path = dir + "/" + last
+        let lines = logLines(path)
+        var size = 0, keep = lines.count
+        while keep > 0, size + lines[keep - 1].utf8.count + 1 <= accessLogCap / 2 {
+            size += lines[keep - 1].utf8.count + 1
+            keep -= 1
+        }
+        dropped += keep
+        rewriteLogFile(path, Array(lines[keep...]))
+    }
+    if dropped > 0 {
+        appendLogLine(accessLine(AccessEntry(time: now, event: "log", outcome: "dropped",
+                                             note: "\(dropped) oldest entries dropped: the log passed its \(accessLogCap >> 20) MB cap")),
+                      to: accessLogFile(for: now))
+    }
+}
+
+var accessLogWarned = false
+
+/// Appends one entry; prunes first when a day has passed since the last pruning, or when this month's file is
+/// past half the cap. Never fails the command: a log that can't be written is said once on stderr.
+func logAccess(_ entry: AccessEntry) {
+    if let problem = accessLogFolderProblem() {
+        if !accessLogWarned {
+            accessLogWarned = true
+            FileHandle.standardError.write("touchenv: not logging this read: \(problem)\n".data(using: .utf8)!)
+        }
+        return
+    }
+    withAccessLogLock {
+        let marker = accessLogDir() + "/touchenv-access.pruned"
+        let last = FileManager.default.contents(atPath: marker).flatMap {
+            logTimeFormatter.date(from: String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let file = accessLogFile(for: entry.time)
+        if last.map({ entry.time.timeIntervalSince($0) > 86400 || entry.time < $0 }) ?? true || fileSize(file) > accessLogCap / 2 {
+            pruneAccessLog(now: entry.time)
+            if let fd = openLogFile(marker, O_WRONLY | O_CREAT | O_TRUNC) {
+                _ = writeFull(fd, Array(logTimeFormatter.string(from: entry.time).utf8))
+                close(fd)
+            }
+        }
+        appendLogLine(accessLine(entry), to: file)
+    }
+}
+
+/// Every entry in every monthly file, oldest first.
+func readAccessLog() -> [AccessEntry] {
+    let dir = accessLogDir()
+    let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { accessLogMonth($0) != nil }.sorted()
+    let entries = files.flatMap { logLines(dir + "/" + $0).compactMap(parseAccessLine) }
+    return entries.enumerated().sorted { ($0.element.time, $0.offset) < ($1.element.time, $1.offset) }.map(\.element)
+}
+
+let logUsage = """
+usage: touchenv log [--since 24h|7d] [--summary] [NAME ...]
+
+Prints touchenv's access log, newest last: every read of a secret (by touchenv get and run) with who asked, the
+calling program, the intent and the outcome (touch-id, 5-minute, grant, standing-grant, refused, cancelled,
+failed), and every grant, revoke, lock, set, rm, export and import. Never a value. Needs no Touch ID.
+  --since 7d    only the last 7 days (d, h, m)
+  --summary     per secret: reads per outcome, and which programs ask for it most
+  NAME ...      only lines about these secrets
+The log is in ~/Library/Logs/touchenv-access-YYYY-MM.log. Entries are kept two years (730 days), then removed;
+all files together stay under 64 MB, the oldest entries going first, with a line saying so.
+"""
+
+/// What touchenv log prints.
+func accessReport(_ entries: [AccessEntry], since: Date?, names: [String], summary: Bool) -> [String] {
+    let shown = entries.filter { e in
+        (since.map { e.time >= $0 } ?? true) && (names.isEmpty || e.secrets.contains { names.contains($0) })
+    }
+    let display = DateFormatter()
+    display.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    display.timeZone = logCalendar.timeZone
+    func asker(_ e: AccessEntry) -> String {
+        let who = e.who.isEmpty ? "?" : logField(e.who, limit: 80)
+        return e.program.isEmpty ? who : "\(who) (\(tilde(logField(e.program, limit: 400))))"
+    }
+    guard summary else {
+        return shown.map { e in
+            var line = "\(display.string(from: e.time))  \(logField(e.event, limit: 20))"
+            if !e.secrets.isEmpty { line += "  \(e.secrets.joined(separator: ","))" }
+            line += "  \(logField(e.outcome, limit: 30))  \(asker(e))"
+            if !e.intent.isEmpty { line += "  intent: \(logField(e.intent))" }
+            if !e.note.isEmpty { line += "  (\(logField(e.note, limit: 400)))" }
+            return line
+        }
+    }
+    var out: [String] = []
+    let reads = shown.filter { $0.event == "read" }
+    let secrets = Set(reads.flatMap(\.secrets)).filter { names.isEmpty || names.contains($0) }.sorted()
+    for name in secrets {
+        let mine = reads.filter { $0.secrets.contains(name) }
+        var outcomes: [String: Int] = [:], askers: [String: Int] = [:]
+        for e in mine {
+            outcomes[e.outcome, default: 0] += 1
+            askers[asker(e), default: 0] += 1
+        }
+        let byOutcome = outcomes.sorted { ($1.value, $0.key) < ($0.value, $1.key) }.map { "\($0.key) \($0.value)" }
+        out.append("\(name): \(mine.count) read\(mine.count == 1 ? "" : "s"): \(byOutcome.joined(separator: ", "))")
+        for (who, n) in askers.sorted(by: { ($1.value, $0.key) < ($0.value, $1.key) }) {
+            out.append(String(format: "  %5d  ", n) + who)
+        }
+    }
+    if out.isEmpty { out.append("no reads logged\(since == nil ? "" : " in that time")") }
+    return out
+}
+
+// The read (or set, rm, grant…) under way, so that whatever ends it, the prompt cancelled or a Keychain error,
+// writes its one line.
+struct AccessAttempt { var event: String; var secrets: [String]; var who: String; var program: String; var intent: String }
+var currentAttempt: AccessAttempt?
+
+func beginAttempt(_ event: String, _ names: [String], who: Requester, intent: String?) {
+    currentAttempt = AccessAttempt(event: event, secrets: names, who: who.name, program: callingProgram(who),
+                                   intent: intent ?? "")
+}
+
+func logAttempt(_ outcome: String, note: String = "") {
+    guard let a = currentAttempt else { return }
+    currentAttempt = nil
+    logAccess(AccessEntry(event: a.event, secrets: a.secrets, outcome: outcome, who: a.who, program: a.program,
+                          intent: a.intent, note: note))
+}
+
+func endAttempt(_ outcome: String, note: String = "", message: String, code: Int32 = 1) -> Never {
+    logAttempt(outcome, note: note)
+    die(message, code)
+}
+
+// MARK: Standing grants
+
+// touchenv grant --always --for-program PROGRAM NAME…: one Touch ID, then that one program reads those secrets with
+// touchenv get or run without asking, until revoked (or a --for / --uses limit set then runs out), across restarts
+// and while the screen is locked. The record and a copy of each secret are one Keychain item (service
+// "touchenv-standing", account = the program's real path) in touchenv's own keychain access group: only touchenv,
+// signed with its team's entitlement, can make, read or change it; no file another program could write. The item
+// has no userPresence (that is the point) and is AfterFirstUnlockThisDeviceOnly: never synced, readable once you have
+// logged in since the Mac started, also when the screen is locked.
+//
+// Who counts as the program, checked on every read against touchenv's parent process (the one that ran it):
+//  - a signed program or app: the process satisfies the designated requirement recorded when the grant was made
+//    (team ID + identifier for a Developer ID program; the exact build's hash for an ad hoc one), checked with
+//    SecCodeCheckValidity on the running process, wherever the file lies.
+//  - a script: the parent is Apple's own shell (/bin/sh, bash, zsh, dash, ksh, csh, tcsh; its signature checked)
+//    whose arguments name the script file (no -c, no -s), resolved from the shell's folder to the recorded real
+//    path; that file still has the SHA-256 recorded; and it and every folder above it can be changed only by you
+//    (or root: a root-owned sticky folder like /tmp is fine).
+// Not checked against the app above it: unattended runs come from launchd or a scheduler, not the terminal you
+// made the grant in. What it does not stop: anything running as you can run the program and read what it prints.
+
+let standingService = "touchenv-standing"
+let interpreterPaths: Set<String> = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/bin/ksh", "/bin/csh", "/bin/tcsh"]
+let maxStandingLength: TimeInterval = 3650 * 86400
+let maxStandingUses = 1_000_000
+
+struct StandingGrant: Codable, Equatable {
+    var program: String           // real path: the script, the program's executable or the .app
+    var kind: String              // "script" or "signed"
+    var sha256: String?           // a script's contents when the grant was made
+    var requirement: String?      // a signed program's designated requirement
+    var signer: String?           // for people: "team ABCDE12345, com.example.tool" or "ad hoc"
+    var names: [String]
+    var created: Date
+    var expires: Date?
+    var usesLeft: Int?
+    var lastUsed: Date?
+    var reads: Int = 0
+    var madeBy: String = ""
+}
+
+func encodeStanding(_ grant: StandingGrant) -> Data {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .secondsSince1970
+    encoder.outputFormatting = .sortedKeys
+    return try! encoder.encode(grant)
+}
+
+func decodeStanding(_ data: Data) -> StandingGrant? {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .secondsSince1970
+    return try? decoder.decode(StandingGrant.self, from: data)
+}
+
+func encodeValues(_ values: [String: Data]) -> Data {
+    try! JSONSerialization.data(withJSONObject: values.mapValues { $0.base64EncodedString() })
+}
+
+func decodeValues(_ data: Data) -> [String: Data]? {
+    guard let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: String] else { return nil }
+    var out: [String: Data] = [:]
+    for (name, value) in raw {
+        guard let decoded = Data(base64Encoded: value) else { return nil }
+        out[name] = decoded
+    }
+    return out
+}
+
+protocol StandingStore: AnyObject {
+    /// The records, without the secrets.
+    func list() -> [StandingGrant]
+    func values(_ program: String) -> [String: Data]?
+    /// Makes or replaces the grant for grant.program.
+    func put(_ grant: StandingGrant, values: [String: Data]) -> OSStatus
+    /// Changes the record (counts, last use) only.
+    func update(_ grant: StandingGrant) -> OSStatus
+    func remove(_ program: String) -> OSStatus
+}
+
+final class KeychainStandingStore: StandingStore {
+    func base(_ program: String?) -> [String: Any] {
+        var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: standingService,
+                                kSecUseDataProtectionKeychain as String: true, kSecAttrSynchronizable as String: false]
+        if let program { q[kSecAttrAccount as String] = program }
+        return q
+    }
+
+    func list() -> [StandingGrant] {
+        var q = base(nil)
+        q[kSecReturnAttributes as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitAll
+        q[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let found = out as? [[String: Any]] else { return [] }
+        return found.compactMap { item in
+            guard let program = item[kSecAttrAccount as String] as? String, let data = item[kSecAttrGeneric as String] as? Data,
+                  let grant = decodeStanding(data), grant.program == program else { return nil }
+            return grant
+        }.sorted { $0.program < $1.program }
+    }
+
+    func values(_ program: String) -> [String: Data]? {
+        var q = base(program)
+        q[kSecReturnData as String] = true
+        q[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let data = out as? Data else { return nil }
+        return decodeValues(data)
+    }
+
+    func put(_ grant: StandingGrant, values: [String: Data]) -> OSStatus {
+        SecItemDelete(base(grant.program) as CFDictionary)
+        var q = base(grant.program)
+        q[kSecAttrGeneric as String] = encodeStanding(grant)
+        q[kSecValueData as String] = encodeValues(values)
+        q[kSecAttrLabel as String] = "touchenv standing grant: \(grant.program)"
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(q as CFDictionary, nil)
+    }
+
+    func update(_ grant: StandingGrant) -> OSStatus {
+        SecItemUpdate(base(grant.program) as CFDictionary, [kSecAttrGeneric as String: encodeStanding(grant)] as CFDictionary)
+    }
+
+    func remove(_ program: String) -> OSStatus { SecItemDelete(base(program) as CFDictionary) }
+}
+
+var standingStore: StandingStore = KeychainStandingStore()
+
+func sha256Hex(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+
+func realPath(_ path: String) -> String? {
+    guard let resolved = realpath(path, nil) else { return nil }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}
+
+func expandTilde(_ path: String) -> String {
+    path == "~" ? homePath : path.hasPrefix("~/") ? homePath + path.dropFirst(1) : path
+}
+
+/// Why a script at this real path might not be what was granted, or nil: it and every folder above it must be a
+/// regular file and folders (no symbolic link), owned by you or root, not writable by group or others (a folder
+/// owned by root with the sticky bit, like /tmp, is fine: others can't rename or replace what is yours in it).
+func pathSafetyProblem(_ path: String) -> String? {
+    guard path.hasPrefix("/") else { return "\(path) is not a full path" }
+    var prefixes = ["/"]
+    var current = ""
+    for part in path.split(separator: "/") {
+        current += "/" + part
+        prefixes.append(current)
+    }
+    let me = getuid()
+    for (i, p) in prefixes.enumerated() {
+        var st = stat()
+        guard lstat(p, &st) == 0 else { return "\(tilde(p)) can't be looked at" }
+        let type = st.st_mode & S_IFMT
+        if type == S_IFLNK { return "\(tilde(p)) is a symbolic link" }
+        guard st.st_uid == me || st.st_uid == 0 else { return "\(tilde(p)) belongs to another user" }
+        if i == prefixes.count - 1 {
+            guard type == S_IFREG else { return "\(tilde(p)) is not a regular file" }
+            if st.st_mode & 0o022 != 0 { return "\(tilde(p)) can be changed by other users" }
+        } else {
+            guard type == S_IFDIR else { return "\(tilde(p)) is not a folder" }
+            if st.st_mode & 0o022 != 0 && !(st.st_mode & S_ISVTX != 0 && st.st_uid == 0) {
+                return "the folder \(tilde(p)) can be changed by other users"
+            }
+        }
+    }
+    return nil
+}
+
+struct IdentityProblem: Error, CustomStringConvertible { let description: String; init(_ d: String) { description = d } }
+
+/// What a standing grant for this path would be bound to: a script's real path and SHA-256, or a signed program's
+/// designated requirement. The secrets, times and counts are left for the caller to fill in.
+func identifyProgram(_ given: String) -> Result<StandingGrant, IdentityProblem> {
+    let expanded = expandTilde(given)
+    guard let real = realPath(expanded.hasPrefix("/") ? expanded : FileManager.default.currentDirectoryPath + "/" + expanded) else {
+        return .failure(IdentityProblem("no such file: \(given)"))
+    }
+    var isDir: ObjCBool = false
+    FileManager.default.fileExists(atPath: real, isDirectory: &isDir)
+    var template = StandingGrant(program: real, kind: "signed", names: [], created: Date())
+    if !isDir.boolValue {
+        guard let handle = FileHandle(forReadingAtPath: real) else { return .failure(IdentityProblem("can't read \(given)")) }
+        let head = handle.readData(ofLength: 512)
+        try? handle.close()
+        if head.starts(with: Data("#!".utf8)) {
+            let firstLine = String(decoding: head.prefix { $0 != 0x0A }.dropFirst(2), as: UTF8.self)
+            var words = firstLine.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            if words.first == "/usr/bin/env", words.count > 1 { words = ["/bin/" + words[1]] }
+            guard let interpreter = words.first, interpreterPaths.contains(interpreter) else {
+                return .failure(IdentityProblem("\(given) is a script for \(words.first ?? "nothing"); standing grants take "
+                                                + "shell scripts (#!/bin/sh, bash, zsh, dash, ksh, csh) or signed programs"))
+            }
+            if let problem = pathSafetyProblem(real) { return .failure(IdentityProblem(problem)) }
+            guard let contents = FileManager.default.contents(atPath: real) else { return .failure(IdentityProblem("can't read \(given)")) }
+            template.kind = "script"
+            template.sha256 = sha256Hex(contents)
+            return .success(template)
+        }
+    } else if !real.hasSuffix(".app") {
+        return .failure(IdentityProblem("\(given) is a folder, not a program, script or .app"))
+    }
+    var staticCode: SecStaticCode?
+    var requirement: SecRequirement?
+    var text: CFString?
+    var info: CFDictionary?
+    guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: real) as CFURL, [], &staticCode) == errSecSuccess, let staticCode,
+          SecStaticCodeCheckValidity(staticCode, [], nil) == errSecSuccess else {
+        return .failure(IdentityProblem("\(given) is neither a shell script nor a validly signed program"))
+    }
+    guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess, let requirement,
+          SecRequirementCopyString(requirement, [], &text) == errSecSuccess, let text else {
+        return .failure(IdentityProblem("can't read \(given)'s signature"))
+    }
+    SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info)
+    let details = info as? [String: Any] ?? [:]
+    let identifier = details[kSecCodeInfoIdentifier as String] as? String ?? "?"
+    if let team = details[kSecCodeInfoTeamIdentifier as String] as? String {
+        template.signer = "team \(team), \(identifier)"
+    } else if (text as String).contains("anchor apple") && !(text as String).contains("anchor apple generic") {
+        template.signer = "Apple, \(identifier)"
+    } else {
+        template.signer = "ad hoc, \(identifier): this exact build only"
+    }
+    template.requirement = text as String
+    return .success(template)
+}
+
+/// The process that ran touchenv, as the kernel tells it. (Not its environment: macOS hides that from other
+/// processes, so a shell started with BASH_ENV or exported BASH_FUNC_… functions can't be told apart. README.)
+struct Caller { var pid: pid_t; var start: UInt64; var executable: String; var arguments: [String]; var cwd: String }
+
+func processPath(_ pid: pid_t) -> String? {
+    var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+    return String(cString: path)
+}
+
+func processCwd(_ pid: pid_t) -> String? {
+    var info = proc_vnodepathinfo()
+    let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+    return withUnsafeBytes(of: &info.pvi_cdir.vip_path) { raw in
+        String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+    }
+}
+
+func callerInfo(_ pid: pid_t) -> Caller? {
+    guard pid > 1, let start = startTime(pid), let executable = processPath(pid) else { return nil }
+    return Caller(pid: pid, start: start, executable: executable, arguments: processArguments(pid), cwd: processCwd(pid) ?? "")
+}
+
+/// The script a shell was started on, from its arguments: the first one after the options. nil when it was given
+/// commands instead (-c, -s, stdin) or an option that takes a file of its own (--rcfile, --init-file).
+func scriptArgument(_ args: [String]) -> String? {
+    let longOptions: Set<String> = ["--login", "--noprofile", "--norc", "--posix", "--noediting", "--verbose"]
+    var i = 1
+    while i < args.count {
+        let a = args[i]
+        if a == "--" || a == "-" { i += 1; break }
+        if a.hasPrefix("--") {
+            guard longOptions.contains(a) else { return nil }
+            i += 1
+            continue
+        }
+        guard (a.hasPrefix("-") || a.hasPrefix("+")), a.count > 1 else { break }
+        let letters = a.dropFirst()
+        if letters.contains("c") || letters.contains("s") { return nil }
+        i += letters.contains("o") || letters.contains("O") ? 2 : 1
+    }
+    return i < args.count ? args[i] : nil
+}
+
+/// The real path of the script the caller (a shell) runs, if it is one.
+func interpretedScript(_ caller: Caller) -> String? {
+    guard interpreterPaths.contains(caller.executable), let argument = scriptArgument(caller.arguments) else { return nil }
+    if argument.hasPrefix("/") { return realPath(argument) }
+    guard caller.cwd.hasPrefix("/") else { return nil }
+    return realPath(caller.cwd + "/" + argument)
+}
+
+/// The calling program's path for the log: the script when a shell runs one, else the asking app's executable.
+func callingProgram(_ who: Requester) -> String {
+    if let caller = callerInfo(getppid()), let script = interpretedScript(caller) { return script }
+    return who.pid > 1 ? processPath(who.pid) ?? "" : ""
+}
+
+/// Whether a running process satisfies a code requirement (its signature checked by the Security framework).
+func processSatisfies(_ pid: pid_t, _ requirementText: String) -> Bool {
+    var code: SecCode?
+    var requirement: SecRequirement?
+    guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: pid] as CFDictionary, [], &code) == errSecSuccess,
+          let code, SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
+          let requirement else { return false }
+    return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
+}
+
+struct CodeChecks {
+    var applePlatform: (pid_t) -> Bool
+    var satisfies: (pid_t, String) -> Bool
+}
+let realCodeChecks = CodeChecks(applePlatform: { processSatisfies($0, "anchor apple") }, satisfies: processSatisfies)
+
+enum StandingDecision: Equatable {
+    case none
+    case allowed(StandingGrant)
+    /// The caller is the granted program, but not as it was: refused, no prompt.
+    case refused(program: String, reason: String)
+    /// The grant ran out: logged, then touchenv asks as usual.
+    case ended(program: String, reason: String)
+}
+
+func standingDecision(_ grants: [StandingGrant], names: [String], caller: Caller, checks: CodeChecks, now: Date) -> StandingDecision {
+    let script = interpretedScript(caller)
+    let executable = realPath(caller.executable)
+    var outcome = StandingDecision.none
+    for grant in grants where !names.isEmpty && names.allSatisfy(grant.names.contains) {
+        var reason: String?
+        if grant.kind == "script" {
+            guard script == grant.program else { continue }
+            if !checks.applePlatform(caller.pid) {
+                reason = "\(caller.executable) is not the system's own shell"
+            } else if let problem = pathSafetyProblem(grant.program) {
+                reason = problem
+            } else if FileManager.default.contents(atPath: grant.program).map(sha256Hex) != grant.sha256 {
+                reason = "\(tilde(grant.program)) changed since the standing grant was made (its SHA-256 differs)"
+            }
+        } else if !(grant.requirement.map { checks.satisfies(caller.pid, $0) } ?? false) {
+            guard let executable, executable == grant.program || executable.hasPrefix(grant.program + "/") else { continue }
+            reason = "\(tilde(grant.program)) is not signed as it was when the standing grant was made"
+        }
+        if let reason {
+            if outcome == .none { outcome = .refused(program: grant.program, reason: reason) }
+            continue
+        }
+        if let expires = grant.expires, expires <= now {
+            if outcome == .none { outcome = .ended(program: grant.program, reason: "the standing grant expired") }
+            continue
+        }
+        if let uses = grant.usesLeft, uses <= 0 {
+            if outcome == .none { outcome = .ended(program: grant.program, reason: "the standing grant's uses ran out") }
+            continue
+        }
+        return .allowed(grant)
+    }
+    return outcome
+}
+
+enum StandingRead { case none, secrets([String: Data]), refused(String) }
+
+/// Runs `body` holding the standing grants' lock, so two reads never both take a grant's last use.
+func withStandingLock<T>(_ body: () -> T) -> T {
+    guard ensurePrivateDir(supportDir()),
+          case let fd = open(supportDir() + "/standing.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600), fd >= 0 else {
+        return body()
+    }
+    defer { close(fd) }
+    flock(fd, LOCK_EX)
+    return body()
+}
+
+/// get and run ask this first. The secrets when a standing grant covers the caller for all of `names`; a refusal
+/// (to exit on, with no prompt) when the caller is a granted program that changed; otherwise .none, to ask as usual.
+/// `stillThere` checks, after the checks, that the caller is still the process they were made on.
+func standingRead(names: [String], caller: Caller?, who: String, intent: String?, store: StandingStore = standingStore,
+                  checks: CodeChecks = realCodeChecks, now: Date = Date(), stillThere: (Caller) -> Bool) -> StandingRead {
+    guard let caller else { return .none }
+    let grants = store.list()
+    if grants.isEmpty { return .none }
+    func log(_ outcome: String, _ program: String, _ note: String = "") {
+        logAccess(AccessEntry(time: now, event: "read", secrets: names, outcome: outcome, who: who, program: program,
+                              intent: intent ?? "", note: note))
+    }
+    switch standingDecision(grants, names: names, caller: caller, checks: checks, now: now) {
+    case .none:
+        return .none
+    case .ended(let program, let reason):
+        log(ReadOutcome.refused, program, "standing grant not used: \(reason); asking instead")
+        return .none
+    case .refused(let program, let reason):
+        log(ReadOutcome.refused, program, reason)
+        return .refused(reason)
+    case .allowed(let found):
+        return withStandingLock {
+            // Again under the lock: another read may have taken the last use, or a revoke happened.
+            guard var grant = store.list().first(where: { $0.program == found.program }), grant.sha256 == found.sha256,
+                  grant.requirement == found.requirement, grant.usesLeft.map({ $0 > 0 }) ?? true else {
+                log(ReadOutcome.refused, found.program, "the standing grant changed or ran out meanwhile")
+                return .refused("the standing grant changed or ran out meanwhile")
+            }
+            guard stillThere(caller) else {
+                log(ReadOutcome.refused, grant.program, "the calling process went away during the checks")
+                return .refused("the calling process went away during the checks")
+            }
+            guard let values = store.values(grant.program), names.allSatisfy({ values[$0] != nil }) else {
+                log(ReadOutcome.failed, grant.program, "the standing grant's copy can't be read")
+                return .refused("the standing grant's copy of the secret can't be read")
+            }
+            grant.reads += 1
+            grant.lastUsed = now
+            if let uses = grant.usesLeft { grant.usesLeft = uses - 1 }
+            _ = store.update(grant)
+            log(ReadOutcome.standing, grant.program, grant.usesLeft.map { "\($0) uses left" } ?? "")
+            var out: [String: Data] = [:]
+            for name in names { out[name] = values[name] }
+            return .secrets(out)
+        }
+    }
+}
+
+/// The caller is still the process the checks were made on, and still touchenv's parent.
+func callerStillThere(_ caller: Caller) -> Bool { startTime(caller.pid) == caller.start && getppid() == caller.pid }
+
+/// Matches what someone typed after --revoke to the grants: the real path, the path as given, or ~/….
+func standingMatching(_ given: String, in grants: [StandingGrant]) -> [StandingGrant] {
+    let expanded = expandTilde(given)
+    let real = realPath(expanded.hasPrefix("/") ? expanded : FileManager.default.currentDirectoryPath + "/" + expanded)
+    return grants.filter { $0.program == expanded || $0.program == real || tilde($0.program) == given }
+}
+
+/// Ends standing grants: the ones matching `program`, or all with nil. Logged. Returns those ended.
+@discardableResult
+func revokeStanding(_ program: String?, who: String, how: String, store: StandingStore = standingStore) -> [StandingGrant] {
+    let grants = store.list()
+    let ending = program.map { standingMatching($0, in: grants) } ?? grants
+    for grant in ending where store.remove(grant.program) == errSecSuccess {
+        logAccess(AccessEntry(event: "revoke", secrets: grant.names, outcome: "standing", who: who, program: grant.program,
+                              note: how))
+    }
+    let left = Set(store.list().map(\.program))
+    return ending.filter { !left.contains($0.program) }
+}
+
+/// After set or rm: the copies standing grants hold of `name` take the new value, or lose it (nil). A grant left
+/// with no secret ends. Returns how many grants were changed.
+@discardableResult
+func standingSecretChanged(_ name: String, to data: Data?, who: String, store: StandingStore = standingStore) -> Int {
+    var changed = 0
+    for var grant in store.list() where grant.names.contains(name) {
+        guard var values = store.values(grant.program) else { continue }
+        if let data {
+            values[name] = data
+        } else {
+            values[name] = nil
+            grant.names.removeAll { $0 == name }
+        }
+        if grant.names.isEmpty {
+            revokeStanding(grant.program, who: who, how: "its last secret was deleted", store: store)
+        } else if store.put(grant, values: values) == errSecSuccess {
+            changed += 1
+        }
+    }
+    return changed
+}
+
+/// One standing grant, for touchenv grant --list.
+func describeStanding(_ g: StandingGrant, now: Date = Date()) -> [String] {
+    let day = DateFormatter()
+    day.dateFormat = "yyyy-MM-dd HH:mm"
+    let identity = g.kind == "script" ? "script, SHA-256 \(g.sha256.map { String($0.prefix(12)) } ?? "?")…"
+                                      : "signed: \(g.signer ?? "?")"
+    var limits: [String] = []
+    if let expires = g.expires { limits.append(expires > now ? "until \(day.string(from: expires))" : "expired") }
+    if let uses = g.usesLeft { limits.append("\(times(uses)) left") }
+    return ["  \(tilde(g.program))  (\(identity))",
+            "    reads \(g.names.joined(separator: ", ")) · made \(day.string(from: g.created))"
+            + (g.madeBy.isEmpty ? "" : " from \(g.madeBy)")
+            + " · last used \(g.lastUsed.map { day.string(from: $0) } ?? "never") · \(g.reads) read\(g.reads == 1 ? "" : "s")"
+            + " · " + (limits.isEmpty ? "no time or use limit" : limits.joined(separator: ", "))]
+}
+
+/// What touchenv lock says about standing grants (and ends them with --all).
+func lockStanding(all: Bool, who: String, store: StandingStore = standingStore) -> String? {
+    if all {
+        let ended = revokeStanding(nil, who: who, how: "touchenv lock --all", store: store)
+        return ended.isEmpty ? nil : "ended \(ended.count) standing grant\(ended.count == 1 ? "" : "s"): "
+            + ended.map { tilde($0.program) }.joined(separator: ", ")
+    }
+    let left = store.list()
+    guard !left.isEmpty else { return nil }
+    return "\(left.count) standing grant\(left.count == 1 ? "" : "s") still on ("
+        + left.map { tilde($0.program) }.joined(separator: ", ")
+        + "): touchenv grant --list shows them; touchenv grant --revoke PROGRAM or touchenv lock --all ends them"
 }
 
 // MARK: Moving to another Mac
@@ -2455,6 +3324,13 @@ func cleanIntent(_ raw: String) -> String? {
     return text.isEmpty ? nil : (text.count > 200 ? String(text.prefix(199)) + "…" : text)
 }
 
+let grantUsage = """
+usage: touchenv grant --for 8h --uses 20 NAME ...         a timed grant to this app and what it runs
+       touchenv grant --always --for-program PROGRAM [--for 90d] [--uses N] NAME ...
+                                                          a standing grant to one program
+       touchenv grant --list · --revoke PROGRAM · --revoke-all
+"""
+
 let sshUsage = """
 usage: touchenv ssh add [--sync] [NAME] KEYFILE · touchenv ssh ls · touchenv ssh rm NAME
        touchenv ssh load [--for 1h] NAME ... · touchenv ssh unload NAME ...
@@ -2722,6 +3598,10 @@ var begin = false, replace = false, localOnly = false
 var grantLength: TimeInterval?
 var grantLengthText = ""
 var grantUses: Int?
+var grantUsesText = ""
+var always = false, forProgram: String?, listGrants = false, revokeProgram: String?, revokeAll = false
+var lockAll = false
+var logSince: TimeInterval?, logSummary = false
 while let option = args.first, option.hasPrefix("--"), option != "--" {
     if option == "--sync", command == "set" {
         sync = true
@@ -2733,23 +3613,50 @@ while let option = args.first, option.hasPrefix("--"), option != "--" {
         if option == "--begin" { begin = true } else if option == "--replace" { replace = true } else { localOnly = true }
         args.removeFirst()
     } else if option == "--for", command == "grant", args.count > 1 {
-        guard let length = parseLength(args[1]), length <= maxGrantLength else {
-            die("touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most", 2)
-        }
-        grantLength = length
+        // Checked once all options are in: a standing grant (--always) allows longer.
+        grantLength = parseLength(args[1]) ?? -1
         grantLengthText = args[1]
         args.removeFirst(2)
     } else if option == "--uses", command == "grant", args.count > 1 {
-        guard let uses = Int(args[1]), (1...maxGrantUses).contains(uses) else {
-            die("touchenv: --uses takes a number from 1 to \(maxGrantUses)", 2)
-        }
-        grantUses = uses
+        grantUses = Int(args[1]) ?? -1
+        grantUsesText = args[1]
         args.removeFirst(2)
+    } else if command == "grant", ["--always", "--list", "--revoke-all"].contains(option) {
+        if option == "--always" { always = true } else if option == "--list" { listGrants = true } else { revokeAll = true }
+        args.removeFirst()
+    } else if command == "grant", option == "--for-program" || option == "--revoke", args.count > 1 {
+        if option == "--revoke" { revokeProgram = args[1] } else { forProgram = args[1] }
+        args.removeFirst(2)
+    } else if option == "--all", command == "lock" {
+        lockAll = true
+        args.removeFirst()
+    } else if option == "--since", command == "log", args.count > 1 {
+        guard let length = parseLength(args[1]) else { die("touchenv: --since takes a length like 24h, 7d or 30m", 2) }
+        logSince = length
+        args.removeFirst(2)
+    } else if option == "--summary", command == "log" {
+        logSummary = true
+        args.removeFirst()
+    } else if option == "--help", command == "log" {
+        print(logUsage)
+        exit(0)
     } else if option == "--intent", args.count > 1 {
         intent = cleanIntent(args[1])
         args.removeFirst(2)
     } else {
         die("touchenv: unknown option \(option)", 2)
+    }
+}
+if command == "grant" {
+    let standing = always || forProgram != nil
+    let maxLength = standing ? maxStandingLength : maxGrantLength
+    let maxUses = standing ? maxStandingUses : maxGrantUses
+    if let length = grantLength, length <= 0 || length > maxLength {
+        die(standing ? "touchenv: --for takes a length like 90d, 12h or 30m, 3650d at most"
+                     : "touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most", 2)
+    }
+    if let uses = grantUses, !(1...maxUses).contains(uses) {
+        die("touchenv: --uses takes a number from 1 to \(maxUses)", 2)
     }
 }
 
@@ -2760,6 +3667,7 @@ case "set":
     let data = readStdin()
     if data.isEmpty { die("touchenv: empty secret, nothing stored") }
     if let wasSynced = synced(name) {
+        beginAttempt("set", [name], who: requester(), intent: intent)
         requireIntent(intent, example: "touchenv set --intent \"<why>\" \(name)")
         let who = requester().name
         let target = sync ? "iCloud Keychain" : "your Keychain"
@@ -2774,28 +3682,50 @@ case "set":
             if status != errSecSuccess { die("touchenv: keychain error \(status)") }
             add(name, data, sync: sync)
         }
+        logAttempt("replaced")
+        let copies = standingSecretChanged(name, to: data, who: requester().name)
+        if copies > 0 { print("updated the copy \(copies) standing grant\(copies == 1 ? "" : "s") hold\(copies == 1 ? "s" : "") of \(name)") }
     } else {
         add(name, data, sync: sync)
+        logAccess(AccessEntry(event: "set", secrets: [name], outcome: "stored", who: requester().name,
+                              program: callingProgram(requester())))
     }
     print("stored \(name) (\(data.count) bytes)\(sync ? ", synced through iCloud Keychain" : "")")
 
 case "get":
     guard args.count == 1 else { die("usage: touchenv get NAME", 2) }
+    let asker = requester()
+    beginAttempt("read", [args[0]], who: asker, intent: intent)
     requireIntent(intent, example: "touchenv get --intent \"<why>\" \(args[0])")
-    let who = requester().name
+    let who = asker.name
+    switch standingRead(names: [args[0]], caller: callerInfo(getppid()), who: who, intent: intent, stillThere: callerStillThere) {
+    case .secrets(let found):
+        currentAttempt = nil
+        FileHandle.standardOutput.write(found[args[0]]!)
+        exit(0)
+    case .refused(let reason):
+        die("touchenv: refused: \(reason). To allow it again: touchenv grant --always --for-program PROGRAM \(args[0])")
+    case .none:
+        break
+    }
     authenticate("Show \(who) \(strong(args[0])) from \(place([args[0]])) in full?", intent: intent,
                  reason: "show \(who) the secret \(args[0]) in full")
-    FileHandle.standardOutput.write(read(args[0]))
+    let value = read(args[0])
+    logAttempt(ReadOutcome.touchID)
+    FileHandle.standardOutput.write(value)
 
 case "rm":
     guard args.count == 1 else { die("usage: touchenv rm NAME", 2) }
+    beginAttempt("rm", [args[0]], who: requester(), intent: intent)
     requireIntent(intent, example: "touchenv rm --intent \"<why>\" \(args[0])")
     let who = requester().name
     authenticate("Allow \(who) to delete \(strong(args[0])) from \(place([args[0]]))?", intent: intent,
                  reason: "let \(who) delete the secret \(args[0])")
     let status = SecItemDelete(query(args[0]) as CFDictionary)
-    if status != errSecSuccess { die("touchenv: keychain error \(status)") }
-    print("deleted \(args[0])")
+    if status != errSecSuccess { endAttempt(ReadOutcome.failed, note: "keychain error \(status)", message: "touchenv: keychain error \(status)") }
+    logAttempt("deleted")
+    let copies = standingSecretChanged(args[0], to: nil, who: who)
+    print("deleted \(args[0])" + (copies > 0 ? "; \(copies) standing grant\(copies == 1 ? "" : "s") no longer read\(copies == 1 ? "s" : "") it" : ""))
 
 case "ls":
     requireIntent(intent, example: "touchenv ls --intent \"<why>\"")
@@ -2813,16 +3743,32 @@ case "run":
         return (parts[0], parts.count == 2)
     }
     let argv = Array(args[(split + 1)...])
+    let asker = requester()
+    beginAttempt("read", specs.map(\.name), who: asker, intent: intent)
     requireIntent(intent, example: "touchenv run --intent \"<why>\" \(args[..<split].joined(separator: " ")) -- \(shortCommand(argv))")
     let names = specs.map(\.name).joined(separator: ", ")
     let who = requester().name
     let wanted = specs.map(\.name)
     signal(SIGPIPE, SIG_IGN)
     var secrets: [String: Data] = [:]
+    // A standing grant for the program that ran touchenv.
+    switch standingRead(names: wanted, caller: callerInfo(getppid()), who: who, intent: intent, stillThere: callerStillThere) {
+    case .secrets(let found):
+        currentAttempt = nil
+        secrets = found
+    case .refused(let reason):
+        die("touchenv: refused: \(reason). To allow it again: touchenv grant --always --for-program PROGRAM \(wanted.joined(separator: " "))")
+    case .none:
+        break
+    }
     // A "Don't ask again for 5 minutes" approval or a grant, if one covers this requester and every secret asked for.
-    if let reply = askAgent(["op": "get", "names": wanted, "intent": intent ?? NSNull()]), reply["ok"] as? Bool == true,
-       let encoded = reply["secrets"] as? [String: String] {
+    if secrets.isEmpty, let reply = askAgent(["op": "get", "names": wanted, "intent": intent ?? NSNull()]),
+       reply["ok"] as? Bool == true, let encoded = reply["secrets"] as? [String: String] {
         for (name, value) in encoded { secrets[name] = Data(base64Encoded: value) }
+        if wanted.allSatisfy({ secrets[$0] != nil }) {
+            let via = reply["via"] as? String
+            logAttempt(via == "grant" ? ReadOutcome.grant : via == "5-minute" ? ReadOutcome.fiveMinute : "5-minute-or-grant")
+        }
     }
     if !wanted.allSatisfy({ secrets[$0] != nil }) {
         let full = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
@@ -2831,6 +3777,7 @@ case "run":
                                 reason: "give \(who) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))",
                                 offerSession: true)
         for name in wanted where secrets[name] == nil { secrets[name] = read(name) }
+        logAttempt(ReadOutcome.touchID, note: keep ? "\"Don't ask again for 5 minutes\" ticked" : "")
         if keep {
             if !startAgent() || askAgent(["op": "grant", "secrets": secrets.mapValues { $0.base64EncodedString() }]) == nil {
                 FileHandle.standardError.write("touchenv: couldn't keep the approval; next time asks again\n".data(using: .utf8)!)
@@ -2874,6 +3821,88 @@ case "run":
     if let dir = tempDir { try? FileManager.default.removeItem(at: dir) }
     exit(process.terminationReason == .uncaughtSignal ? 128 + process.terminationStatus : process.terminationStatus)
 
+case "grant" where listGrants:
+    guard args.isEmpty, !always, forProgram == nil, revokeProgram == nil, !revokeAll else { die(grantUsage, 2) }
+    let standing = standingStore.list()
+    if standing.isEmpty { print("No standing grants.") }
+    else {
+        print("Standing grants (touchenv grant --revoke PROGRAM ends one; touchenv lock --all ends all):")
+        for grant in standing { describeStanding(grant).forEach { print($0) } }
+    }
+    if let reply = askAgent(["op": "list"]), let on = reply["on"] as? [[String: Any]], !on.isEmpty {
+        print("Timed grants and 5-minute approvals (touchenv lock ends them):")
+        for item in on {
+            let names = (item["names"] as? [String] ?? []).joined(separator: ", ")
+            let left = clock(item["left"] as? Int ?? 0)
+            if item["kind"] as? String == "grant" {
+                print("  \(item["who"] as? String ?? "?") and what it runs: \(names) · \(times(item["uses"] as? Int ?? 0)), \(left) left")
+            } else {
+                print("  \(item["who"] as? String ?? "?"): \(names) · 5-minute approval, \(left) left")
+            }
+        }
+    } else {
+        print("No timed grants or 5-minute approvals.")
+    }
+
+case "grant" where revokeProgram != nil || revokeAll:
+    guard args.isEmpty, !always, forProgram == nil, !(revokeAll && revokeProgram != nil) else { die(grantUsage, 2) }
+    let ended = revokeStanding(revokeProgram, who: requester().name, how: revokeAll ? "touchenv grant --revoke-all" : "touchenv grant --revoke")
+    if ended.isEmpty {
+        if revokeAll { print("No standing grants.") } else { die("touchenv: no standing grant for \(revokeProgram!) (touchenv grant --list)") }
+    }
+    for grant in ended { print("ended the standing grant for \(tilde(grant.program)) (\(grant.names.joined(separator: ", ")))") }
+
+case "grant" where always || forProgram != nil:
+    guard always, let programArgument = forProgram, !args.isEmpty, args.allSatisfy(validName) else { die(grantUsage, 2) }
+    var wanted: [String] = []
+    for name in args where !wanted.contains(name) { wanted.append(name) }
+    var grant: StandingGrant
+    switch identifyProgram(programArgument) {
+    case .success(let found): grant = found
+    case .failure(let problem): die("touchenv: no standing grant: \(problem)")
+    }
+    let list = wanted.joined(separator: ", ")
+    var example = "touchenv grant --intent \"<why>\" --always --for-program \(shellQuoted(programArgument))"
+    if grantLength != nil { example += " --for \(grantLengthText)" }
+    if grantUses != nil { example += " --uses \(grantUsesText)" }
+    let asker = requester()
+    currentAttempt = AccessAttempt(event: "grant", secrets: wanted, who: asker.name, program: grant.program, intent: intent ?? "")
+    requireIntent(intent, example: example + " \(wanted.joined(separator: " "))")
+    for name in wanted where synced(name) == nil { endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)") }
+    var limits: [String] = []
+    if let length = grantLength { limits.append("for \(Int(length / 86400) >= 2 ? "\(Int(length / 86400)) days" : spokenLength(length))") }
+    if let uses = grantUses { limits.append("up to \(times(uses))") }
+    let limitText = limits.isEmpty ? "from now on, until you revoke it" : limits.joined(separator: ", ")
+    let identity = grant.kind == "script"
+        ? "Script \(grant.program)\nSHA-256 \(grant.sha256 ?? "")\nIf the script changes, the grant stops working."
+        : "Signed program \(grant.program)\nSigner: \(grant.signer ?? "?")\nRequirement: \(grant.requirement ?? "")"
+    authenticate("Allow \(strong(tilde(grant.program))) to read \(strong(wanted)) from \(place(wanted)) without asking, "
+                 + "\(limitText)? Also while the Mac is locked. Any program running as you could start it and get them through it.",
+                 intent: intent, detail: identity,
+                 reason: "let \(tilde(grant.program)) read \(list) without asking, \(limitText)")
+    var values: [String: Data] = [:]
+    for name in wanted { values[name] = read(name) }
+    let now = Date()
+    grant.names = wanted
+    grant.created = now
+    grant.expires = grantLength.map { now.addingTimeInterval($0) }
+    grant.usesLeft = grantUses
+    grant.madeBy = asker.name
+    let replaced = standingStore.list().first { $0.program == grant.program }
+    let status = standingStore.put(grant, values: values)
+    guard status == errSecSuccess else {
+        endAttempt(ReadOutcome.failed, note: "keychain error \(status)", message: "touchenv: keychain error \(status); no standing grant made")
+    }
+    logAttempt("standing", note: [limits.isEmpty ? "no limit" : limits.joined(separator: ", "),
+                                  grant.kind == "script" ? "sha256 \(grant.sha256 ?? "")" : "signer \(grant.signer ?? "")",
+                                  replaced.map { "replaces the grant for \($0.names.joined(separator: ","))" }]
+                                  .compactMap { $0 }.joined(separator: "; "))
+    print("""
+        \(tilde(grant.program)) can now read \(list) with touchenv get or run without asking, \(limitText), also while the
+        Mac is locked. Each read is logged (touchenv log). touchenv grant --revoke \(shellPath(grant.program)) ends it.
+        \(grant.kind == "script" ? "Any change to the script ends it too: make the grant again after editing it." : "")
+        """.trimmingCharacters(in: .whitespacesAndNewlines))
+
 case "grant":
     guard let length = grantLength, let uses = grantUses, !args.isEmpty, args.allSatisfy(validName) else {
         die("usage: touchenv grant --for 8h --uses 20 NAME [NAME2 ...]  (both limits are required; 24h at most)", 2)
@@ -2881,11 +3910,12 @@ case "grant":
     var wanted: [String] = []
     for name in args where !wanted.contains(name) { wanted.append(name) }
     let list = wanted.joined(separator: ", ")
-    requireIntent(intent, example: "touchenv grant --intent \"<why>\" --for \(grantLengthText) --uses \(uses) \(wanted.joined(separator: " "))")
     let who = requester()
+    currentAttempt = AccessAttempt(event: "grant", secrets: wanted, who: who.name, program: callingProgram(who), intent: intent ?? "")
+    requireIntent(intent, example: "touchenv grant --intent \"<why>\" --for \(grantLengthText) --uses \(uses) \(wanted.joined(separator: " "))")
     // The grant covers the requester and what it runs, so there must be one to name.
     guard who.pid > 1 else { die("touchenv: can't tell which app is asking, so there is nothing to grant to") }
-    for name in wanted where synced(name) == nil { die("touchenv: no secret named \(name)") }
+    for name in wanted where synced(name) == nil { endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)") }
     let limits = "for \(spokenLength(length)), up to \(times(uses))"
     authenticate("Allow \(who.name) and what it runs to read \(strong(wanted)) from \(place(wanted)) without asking, \(limits)? "
                  + "It stays on while the Mac is locked.", intent: intent,
@@ -2894,14 +3924,27 @@ case "grant":
     for name in wanted { secrets[name] = read(name).base64EncodedString() }
     signal(SIGPIPE, SIG_IGN)
     guard startAgent(), let reply = askAgent(["op": "allow", "secrets": secrets, "seconds": length, "uses": uses]),
-          reply["ok"] as? Bool == true else { die("touchenv: couldn't start the grant; nothing was allowed") }
+          reply["ok"] as? Bool == true else {
+        endAttempt(ReadOutcome.failed, note: "couldn't start the grant", message: "touchenv: couldn't start the grant; nothing was allowed")
+    }
+    logAttempt("timed", note: "\(limits)")
     let until = DateFormatter.localizedString(from: Date().addingTimeInterval(length), dateStyle: .none, timeStyle: .short)
     print("\(reply["who"] as? String ?? who.name) and what it runs can read \(list) with touchenv run without asking: "
           + "\(times(uses)), until \(until), also while the Mac is locked. touchenv lock ends it.")
 
 case "lock":
-    if askAgent(["op": "lock"]) != nil { print("locked: every approval and grant ended") }
-    else { print("nothing to lock") }
+    guard args.isEmpty else { die("usage: touchenv lock [--all]", 2) }
+    let who = requester().name
+    if let reply = askAgent(["op": "lock"]) {
+        for ended in reply["ended"] as? [[String: Any]] ?? [] {
+            logAccess(AccessEntry(event: "revoke", secrets: ended["names"] as? [String] ?? [], outcome: "lock",
+                                  who: ended["who"] as? String ?? "", note: "timed grant ended by touchenv lock, asked by \(who)"))
+        }
+        print("locked: every 5-minute approval and timed grant ended")
+    } else {
+        print("no 5-minute approval or timed grant to lock")
+    }
+    if let standing = lockStanding(all: lockAll, who: who) { print(standing) }
 
 case "export":
     guard let recipientArgument, args.allSatisfy(validName) else {
@@ -2937,6 +3980,8 @@ case "export":
         FileHandle.standardOutput.write(header + box.combined!)
     } catch { die("touchenv: \(error.localizedDescription)") }
     let count = "\(names.count) secret\(names.count == 1 ? "" : "s")"
+    logAccess(AccessEntry(event: "export", secrets: names, outcome: "done", who: who, program: callingProgram(requester()),
+                          intent: intent ?? "", note: "for the Mac showing \(code)"))
     FileHandle.standardError.write("""
         exported \(count) (\(names.joined(separator: ", "))) for the Mac showing \(code).
         Copy the file there and run: touchenv import <file>. Then delete the file here too.
@@ -3017,6 +4062,8 @@ case "import":
         stored += 1
         print("stored \(secret.name) (\(secret.data.count) bytes)\(secret.sync ? ", synced through iCloud Keychain" : "")")
     }
+    logAccess(AccessEntry(event: "import", secrets: incoming.map(\.name), outcome: "done", who: who,
+                          program: callingProgram(requester()), intent: intent ?? "", note: "\(stored) stored, from \(from)"))
     // One import per receiving key, and the file has done its job.
     SecItemDelete(receivingQuery() as CFDictionary)
     do {
@@ -3026,6 +4073,13 @@ case "import":
         print("couldn't delete \(path) (\(error.localizedDescription)): delete it yourself")
     }
     print("\(stored) secret\(stored == 1 ? "" : "s") from \(from). Now delete keys.tenv on \(from) too, and empty its Trash.")
+
+case "log":
+    guard args.allSatisfy(validName) else { die(logUsage, 2) }
+    let now = Date()
+    for line in accessReport(readAccessLog(), since: logSince.map { now.addingTimeInterval(-$0) }, names: args, summary: logSummary) {
+        print(line)
+    }
 
 case "agent":
     Agent().run()

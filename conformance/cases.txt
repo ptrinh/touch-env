@@ -71,6 +71,29 @@
 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --for 8h --uses 3 bad-name
 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --intent why --for 30m --uses 3 A bad-name
 0 | out:touchenv grant --for 8h --uses 20 NAME | help
+# Standing grants and the access log arrived in macOS touchenv 1.7.0.
+macos: 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --always A
+macos: 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --always --for-program /x
+macos: 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --for-program /x A
+macos: 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --always --for-program /x bad-name
+macos: 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --list A
+macos: 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --revoke-all A
+macos: 2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --revoke-all --revoke /x
+macos: 2 | err:touchenv: unknown option --revoke | grant --revoke
+macos: 2 | err:touchenv: --for takes a length like 90d, 12h or 30m, 3650d at most | grant --always --for-program /x --for 3651d A
+macos: 2 | err:touchenv: --for takes a length like 90d, 12h or 30m, 3650d at most | grant --always --for-program /x --for soon A
+macos: 2 | err:touchenv: --uses takes a number from 1 to 1000000 | grant --always --for-program /x --uses 0 A
+macos: 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | grant --for 2d --uses 1 A
+macos: 1 | err:touchenv: no standing grant: no such file | grant --always --for-program /nonexistent/touchenv-test A
+macos: 2 | err:usage: touchenv lock [--all] | lock A
+macos: 2 | err:touchenv: unknown option --all | get --all A
+macos: 2 | err:touchenv: --since takes a length like 24h, 7d or 30m | log --since soon
+macos: 2 | err:usage: touchenv log | log bad-name
+macos: 0 | out:kept two years (730 days) | log --help
+macos: 0 | out:touchenv grant --always --for-program PROGRAM | help
+windows: 2 | err:touchenv: standing grants (grant --always, --list, --revoke) are macOS only for now | grant --always --for-program x A
+windows: 2 | err:touchenv: standing grants (grant --always, --list, --revoke) are macOS only for now | grant --list
+windows: 2 | err:touchenv: the access log is macOS only for now | log
 windows: 2 | err:usage: touchenv service install [--offer-5-minutes] · touchenv service uninstall | service
 windows: 2 | err:usage: touchenv service install [--offer-5-minutes] · touchenv service uninstall | service start
 windows: 2 | err:usage: touchenv service install [--offer-5-minutes] · touchenv service uninstall | service install --yes

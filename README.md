@@ -33,7 +33,10 @@ touchenv run --intent "monthly report" OPENAI_API_KEY -- python report.py   # sh
 touchenv ls                                  # names only
 touchenv get NAME · touchenv rm NAME
 touchenv grant --for 8h --uses 20 MY_KEY     # one touch now, then no asking: for when you step away (below)
-touchenv lock                                # end every approval and grant now
+touchenv grant --always --for-program ~/bin/helper.sh MY_KEY   # one program, from now on (below)
+touchenv grant --list                        # what is allowed without asking, and to whom
+touchenv lock                                # end every 5-minute approval and timed grant now
+touchenv log --summary                       # who read what, and how (below)
 touchenv import --begin · touchenv export --to tenv1:… > keys.tenv · touchenv import keys.tenv   # new Mac, below
 touchenv ssh add ~/.ssh/id_ed25519           # an SSH key, used through Touch ID (below)
 ```
@@ -62,11 +65,88 @@ touchenv grant --for 8h --uses 20 ASC_KEY OPENAI_API_KEY
 One touch, and the prompt spells out the keys and both limits. After that the app you ran it from (that Claude Code
 session, or everything in that terminal app) and the commands it starts get those keys from `touchenv run` without
 asking, **also while the Mac is locked**. It ends at the time (24 hours at most), after that many runs, on
-`touchenv lock` or **Lock Now** in the menu bar, when that app quits, or when you log out. Other apps and other keys
+`touchenv lock` or **Lock Now** in the menu bar, when that app quits, or when you log out (for a program that runs
+unattended, use a standing grant instead, below). Other apps and other keys
 still ask, and so do `get` and `export`.
 
 Until it ends, anything that app runs can take those keys, as with the 5-minute approval but for longer and with
 nobody watching. Grant the fewest keys, the shortest time and the fewest uses the task needs.
+
+## One program, from now on (standing grants)
+
+Some programs read a secret over and over with nobody there: a helper script that hands Claude Code an MCP
+server's token every time it connects, also from scheduled tasks. A timed grant runs out and belongs to the app
+you made it in. A standing grant belongs to one program instead, and has no end until you end it:
+
+```sh
+touchenv grant --always --for-program ~/.claude/mcp-trinh-headers.sh MCP_TRINH_AUTH
+touchenv grant --always --for-program /Applications/Tool.app --for 90d --uses 10000 TOOL_KEY   # with limits
+touchenv grant --list                        # every grant: program, secrets, made, last used, reads
+touchenv grant --revoke ~/.claude/mcp-trinh-headers.sh · touchenv grant --revoke-all   # no Touch ID
+```
+
+One touch, and the prompt names the program and the secrets and says this is from now on. After that, when that
+program runs `touchenv get` or `touchenv run`, it gets those secrets without a prompt, after a restart too, and
+**also while the Mac is locked** (once you have logged in since it started). An AI agent still has to give
+`--intent`. Every read is in the access log (below). Other programs, and other secrets, still ask.
+
+**What counts as that program**, checked on every read against the process that ran touchenv:
+
+- **A shell script** (`#!/bin/sh`, bash, zsh, dash, ksh or csh): the process must be the Mac's own shell (its Apple
+  signature is checked) started on that file: `sh helper.sh`, `/full/path/helper.sh`, through a symbolic link, with
+  options like `-e`; not `sh -c '…'`, which is someone else's commands. The file must still have the SHA-256 it had
+  when you made the grant, and it and every folder above it must be changeable only by you (or root). **Edit the
+  script and the grant stops**: touchenv refuses it outright (no prompt, so an unattended run fails rather than
+  waits) and logs why. Make the grant again after you have checked the change. If the script `cd`s elsewhere
+  before calling touchenv, start it by its full path.
+- **A signed program or app**: its code signature, checked by macOS on the running process: team and identifier for
+  a Developer ID program, so its updates keep the grant; the exact build for an ad hoc signed one. The process must
+  be the app's own executable, not a helper inside it.
+
+It is not tied to the app that runs the program: scheduled tasks start it from `launchd`, Claude's app or the
+`claude` CLI, not from the terminal where you made the grant, and a rule like that would stop the very runs it is
+for.
+
+**What it does not stop.** Any program running as you can *run* that script or program and read what it prints, so
+a standing grant for a helper that prints a token gives that token to anything that knows to run the helper. What
+it does stop: a copied or stolen file (the secret isn't in it), programs that don't know about the helper, a changed
+helper, and anything that only reads files. It is not a defence against malware aimed at you: a program that
+starts the script's shell with exported shell functions (`BASH_FUNC_…`, which `/bin/sh` takes too) or `BASH_ENV`
+runs its own code inside that shell, and gets the secret even when the script itself never prints it; macOS doesn't
+let touchenv see a process's environment to spot that. Grant one program,
+the fewest secrets, and prefer a program that uses the secret itself over one that prints it.
+
+`touchenv lock` and **Lock Now** leave standing grants on (and say so); `touchenv lock --all` ends them too. The
+menu bar icon, while it shows, lists them. `touchenv set` of a granted secret updates the grant's copy; `touchenv rm`
+takes it out of the grant. Grants stay on this Mac: export and import don't carry them.
+
+The grant and its copy of the secrets are one Keychain item (service `touchenv-standing`, this device only, readable
+after first unlock) in touchenv's own access group: only the signed touchenv can make, read or change one; there is
+no file another program could write to give itself a grant. Revoking needs no Touch ID: anything running as you can
+end a grant, which only means it asks again.
+
+## The access log
+
+Every read of a secret by `get` and `run` is one line in `~/Library/Logs/touchenv-access-YYYY-MM.log`: the time,
+the secret names, who asked (the app named in the prompt, and the calling program's path), the intent, and the
+outcome: `touch-id` (Touch ID or the Mac's password), `5-minute`, `grant` (a timed grant), `standing-grant`,
+`refused` (with why: no such secret, no `--intent`, a changed script, a signature that doesn't match…), `cancelled`,
+or `failed` (a Keychain error). So are grants made, revoked and ended by `lock`, `set` and `rm`, `export` and
+`import`. Never a value, any part of one, or its length.
+
+```sh
+touchenv log                                 # all of it, newest last
+touchenv log --since 24h MCP_TRINH_AUTH      # one secret, the last day
+touchenv log --summary                       # per secret: reads per outcome, and which programs ask most
+```
+
+Reading it needs no Touch ID. Entries are kept **two years** (730 days): files for months entirely older than that
+are deleted and the oldest month is pruned line by line, checked at most once a day when touchenv writes. Within two
+years nothing goes for size in normal use; all files together are capped at 64 MB, and past that the oldest entries
+go first, with a line saying how many. The files are `0600` in a folder only you can write; the intent and every
+other field lose control characters and are cut short, so a caller can't add or disguise a line. Like any file of
+yours, any program running as you could edit it: it is your record, not proof against malware. The SSH agent keeps
+its own log, `~/Library/Logs/touchenv-ssh-agent.log`, as before.
 
 ## SSH keys
 
@@ -224,6 +304,9 @@ so SmartScreen may warn the first time.
 Same commands as on a Mac. Every read asks Windows Hello, and the Hello window shows touchenv's text: who asks,
 which keys, the intent and the command. Differences:
 
+- **No standing grants and no access log yet**: `touchenv grant --always`, `--list`, `--revoke` and `touchenv log`
+  say they are macOS only.
+
 - **Grants and "Don't ask again for 5 minutes" need the touchenv service**, installed once (below). Without it,
   `grant` is refused, `lock` says there's nothing to lock, and every `run` asks.
 - **`touchenv status`** lists grants and approvals, and each use.
@@ -293,14 +376,21 @@ One Swift file, [`touchenv.swift`](touchenv.swift) (kept to one: with a second f
 sit in an access group only the signed app holds. The prompt embeds `LAAuthenticationView` (no Allow button); the
 Touch ID icon comes from macOS, with a copy in `Resources/`. 5-minute approvals live in memory in `touchenv agent`,
 keyed by the requester's pid and start time (a grant also covers the processes below that requester), behind a `0600` Unix socket; each end checks that the other satisfies
-touchenv's designated code requirement.
+touchenv's designated code requirement. Standing grants are Data Protection keychain items (service
+`touchenv-standing`, account = the program's real path, `AfterFirstUnlockThisDeviceOnly`, no access control): the
+record (JSON) in `kSecAttrGeneric`, the secrets' copy in the value, so listing never touches a value. The caller is
+`getppid()`: a script is matched from the shell's arguments (`KERN_PROCARGS2`, trusted only from a shell that
+satisfies `anchor apple`), its folder (`PROC_PIDVNODEPATHINFO`), `realpath`, SHA-256 and an `lstat` of every folder
+up to `/`; a signed program with `SecCodeCheckValidity` against the recorded designated requirement; the pid's start
+time is checked again after. `tests/standing-tests.swift` runs those checks on real shells (the grants kept in
+memory, never the Keychain) and tests the access log.
 
 SSH: the OpenSSH key format, the agent protocol and the RSA/ECDSA/Ed25519 signing are in the same file, on CryptoKit
 and Security.framework, no other code. `tests/run.sh` compiles that file with `-D TOUCHENV_TESTS` (which leaves out
 the command dispatch) plus `tests/ssh-tests.swift`, and checks it against OpenSSH's own tools: keys made by
 `ssh-keygen`, signatures checked with `ssh-keygen -Y verify`, `ssh-add` and `ssh-keygen -Y sign` talking to the agent,
 a throwaway `ssh-agent` for `load`; `tests/run.sh --sshd` adds real logins against a throwaway `sshd` on a high port.
-None of it reads your keys, agent or config.
+None of it reads your keys, agent, config or Keychain.
 
 Building needs a paid Apple Developer account: an App ID, a Developer ID provisioning profile, and the values in the
 header of `build.sh` put in `build.local`. Then `./build.sh`. Your build can't read keys saved by the prebuilt app;
