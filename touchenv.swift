@@ -273,11 +273,59 @@ func titleText(_ marked: String) -> NSAttributedString {
     return out
 }
 
+/// The scheme of the links behind a prompt title's copy icons: touchenv-copy:NAME.
+let copyLinkScheme = "touchenv-copy"
+
+/// The small icon shown after a secret's name in a prompt's title; `done` is the tick shown once it was copied.
+func copyIcon(done: Bool) -> NSTextAttachment {
+    let attachment = NSTextAttachment()
+    let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [done ? .systemGreen : .secondaryLabelColor]))
+    if let image = NSImage(systemSymbolName: done ? "checkmark" : "doc.on.doc", accessibilityDescription: "Copy the name")?
+        .withSymbolConfiguration(config) {
+        attachment.image = image
+        attachment.bounds = NSRect(x: 0, y: -2, width: image.size.width, height: image.size.height)
+    }
+    return attachment
+}
+
+/// A prompt's title like titleText, with a copy icon after each name marked by strong(): a click on the icon puts
+/// that name (never a value) on the clipboard.
+func titleTextWithCopyIcons(_ marked: String) -> NSAttributedString {
+    let out = NSMutableAttributedString()
+    var bold = false, run = ""
+    func flush() {
+        guard !run.isEmpty else { return }
+        out.append(NSAttributedString(string: run, attributes: [
+            .font: bold ? NSFont.boldSystemFont(ofSize: 13) : NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor]))
+        if bold, let name = run.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
+           let link = URL(string: "\(copyLinkScheme):\(name)") {
+            out.append(NSAttributedString(string: "\u{2009}", attributes: [.font: NSFont.systemFont(ofSize: 13)]))
+            let icon = NSMutableAttributedString(attachment: copyIcon(done: false))
+            icon.addAttributes([.link: link, .toolTip: "Copy \(run)", .cursor: NSCursor.pointingHand],
+                               range: NSRange(location: 0, length: icon.length))
+            out.append(icon)
+        }
+        run = ""
+    }
+    for character in marked {
+        if character == "\u{1}" || character == "\u{2}" {
+            flush()
+            bold = character == "\u{1}"
+        } else {
+            run.append(character)
+        }
+    }
+    flush()
+    return out
+}
+
 enum Outcome { case approved, denied, password }
 
 /// touchenv's own window: the question, the intent, the command behind "More detail", and the Touch ID sensor
 /// embedded, so macOS shows no dialog of its own. There is no Allow button: only a finger approves.
-final class Prompt: NSObject {
+final class Prompt: NSObject, NSTextViewDelegate {
     let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
     let detailToggle = NSButton(title: "More detail ›", target: nil, action: nil)
     var detailField: NSTextField?
@@ -332,8 +380,24 @@ final class Prompt: NSObject {
         sensor.widthAnchor.constraint(equalToConstant: 74).isActive = true
         sensor.heightAnchor.constraint(equalToConstant: 70).isActive = true
 
-        let heading = label("", .systemFont(ofSize: 13))
-        heading.attributedStringValue = titleText(title)
+        // The title is a text view, not a label, so the copy icon after each secret's name can be clicked.
+        let heading = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: 10))
+        heading.isEditable = false
+        heading.isSelectable = true
+        heading.drawsBackground = false
+        heading.textContainerInset = .zero
+        heading.textContainer?.lineFragmentPadding = 0
+        heading.textContainer?.widthTracksTextView = true
+        heading.linkTextAttributes = [.cursor: NSCursor.pointingHand]
+        heading.delegate = self
+        heading.textStorage?.setAttributedString(titleTextWithCopyIcons(title))
+        heading.translatesAutoresizingMaskIntoConstraints = false
+        heading.widthAnchor.constraint(equalToConstant: width).isActive = true
+        if let container = heading.textContainer, let layout = heading.layoutManager {
+            container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+            layout.ensureLayout(for: container)
+            heading.heightAnchor.constraint(equalToConstant: ceil(layout.usedRect(for: container).height)).isActive = true
+        }
         var views: [NSView] = [sensor, heading]
         for note in notes {
             let line = label("", .systemFont(ofSize: 12))
@@ -399,6 +463,22 @@ final class Prompt: NSObject {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.setContentSize(stack.fittingSize)
+    }
+
+    /// A click on a copy icon in the title: the name goes on the clipboard and the icon becomes a tick for a moment.
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let url = link as? URL, url.scheme == copyLinkScheme,
+              let name = String(url.absoluteString.dropFirst(copyLinkScheme.count + 1)).removingPercentEncoding,
+              let storage = textView.textStorage, charIndex < storage.length else { return true }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(name, forType: .string)
+        let range = NSRange(location: charIndex, length: 1)
+        storage.addAttribute(.attachment, value: copyIcon(done: true), range: range)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak textView] in
+            guard let storage = textView?.textStorage, range.location < storage.length else { return }
+            storage.addAttribute(.attachment, value: copyIcon(done: false), range: range)
+        }
+        return true // handled: never hand the link to the system
     }
 
     @objc func toggleDetail() {
