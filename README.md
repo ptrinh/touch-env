@@ -72,6 +72,42 @@ still ask, and so do `get` and `export`.
 Until it ends, anything that app runs can take those keys, as with the 5-minute approval but for longer and with
 nobody watching. Grant the fewest keys, the shortest time and the fewest uses the task needs.
 
+## Typing the Mac password instead (synced secrets only)
+
+Over ssh, or with the lid closed, there is no sensor to touch. For secrets synced through iCloud Keychain
+(`set --sync`), `--password` takes your Mac password, typed in the terminal:
+
+```sh
+touchenv get --password --intent "deploy" API_KEY | pbcopy    # stdout carries only the secret
+touchenv run --password API_KEY -- ./deploy.sh
+touchenv grant --password --for 8h --uses 20 API_KEY          # timed or standing grants too
+```
+
+touchenv first prints what you are approving (who asks, which secrets, the intent, a grant's limits) on the
+terminal, then asks `Mac password for you (not shown):`. The password is read only from the terminal (`/dev/tty`)
+with echo off, and echo comes back on however touchenv ends (Ctrl-C included). It is never taken from an argument,
+the environment or a pipe: with no terminal (an AI agent's shell, a script) `--password` is refused. Anything typed
+ahead is dropped before `run` starts the command. A password approval never starts a 5-minute approval: each
+`--password` read asks again; `grant --password` is the way to cover a while.
+
+- **Local secrets refuse it.** If any secret named is kept on this Mac only, the whole request is refused before
+  the prompt, naming them: those are locked by macOS itself (`userPresence`), and only Touch ID or the system's
+  own password window can open them. macOS has no public way to hand it a password typed elsewhere.
+- **What it changes.** A synced secret has no access control in the Keychain (iCloud won't take one), so for those
+  touchenv's own check is the gate whether you use Touch ID or a password. The difference is the password: it can
+  be watched or keylogged, a fingerprint can't.
+- **The check.** OpenDirectory checks the password of the account running touchenv (`ODRecord.verifyPassword`;
+  no user name is taken from you); any error from it (a network account that can't be reached…) refuses.
+  touchenv wipes its own buffer as soon as the check is done, but OpenDirectory takes the password as a string
+  object, a copy touchenv cannot erase; it stays in memory until freed, and touchenv exits right after.
+- **Wrong passwords.** Three tries; each wrong one doubles the wait before the next (1 s, 2 s, 4 s … up to an
+  hour), counted across runs in a Keychain item only touchenv can change, so a loop of `touchenv get --password`
+  gets no faster. A right password clears the count. Your account's own lockout policy, if it has one, also
+  counts them.
+- **Logged** as `password-cli`; each wrong try as `refused` ("wrong password (try 1 of 3)"), and the refusals as
+  "no terminal", "local secret: …", "too many wrong passwords". Never the password or its length.
+- An AI agent still has to give `--intent`.
+
 ## One program, from now on (standing grants)
 
 Some programs read a secret over and over with nobody there: a helper script that hands Claude Code an MCP
@@ -304,8 +340,8 @@ so SmartScreen may warn the first time.
 Same commands as on a Mac. Every read asks Windows Hello, and the Hello window shows touchenv's text: who asks,
 which keys, the intent and the command. Differences:
 
-- **No standing grants and no access log yet**: `touchenv grant --always`, `--list`, `--revoke` and `touchenv log`
-  say they are macOS only.
+- **No standing grants, no access log and no `--password` yet**: `touchenv grant --always`, `--list`,
+  `--revoke`, `touchenv log` and `--password` say they are macOS only.
 
 - **Grants and "Don't ask again for 5 minutes" need the touchenv service**, installed once (below). Without it,
   `grant` is refused, `lock` says there's nothing to lock, and every `run` asks.

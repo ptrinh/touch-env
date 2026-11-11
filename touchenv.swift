@@ -75,6 +75,7 @@ import Darwin
 import Foundation
 import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
+import OpenDirectory
 import Security
 
 let version = "1.6.0"
@@ -103,6 +104,8 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
   touchenv grant --list                 standing grants, timed grants and 5-minute approvals
   touchenv grant --revoke PROGRAM · --revoke-all
                                         end standing grants (no Touch ID)
+  --password (get, run, grant)          for secrets synced through iCloud only: type your Mac password at
+                                        a hidden prompt in the terminal instead of Touch ID
   touchenv lock [--all]                 end every 5-minute approval and timed grant now; --all ends
                                         standing grants too
   touchenv log [--since 7d] [--summary] [NAME ...]
@@ -1160,6 +1163,7 @@ enum ReadOutcome {
     static let refused = "refused"           // with the reason in the note
     static let cancelled = "cancelled"       // at the prompt
     static let failed = "failed"             // a Keychain error, or no way to ask
+    static let passwordCLI = "password-cli"  // the Mac password typed in the terminal (synced secrets only)
 }
 
 let accessLogRetention: TimeInterval = 730 * 86400
@@ -1930,6 +1934,271 @@ func lockStanding(all: Bool, who: String, store: StandingStore = standingStore) 
     return "\(left.count) standing grant\(left.count == 1 ? "" : "s") still on ("
         + left.map { tilde($0.program) }.joined(separator: ", ")
         + "): touchenv grant --list shows them; touchenv grant --revoke PROGRAM or touchenv lock --all ends them"
+}
+
+// MARK: The Mac password, typed in the terminal (iCloud-synced secrets only)
+
+// get, run and grant --password: the account password of the user running touchenv, typed at a no-echo prompt on
+// the controlling terminal (/dev/tty), approves instead of Touch ID. Only for secrets synced through iCloud Keychain:
+// those carry no access control (iCloud won't take one), so touchenv's own check is the gate either way, Touch ID or
+// password. Local secrets carry userPresence, which only Touch ID or the system's own password window can satisfy
+// (LocalAuthentication has no public way to hand it a typed account password), so --password refuses them.
+// The password: read into a buffer touchenv allocates, never an argument, the environment or stdin; checked with
+// OpenDirectory (ODRecord.verifyPassword on the current user's record), which takes an NSString: that one copy
+// can't be erased, and lives until it is freed. touchenv's own buffer is wiped (memset_s) as soon as the check is
+// done. Wrong passwords are counted in a Keychain item in touchenv's access group (no other program can reset it):
+// each failure doubles the wait before the next try (1 s, 2 s, 4 s … 1 hour), across runs; success clears it.
+// The account's own lockout policy, if one is set, counts these failures too.
+
+enum PasswordCheck: Equatable { case ok, wrong, error(String) }
+
+struct PasswordThrottle: Codable, Equatable {
+    var failures = 0
+    var notBefore = Date.distantPast
+}
+
+protocol ThrottleStore: AnyObject {
+    /// nil when the count can't be read: then no password is checked at all.
+    func load() -> PasswordThrottle?
+    func save(_ throttle: PasswordThrottle) -> Bool
+}
+
+final class KeychainThrottleStore: ThrottleStore {
+    let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                               kSecAttrService as String: "touchenv-password-throttle",
+                               kSecAttrAccount as String: "wrong-passwords",
+                               kSecUseDataProtectionKeychain as String: true, kSecAttrSynchronizable as String: false]
+    func load() -> PasswordThrottle? {
+        var q = base
+        q[kSecReturnData as String] = true
+        q[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status == errSecItemNotFound { return PasswordThrottle() }
+        guard status == errSecSuccess, let data = out as? Data else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        return try? decoder.decode(PasswordThrottle.self, from: data)
+    }
+    func save(_ throttle: PasswordThrottle) -> Bool {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        let data = try! encoder.encode(throttle)
+        let status = SecItemUpdate(base as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var q = base
+            q[kSecValueData as String] = data
+            q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            q[kSecAttrLabel as String] = "touchenv: wrong Mac passwords typed in the terminal"
+            return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
+        }
+        return status == errSecSuccess
+    }
+}
+
+let passwordTries = 3
+var throttleUnit: TimeInterval = 1          // tests make it shorter
+var throttleStore: ThrottleStore = KeychainThrottleStore()
+var passwordVerifier: (UnsafeBufferPointer<UInt8>) -> PasswordCheck = verifyAccountPassword
+var syncedLookup: (String) -> Bool? = { synced($0) }
+var ttyPath = "/dev/tty"
+/// Tests check the buffer after wiping, before it is freed.
+var passwordWiped: ((UnsafeMutablePointer<UInt8>, Int) -> Void)?
+
+/// The wait after `failures` wrong passwords in a row: 1, 2, 4 … units, an hour at most.
+func throttleDelay(_ failures: Int) -> TimeInterval {
+    failures <= 0 ? 0 : min(pow(2, Double(min(failures, 30) - 1)), 3600) * throttleUnit
+}
+
+func currentUserName() -> String? {
+    guard let entry = getpwuid(getuid()) else { return nil }
+    return String(cString: entry.pointee.pw_name)
+}
+
+/// Whether `password` is the account password of the user running touchenv, asked of OpenDirectory.
+func verifyAccountPassword(_ password: UnsafeBufferPointer<UInt8>) -> PasswordCheck {
+    guard let name = currentUserName(), let bytes = password.baseAddress else { return .error("can't tell which account this is") }
+    // The one copy touchenv can't wipe: OpenDirectory takes the password as a string object.
+    guard let text = NSString(bytes: bytes, length: password.count, encoding: String.Encoding.utf8.rawValue) else { return .wrong }
+    do {
+        let node = try ODNode(session: ODSession.default(), type: ODNodeType(kODNodeTypeAuthentication))
+        let record = try node.record(withRecordType: kODRecordTypeUsers, name: name, attributes: nil)
+        try record.verifyPassword(text as String)
+        return .ok
+    } catch let error as NSError {
+        return error.code == 5000 ? .wrong : .error(error.localizedDescription)   // 5000: kODErrorCredentialsInvalid
+    }
+}
+
+/// Terminal text: no control characters (who asks comes from process names, which a program chooses).
+func terminalText(_ raw: String) -> String {
+    String(String.UnicodeScalarView(raw.unicodeScalars.map {
+        switch $0.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator: return " "
+        default: return $0
+        }
+    }))
+}
+
+func writeTTY(_ fd: Int32, _ text: String) { _ = writeFull(fd, Array(text.utf8)) }
+
+// What the signal handler needs to put the terminal back: plain globals, no captures.
+var ttySavedState = termios()
+var ttyEchoFd: Int32 = -1
+func ttySignalRestore(_ signal: Int32) {
+    if ttyEchoFd >= 0 { tcsetattr(ttyEchoFd, TCSANOW, &ttySavedState) }
+    Darwin.signal(signal, SIG_DFL)
+    raise(signal)
+}
+
+/// Reads one line from the terminal with echo off, and hands it to `body` in a buffer that is wiped afterwards.
+/// Echo comes back on every way out: the end, Ctrl-C, a kill, a hang-up (Ctrl-Z is ignored while it waits).
+/// `body` gets nil at end of input.
+func withTypedPassword<T>(_ fd: Int32, prompt: String, _ body: (UnsafeBufferPointer<UInt8>?) -> T) -> T {
+    let capacity = 1024
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+    buffer.initialize(repeating: 0, count: capacity)
+    defer {
+        memset_s(buffer, capacity, 0, capacity)
+        passwordWiped?(buffer, capacity)
+        buffer.deallocate()
+    }
+    writeTTY(fd, prompt)
+    var saved = termios()
+    let isTerminal = tcgetattr(fd, &saved) == 0
+    var handlers: [(Int32, sig_t?)] = []
+    if isTerminal {
+        ttySavedState = saved
+        ttyEchoFd = fd
+        for s in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] { handlers.append((s, signal(s, ttySignalRestore))) }
+        handlers.append((SIGTSTP, signal(SIGTSTP, SIG_IGN)))
+        var quiet = saved
+        quiet.c_lflag &= ~tcflag_t(ECHO | ECHOE | ECHOK | ECHONL)
+        tcsetattr(fd, TCSAFLUSH, &quiet)   // also drops anything typed before the prompt
+    }
+    var count = 0, ended = false
+    while count < capacity - 1 {
+        let n = read(fd, buffer + count, 1)
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 { ended = true; break }
+        if buffer[count] == 0x0A || buffer[count] == 0x0D { buffer[count] = 0; break }
+        count += 1
+    }
+    if isTerminal {
+        tcsetattr(fd, TCSANOW, &saved)
+        ttyEchoFd = -1
+        for (s, old) in handlers { signal(s, old) }
+    }
+    writeTTY(fd, "\n")
+    return body(ended && count == 0 ? nil : UnsafeBufferPointer(start: buffer, count: count))
+}
+
+func withThrottleLock<T>(_ body: () -> T) -> T {
+    guard ensurePrivateDir(supportDir()),
+          case let fd = open(supportDir() + "/password.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600), fd >= 0 else {
+        return body()
+    }
+    defer { close(fd) }
+    flock(fd, LOCK_EX)
+    return body()
+}
+
+/// Approves the attempt under way (currentAttempt) with the Mac password typed in the terminal, or ends touchenv
+/// with the reason, logged. Refused before any prompt when a secret isn't synced, when there is no terminal, or while
+/// earlier wrong passwords still make it wait. `summary`: what is being approved, shown before the prompt.
+func approveWithPassword(names: [String], summary: [String]) {
+    func refuse(_ note: String, _ message: String, _ outcome: String = ReadOutcome.refused) -> Never {
+        endAttempt(outcome, note: note, message: message)
+    }
+    if getuid() == 0 { refuse("run as root", "touchenv: --password checks your own Mac password; not as root") }
+    var missing: [String] = [], local: [String] = []
+    for name in names {
+        switch syncedLookup(name) {
+        case nil: missing.append(name)
+        case false?: local.append(name)
+        case true?: break
+        }
+    }
+    if let name = missing.first { refuse("no secret named \(name)", "touchenv: no secret named \(name)") }
+    if !local.isEmpty {
+        let list = local.joined(separator: ", ")
+        refuse("local secret: \(list)",
+               "touchenv: --password is for secrets synced through iCloud Keychain only. \(list) \(local.count == 1 ? "is" : "are") "
+               + "kept on this Mac behind Touch ID, which only Touch ID or the system's password window can open: "
+               + "ask again without --password.")
+    }
+    let fd = open(ttyPath, O_RDWR | O_NOCTTY | O_CLOEXEC)
+    guard fd >= 0, isatty(fd) != 0 else {
+        refuse("no terminal", "touchenv: --password needs a terminal to type the password in; it is never taken from "
+               + "an argument, the environment or a pipe")
+    }
+    defer { close(fd) }
+    guard let user = currentUserName() else { refuse("no account name", "touchenv: can't tell which account this is", ReadOutcome.failed) }
+    writeTTY(fd, summary.map { terminalText($0) + "\n" }.joined())
+    for attempt in 1...passwordTries {
+        guard let before = withThrottleLock({ throttleStore.load() }) else {
+            refuse("can't read the count of wrong passwords", "touchenv: can't read the count of wrong passwords; not checking one",
+                   ReadOutcome.failed)
+        }
+        let wait = before.notBefore.timeIntervalSinceNow
+        if wait > 0 {
+            if attempt == 1 || wait > 30 * throttleUnit {
+                refuse("too many wrong passwords", "touchenv: too many wrong passwords; try again in \(Int(wait.rounded(.up))) s")
+            }
+            Thread.sleep(forTimeInterval: wait)
+        }
+        let result: PasswordCheck? = withTypedPassword(fd, prompt: "Mac password for \(user) (not shown): ") { typed in
+            guard let typed else { return nil }
+            return withThrottleLock {
+                // Again under the lock, right before checking: another touchenv may have failed meanwhile.
+                guard let now = throttleStore.load() else { return .error("can't read the count of wrong passwords") }
+                if now.notBefore > Date() { return .error("too many wrong passwords") }
+                let check = passwordVerifier(typed)
+                switch check {
+                case .ok:
+                    if !throttleStore.save(PasswordThrottle()) { return .error("can't clear the count of wrong passwords") }
+                case .wrong:
+                    let failures = now.failures + 1
+                    if !throttleStore.save(PasswordThrottle(failures: failures, notBefore: Date().addingTimeInterval(throttleDelay(failures)))) {
+                        return .error("can't count the wrong password")
+                    }
+                case .error:
+                    break
+                }
+                return check
+            }
+        }
+        switch result {
+        case nil:
+            refuse("no password typed", "touchenv: no password typed; not approved", ReadOutcome.cancelled)
+        case .ok?:
+            tcflush(fd, TCIFLUSH)   // nothing typed ahead reaches what runs next
+            return
+        case .wrong?:
+            if attempt == passwordTries {
+                refuse("wrong password (try \(attempt) of \(passwordTries))", "touchenv: wrong password; not approved")
+            }
+            writeTTY(fd, "Wrong password.\n")
+            if let a = currentAttempt {
+                logAccess(AccessEntry(event: a.event, secrets: a.secrets, outcome: ReadOutcome.refused, who: a.who,
+                                      program: a.program, intent: a.intent, note: "wrong password (try \(attempt) of \(passwordTries))"))
+            }
+        case .error(let why)?:
+            if why == "too many wrong passwords" {
+                refuse(why, "touchenv: too many wrong passwords; try again later")
+            }
+            refuse("password check failed: \(why)", "touchenv: couldn't check the password (\(why)); not approved", ReadOutcome.failed)
+        }
+    }
+}
+
+/// get and run with --password: approve, then read every secret. No 5-minute approval follows.
+func passwordRead(names: [String], summary: [String], read: (String) -> Data) -> [String: Data] {
+    approveWithPassword(names: names, summary: summary)
+    var out: [String: Data] = [:]
+    for name in names { out[name] = read(name) }
+    logAttempt(ReadOutcome.passwordCLI)
+    return out
 }
 
 // MARK: Moving to another Mac
@@ -3412,6 +3681,7 @@ usage: touchenv grant --for 8h --uses 20 NAME ...         a timed grant to this 
        touchenv grant --always --for-program PROGRAM [--for 90d] [--uses N] NAME ...
                                                           a standing grant to one program
        touchenv grant --list · --revoke PROGRAM · --revoke-all
+       --password before the limits: type your Mac password in the terminal instead of Touch ID (synced secrets only)
 """
 
 let sshUsage = """
@@ -3684,6 +3954,7 @@ var grantUses: Int?
 var grantUsesText = ""
 var always = false, forProgram: String?, listGrants = false, revokeProgram: String?, revokeAll = false
 var lockAll = false
+var usePassword = false
 var logSince: TimeInterval?, logSummary = false
 while let option = args.first, option.hasPrefix("--"), option != "--" {
     if option == "--sync", command == "set" {
@@ -3710,6 +3981,9 @@ while let option = args.first, option.hasPrefix("--"), option != "--" {
     } else if command == "grant", option == "--for-program" || option == "--revoke", args.count > 1 {
         if option == "--revoke" { revokeProgram = args[1] } else { forProgram = args[1] }
         args.removeFirst(2)
+    } else if option == "--password", ["get", "run", "grant"].contains(command) {
+        usePassword = true
+        args.removeFirst()
     } else if option == "--all", command == "lock" {
         lockAll = true
         args.removeFirst()
@@ -3791,6 +4065,13 @@ case "get":
     case .none:
         break
     }
+    if usePassword {
+        // The prompt and everything else go to the terminal; stdout gets only the secret.
+        var summary = ["touchenv: show \(who) \(args[0]) from iCloud Keychain in full?"]
+        if let intent { summary.append("  Intent: \(intent)") }
+        FileHandle.standardOutput.write(passwordRead(names: [args[0]], summary: summary, read: read)[args[0]]!)
+        exit(0)
+    }
     authenticate("Show \(who) \(strong(args[0])) from \(place([args[0]])) in full?", intent: intent,
                  reason: "show \(who) the secret \(args[0]) in full")
     let value = read(args[0])
@@ -3852,6 +4133,12 @@ case "run":
             let via = reply["via"] as? String
             logAttempt(via == "grant" ? ReadOutcome.grant : via == "5-minute" ? ReadOutcome.fiveMinute : "5-minute-or-grant")
         }
+    }
+    if !wanted.allSatisfy({ secrets[$0] != nil }) && usePassword {
+        // No "Don't ask again for 5 minutes" from a password: each --password run asks; grant --password covers a while.
+        var summary = ["touchenv: give \(who) \(names) from iCloud Keychain for the command: \(shortCommand(argv))?"]
+        if let intent { summary.append("  Intent: \(intent)") }
+        secrets = passwordRead(names: wanted, summary: summary, read: read)
     }
     if !wanted.allSatisfy({ secrets[$0] != nil }) {
         let full = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
@@ -3959,10 +4246,17 @@ case "grant" where always || forProgram != nil:
     let identity = grant.kind == "script"
         ? "Script \(grant.program)\nSHA-256 \(grant.sha256 ?? "")\nIf the script changes, the grant stops working."
         : "Signed program \(grant.program)\nSigner: \(grant.signer ?? "?")\nRequirement: \(grant.requirement ?? "")"
-    authenticate("Allow \(strong(tilde(grant.program))) to read \(strong(wanted)) from \(place(wanted)) without asking, "
-                 + "\(limitText)? Also while the Mac is locked. Any program running as you could start it and get them through it.",
-                 intent: intent, detail: identity,
-                 reason: "let \(tilde(grant.program)) read \(list) without asking, \(limitText)")
+    let question = "Allow \(strong(tilde(grant.program))) to read \(strong(wanted)) from \(place(wanted)) without asking, "
+        + "\(limitText)? Also while the Mac is locked. Any program running as you could start it and get them through it."
+    if usePassword {
+        var summary = ["touchenv: " + question.filter { $0 != "\u{1}" && $0 != "\u{2}" }]
+        if let intent { summary.append("  Intent: \(intent)") }
+        summary += identity.split(separator: "\n").map { "  " + $0 }
+        approveWithPassword(names: wanted, summary: summary)
+    } else {
+        authenticate(question, intent: intent, detail: identity,
+                     reason: "let \(tilde(grant.program)) read \(list) without asking, \(limitText)")
+    }
     var values: [String: Data] = [:]
     for name in wanted { values[name] = read(name) }
     let now = Date()
@@ -3976,7 +4270,8 @@ case "grant" where always || forProgram != nil:
     guard status == errSecSuccess else {
         endAttempt(ReadOutcome.failed, note: "keychain error \(status)", message: "touchenv: keychain error \(status); no standing grant made")
     }
-    logAttempt("standing", note: [limits.isEmpty ? "no limit" : limits.joined(separator: ", "),
+    logAttempt("standing", note: [usePassword ? "approved with the Mac password typed in the terminal" : nil,
+                                  limits.isEmpty ? "no limit" : limits.joined(separator: ", "),
                                   grant.kind == "script" ? "sha256 \(grant.sha256 ?? "")" : "signer \(grant.signer ?? "")",
                                   replaced.map { "replaces the grant for \($0.names.joined(separator: ","))" }]
                                   .compactMap { $0 }.joined(separator: "; "))
@@ -4000,9 +4295,16 @@ case "grant":
     guard who.pid > 1 else { die("touchenv: can't tell which app is asking, so there is nothing to grant to") }
     for name in wanted where synced(name) == nil { endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)") }
     let limits = "for \(spokenLength(length)), up to \(times(uses))"
-    authenticate("Allow \(who.name) and what it runs to read \(strong(wanted)) from \(place(wanted)) without asking, \(limits)? "
-                 + "It stays on while the Mac is locked.", intent: intent,
-                 reason: "let \(who.name) and what it runs read \(list) without asking, \(limits), also while the Mac is locked")
+    if usePassword {
+        var summary = ["touchenv: allow \(who.name) and what it runs to read \(list) from iCloud Keychain without asking, "
+                       + "\(limits)? It stays on while the Mac is locked."]
+        if let intent { summary.append("  Intent: \(intent)") }
+        approveWithPassword(names: wanted, summary: summary)
+    } else {
+        authenticate("Allow \(who.name) and what it runs to read \(strong(wanted)) from \(place(wanted)) without asking, \(limits)? "
+                     + "It stays on while the Mac is locked.", intent: intent,
+                     reason: "let \(who.name) and what it runs read \(list) without asking, \(limits), also while the Mac is locked")
+    }
     var secrets: [String: String] = [:]
     for name in wanted { secrets[name] = read(name).base64EncodedString() }
     signal(SIGPIPE, SIG_IGN)
@@ -4010,7 +4312,7 @@ case "grant":
           reply["ok"] as? Bool == true else {
         endAttempt(ReadOutcome.failed, note: "couldn't start the grant", message: "touchenv: couldn't start the grant; nothing was allowed")
     }
-    logAttempt("timed", note: "\(limits)")
+    logAttempt("timed", note: "\(limits)" + (usePassword ? "; approved with the Mac password typed in the terminal" : ""))
     let until = DateFormatter.localizedString(from: Date().addingTimeInterval(length), dateStyle: .none, timeStyle: .short)
     print("\(reply["who"] as? String ?? who.name) and what it runs can read \(list) with touchenv run without asking: "
           + "\(times(uses)), until \(until), also while the Mac is locked. touchenv lock ends it.")

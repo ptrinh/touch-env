@@ -134,6 +134,9 @@ func run(args []string, env *Env) error {
 				o.localOnly = true
 			}
 			args = args[1:]
+		case option == "--password" && (command == "get" || command == "run" || command == "grant"):
+			// Approving with the Mac password typed in the terminal exists in the macOS build only (README).
+			return die(2, "touchenv: --password is macOS only for now")
 		case command == "grant" && (option == "--always" || option == "--for-program" || option == "--list" ||
 			option == "--revoke" || option == "--revoke-all"):
 			// Standing grants (README, "Standing grants") exist in the macOS build only.

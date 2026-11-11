@@ -91,6 +91,14 @@ macos: 2 | err:touchenv: --since takes a length like 24h, 7d or 30m | log --sinc
 macos: 2 | err:usage: touchenv log | log bad-name
 macos: 0 | out:kept two years (730 days) | log --help
 macos: 0 | out:touchenv grant --always --for-program PROGRAM | help
+macos: 2 | err:usage: touchenv get NAME | get --password
+macos: 2 | err:usage: touchenv get NAME | get --password A B
+macos: 2 | err:usage: touchenv run NAME[:file] ... -- command args... | run --password A
+macos: 2 | err:touchenv: unknown option --password | ls --password
+macos: 2 | err:touchenv: unknown option --password | set --password A
+macos: 0 | out:--password (get, run, grant) | help
+windows: 2 | err:touchenv: --password is macOS only for now | get --password A
+windows: 2 | err:touchenv: --password is macOS only for now | grant --password --for 8h --uses 1 A
 windows: 2 | err:touchenv: standing grants (grant --always, --list, --revoke) are macOS only for now | grant --always --for-program x A
 windows: 2 | err:touchenv: standing grants (grant --always, --list, --revoke) are macOS only for now | grant --list
 windows: 2 | err:touchenv: the access log is macOS only for now | log
