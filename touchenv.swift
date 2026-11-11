@@ -129,6 +129,8 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         --local keeps none synced
 
   --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.
+
+(c) Phil Trinh 2026
 """
 var context = LAContext()
 

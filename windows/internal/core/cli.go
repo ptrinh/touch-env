@@ -51,7 +51,9 @@ func usage() string {
   touchenv import [--replace] keys.tenv
                                         (new machine) store them, then delete the file; --replace overwrites
 
-  --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.`
+  --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.
+
+(c) Phil Trinh 2026`
 }
 
 // Env is what a run of touchenv works with.
