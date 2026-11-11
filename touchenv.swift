@@ -297,6 +297,9 @@ final class Prompt: NSObject {
             let field = NSTextField(wrappingLabelWithString: text)
             field.font = font
             field.textColor = color
+            // A wrapping label is selectable; without this, clicking it hands the text to the field
+            // editor, which drops the bold of an attributed string.
+            field.allowsEditingTextAttributes = true
             field.preferredMaxLayoutWidth = width
             field.widthAnchor.constraint(equalToConstant: width).isActive = true
             return field
