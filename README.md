@@ -103,6 +103,12 @@ access log, `--password` or SSH keys yet. See [docs/windows.md](docs/windows.md)
 The whole picture, including what a typed password and a standing grant don't protect against:
 [docs/security.md](docs/security.md). Building and testing: [docs/building.md](docs/building.md).
 
+## See also
+
+[bordercheck](https://github.com/ptrinh/bordercheck) finds the keys still lying around in plain text on a work
+laptop (`.env` files, shell history, SSH keys without a passphrase, tokens in AI agent configs) and the other
+open doors, so you know what to move into touch-env.
+
 ## License
 
 MIT
