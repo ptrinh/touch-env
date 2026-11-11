@@ -3,7 +3,7 @@
 #   ~/Applications/touchenv.app  +  ~/.local/bin/touchenv -> touchenv.app/Contents/MacOS/touchenv
 #
 # Needs an Apple Developer account: the keychain access group is a restricted entitlement, so the app must be
-# signed with your Developer ID and carry a provisioning profile that grants it (see README, "Build it yourself").
+# signed with your Developer ID and carry a provisioning profile that grants it (see docs/building.md, "Building it yourself").
 #
 #   TOUCHENV_TEAM_ID    your team ID, e.g. ABCDE12345
 #   TOUCHENV_BUNDLE_ID  the App ID the profile was made for, e.g. com.example.touchenv

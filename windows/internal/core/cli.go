@@ -1,7 +1,7 @@
 package core
 
 // The command line, kept to the same contract as touchenv.swift: commands, options, messages and exit codes
-// (2 for usage, 1 for refusals and failures, the command's own code for run). Differences are listed in the README.
+// (2 for usage, 1 for refusals and failures, the command's own code for run). Differences are listed in docs/windows.md.
 
 import (
 	"crypto/rand"
@@ -135,11 +135,11 @@ func run(args []string, env *Env) error {
 			}
 			args = args[1:]
 		case option == "--password" && (command == "get" || command == "run" || command == "grant"):
-			// Approving with the Mac password typed in the terminal exists in the macOS build only (README).
+			// Approving with the Mac password typed in the terminal exists in the macOS build only (docs/grants.md).
 			return die(2, "touchenv: --password is macOS only for now")
 		case command == "grant" && (option == "--always" || option == "--for-program" || option == "--list" ||
 			option == "--revoke" || option == "--revoke-all"):
-			// Standing grants (README, "Standing grants") exist in the macOS build only.
+			// Standing grants (docs/grants.md) exist in the macOS build only.
 			return die(2, "touchenv: standing grants (grant --always, --list, --revoke) are macOS only for now")
 		case option == "--for" && command == "grant" && len(args) > 1:
 			d, ok := ParseLength(args[1])
@@ -192,10 +192,10 @@ func run(args []string, env *Env) error {
 	case "import":
 		return c.importCmd(args)
 	case "log":
-		// The access log exists in the macOS build only (README, "The access log").
+		// The access log exists in the macOS build only (docs/access-log.md).
 		return die(2, "touchenv: the access log is macOS only for now")
 	case "ssh":
-		// The SSH agent and key commands exist in the macOS build only (README, "SSH keys").
+		// The SSH agent and key commands exist in the macOS build only (docs/ssh.md).
 		return die(2, "touchenv: ssh keys are macOS only for now")
 	case "help", "-h", "--help":
 		fmt.Fprintln(env.Stdout, usage())

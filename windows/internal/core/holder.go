@@ -5,7 +5,7 @@ package core
 // tells it who each caller is from what Windows itself reports (the pipe client's token and pid, the system's process
 // list), never from anything the caller says about itself.
 //
-// What it can and can't promise on Windows is in the README ("Grants on Windows"). In short: the time limit, the
+// What it can and can't promise on Windows is in docs/windows.md ("Grants on Windows"). In short: the time limit, the
 // number of uses and touchenv lock are enforced here, in a process the user's programs can't read or change without
 // administrator rights. Which process gets the secrets is not: a program running as the user can start a process
 // under the requester, or inject into it, so the requester checks below stop accidents, not attacks.

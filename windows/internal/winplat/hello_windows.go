@@ -6,7 +6,7 @@ package winplat
 // Decrypt and Sign show touchenv's message in the Hello dialog through NCRYPT_USE_CONTEXT_PROPERTY.
 //
 // The provider name, the "NgcCacheType" property and NgcGetDefaultDecryptionKeyName are not in Microsoft's public
-// documentation; KeePassWinHello has used them the same way since 2019. See README, Windows.
+// documentation; KeePassWinHello has used them the same way since 2019. See docs/building.md, "Windows".
 
 import (
 	"crypto/rsa"

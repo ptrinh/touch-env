@@ -15,7 +15,7 @@ TPM (`tpm.msc`).
    A second `echo two | touchenv set B` asks nothing.
 4. **Prompt text.** `touchenv run --intent "manual test" A -- cmd /c echo %A%`: the Hello window shows "touchenv: Allow
    Windows Terminal to read A?", "Intent: manual test" and the command line, then prints the key. Try a 200-character
-   intent: note where Windows cuts the text, if it does. Screenshot it for the README.
+   intent: note where Windows cuts the text, if it does. Screenshot it for docs/windows.md.
 5. **Every read asks.** `touchenv get A` twice within a few seconds: two prompts. Again right after unlocking the PC,
    and after approving with a fingerprint, then the PIN, then face (whatever the PC has).
 6. **Cancel.** Cancel the prompt: `touchenv: not approved`, exit 1 (`$LASTEXITCODE` in PowerShell), nothing printed.
@@ -33,7 +33,7 @@ TPM (`tpm.msc`).
    ```
 
    It must throw, never print bytes. Without `Silent` it must show a Hello prompt (with Windows' generic text: the gap
-   the README describes). Approving it there gives the store key, so cancel.
+   docs/windows.md describes). Approving it there gives the store key, so cancel.
 10. **`:file`.** `touchenv run A:file -- cmd /c "type %A% & icacls %A%"`: prints the key; `icacls` lists only you.
     Afterwards `%LOCALAPPDATA%\touchenv\run` is empty. Then `touchenv run A:file -- cmd /c pause`, close the window
     while it waits, open a new one and run another `:file` command: the leftover folder is gone.
@@ -77,7 +77,7 @@ identity in a test, but can't use Windows Hello, so nothing below has been seen 
     as you can get A too". A shield icon appears in the notification area. Then
     `touchenv run A -- cmd /c echo %A%` twice: no prompt, the key printed, a notification each time ("Windows Terminal
     read A", "No Windows Hello asked: …"; the second says it was the last use). A third run asks again.
-    `touchenv status` lists both uses with times and pids. Screenshot the prompt and a notification for the README.
+    `touchenv status` lists both uses with times and pids. Screenshot the prompt and a notification for docs/windows.md.
 23. **What a grant doesn't cover.** Grant from Windows Terminal, then from VS Code's terminal `touchenv run A -- …`:
     asks. `touchenv get A` and `touchenv export …`: ask. A second key not in the grant: asks.
 24. **Screen lock.** Grant for 10 minutes, then in the granted terminal:
@@ -92,7 +92,7 @@ identity in a test, but can't use Windows Hello, so nothing below has been seen 
     touchenv set up: its `status` shows nothing and its runs ask. Back in the first account, the grant is still on.
 29. **Remote Desktop.** Grant at the PC, disconnect, connect again over Remote Desktop to the same session: a run
     from the granted terminal works without asking (Windows Hello itself can't ask there). A new grant over Remote
-    Desktop is refused (it needs Windows Hello). Note what happens and put it in the README.
+    Desktop is refused (it needs Windows Hello). Note what happens and put it in docs/windows.md.
 30. **Impostor.** As administrator `sc stop touchenv`. Then as yourself in PowerShell:
     `$s = [System.IO.Pipes.NamedPipeServerStream]::new("touchenv"); $s.WaitForConnection()`. In another window:
     `touchenv grant --for 5m --uses 1 A` fails with "something other than the touchenv service is answering" and

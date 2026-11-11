@@ -1,4 +1,4 @@
-// touchenv for Windows: secrets on this PC, every read behind Windows Hello. See ../README.md and internal/core.
+// touchenv for Windows: secrets on this PC, every read behind Windows Hello. See ../docs/windows.md and internal/core.
 package main
 
 import (

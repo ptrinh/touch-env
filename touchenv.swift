@@ -100,7 +100,7 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         to its signature) reads those secrets with get or run without
                                         asking, from now on, also while the Mac is locked. Anything
                                         running as you can start that program and get them through
-                                        it: see the README
+                                        it: see docs/grants.md
   touchenv grant --list                 standing grants, timed grants and 5-minute approvals
   touchenv grant --revoke PROGRAM · --revoke-all
                                         end standing grants (no Touch ID)
@@ -1680,7 +1680,7 @@ func identifyProgram(_ given: String) -> Result<StandingGrant, IdentityProblem> 
 }
 
 /// The process that ran touchenv, as the kernel tells it. (Not its environment: macOS hides that from other
-/// processes, so a shell started with BASH_ENV or exported BASH_FUNC_… functions can't be told apart. README.)
+/// processes, so a shell started with BASH_ENV or exported BASH_FUNC_… functions can't be told apart. docs/security.md.)
 struct Caller { var pid: pid_t; var start: UInt64; var executable: String; var arguments: [String]; var cwd: String }
 
 func processPath(_ pid: pid_t) -> String? {
