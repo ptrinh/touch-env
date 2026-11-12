@@ -607,6 +607,8 @@ final class Prompt: NSObject, NSTextViewDelegate {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         panel.center()
+        // Who has the keyboard now: it goes back there when the prompt closes.
+        let previous = NSWorkspace.shared.frontmostApplication
         app.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         var finished = false
@@ -628,8 +630,21 @@ final class Prompt: NSObject, NSTextViewDelegate {
                     self.outcome = .password
                 }
                 self.panel.orderOut(nil)
+                Prompt.giveFocusBack(to: previous)
                 done(self.outcome)
             }
+        }
+    }
+
+    /// touchenv took the keyboard to show the prompt and has no window left to hold it: hand it back to the app that
+    /// had it, unless the person has moved on to another app meanwhile.
+    static func giveFocusBack(to previous: NSRunningApplication?) {
+        guard let previous, previous.processIdentifier != getpid(), !previous.isTerminated, NSApp.isActive else { return }
+        if #available(macOS 14.0, *) {
+            NSApp.yieldActivation(to: previous)
+            previous.activate()
+        } else {
+            previous.activate(options: [.activateIgnoringOtherApps])
         }
     }
 
