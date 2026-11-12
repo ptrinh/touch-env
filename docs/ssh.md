@@ -126,8 +126,16 @@ ssh -T git@github.com                       # Windows Hello asks
 
   ```
   Host *
-      IdentityAgent \\.\pipe\touchenv-ssh-<your SID>
+      IdentityAgent "//./pipe/touchenv-ssh-<your SID>"
   ```
+
+  (Forward slashes on purpose: ssh's config parser turns `\\` into `\`, so the usual `\\.\pipe\…` spelling never opens.)
+  Programs that don't read `.ssh\config` (some IDEs) need the environment variable instead:
+  `setx SSH_AUTH_SOCK \\.\pipe\touchenv-ssh-<your SID>`.
+- **Use Windows' own OpenSSH**, 8.9 or later (`ssh -V`; Windows 11 has it, Windows 10 may need the newer
+  [Win32-OpenSSH](https://github.com/PowerShell/Win32-OpenSSH/releases)). Older ones don't tell the agent which
+  server they reached, so the prompt says the server is unknown. The ssh that comes with Git for Windows can't reach
+  the agent at all: `git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe`.
 
   Stop Windows' own `ssh-agent` service if you used it, and remove the keys you added to it (`ssh-add -D`): it keeps
   them in the registry, where any program running as you can have them used.
@@ -135,7 +143,12 @@ ssh -T git@github.com                       # Windows Hello asks
   `ssh load`.
 - **Weaker than on a Mac,** as everything on Windows is (see [windows.md](windows.md#weaker-than-on-a-mac)): any
   program running as you can ask Windows Hello for a signature with its own prompt text, so only touch for a prompt
-  you expected. It never gets the key.
+  you expected. The agent never hands a key to a client. But it runs for as long as you're logged on, and after a
+  signature its memory can still hold what Windows Hello unlocked (the store's key, the SSH key) until Go's garbage
+  collector reuses it: a program running as you that reads the agent's memory could then decrypt the store without
+  a prompt. `touchenv run` and `get` have the same exposure only for the moment they run.
+- **Not done yet:** it doesn't check for a locked screen (a request then leaves a prompt waiting behind it), and a
+  request whose ssh was cancelled still shows its prompt.
 - Refusals and signatures are logged to `%LOCALAPPDATA%\touchenv\ssh-agent.log`; `touchenv ssh agent status` shows
   the latest.
 - An SSH key moved with `export`/`import` (either way between a Mac and a PC) is an SSH key again on Windows:

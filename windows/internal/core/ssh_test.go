@@ -162,7 +162,7 @@ func TestSSHAddListSignRemove(t *testing.T) {
 	host, _ := ssh.NewSignerFromKey(hostPriv)
 	os.MkdirAll(filepath.Join(m.ssh.home, ".ssh"), 0o700)
 	os.WriteFile(filepath.Join(m.ssh.home, ".ssh", "known_hosts"),
-		[]byte("other.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"+
+		[]byte("this line is not a known_hosts line\nother.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"+
 			"github.com "+string(ssh.MarshalAuthorizedKey(host.PublicKey()))), 0o600)
 
 	c := m.agentClient(100)
@@ -195,6 +195,10 @@ func TestSSHAddListSignRemove(t *testing.T) {
 	before := len(m.h.prompts)
 	if _, err := c.Sign(pub, loginData([]byte("session-2"), "git", pub)); err == nil {
 		t.Fatal("signed a login for an unbound session")
+	}
+	// A user name that would break the prompt's lines.
+	if _, err := c.Sign(pub, loginData(session, "git with the SSH key X?\nServer: github.com", pub)); err == nil {
+		t.Fatal("signed a login whose user name has a line break")
 	}
 	// Something that is neither a login nor SSHSIG.
 	if _, err := c.Sign(pub, []byte("please sign this")); err == nil {
@@ -323,7 +327,7 @@ func TestSSHAgentConfig(t *testing.T) {
 	os.WriteFile(cfg, []byte(original), 0o600)
 
 	out := m.must("ssh", "agent", "install").stdout
-	if !strings.Contains(out, "add these lines") || !strings.Contains(out, `IdentityAgent \\.\pipe\touchenv-ssh-test`) {
+	if !strings.Contains(out, "add these lines") || !strings.Contains(out, `IdentityAgent "//./pipe/touchenv-ssh-test"`) {
 		t.Fatal(out)
 	}
 	if data, _ := os.ReadFile(cfg); string(data) != original {
@@ -372,5 +376,81 @@ func TestSSHKeyMovesWithExport(t *testing.T) {
 	pub, _ := ssh.NewPublicKey(priv.Public())
 	if ls := fresh.must("ssh", "ls").stdout; !strings.Contains(ls, "DEPLOY  ED25519 256  "+ssh.FingerprintSHA256(pub)) {
 		t.Fatal(ls)
+	}
+}
+
+// ssh -A: the connection is first bound to the host the agent is forwarded to; a login that host then asks for is
+// labelled as coming from it.
+func TestSSHForwardedRequestSaysSo(t *testing.T) {
+	m := newSSHMachine(t, 0)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	m.must("ssh", "add", writeKey(t, priv, ""))
+	pub, _ := ssh.NewPublicKey(priv.Public())
+	_, hopPriv, _ := ed25519.GenerateKey(rand.Reader)
+	hop, _ := ssh.NewSignerFromKey(hopPriv)
+	_, targetPriv, _ := ed25519.GenerateKey(rand.Reader)
+	target, _ := ssh.NewSignerFromKey(targetPriv)
+	os.MkdirAll(filepath.Join(m.ssh.home, ".ssh"), 0o700)
+	os.WriteFile(filepath.Join(m.ssh.home, ".ssh", "known_hosts"), []byte("bastion.example "+
+		string(ssh.MarshalAuthorizedKey(hop.PublicKey()))+"github.com "+string(ssh.MarshalAuthorizedKey(target.PublicKey()))), 0o600)
+
+	c := m.agentClient(100)
+	sig, _ := hop.Sign(rand.Reader, []byte("hop-session"))
+	var p []byte
+	p = append(p, sshString(hop.PublicKey().Marshal())...)
+	p = append(p, sshString([]byte("hop-session"))...)
+	p = append(p, sshString(ssh.Marshal(sig))...)
+	p = append(p, 1) // forwarding
+	if _, err := c.Extension("session-bind@openssh.com", p); err != nil {
+		t.Fatal(err)
+	}
+	bind(t, c, target, []byte("remote-session"))
+	if _, err := c.Sign(pub, loginData([]byte("remote-session"), "git", pub)); err != nil {
+		t.Fatal(err)
+	}
+	prompt := m.h.prompts[len(m.h.prompts)-1]
+	for _, want := range []string{"Server: github.com, its key as in your known_hosts.",
+		"Asked through agent forwarding (ssh -A) by bastion.example, its key as in your known_hosts, not by a program on this PC."} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt %q lacks %q", prompt, want)
+		}
+	}
+}
+
+func TestSSHConfigEdgeCases(t *testing.T) {
+	m := newSSHMachine(t, 0)
+	cfg := filepath.Join(m.ssh.home, ".ssh", "config")
+	os.MkdirAll(filepath.Dir(cfg), 0o700)
+
+	// Windows line endings are kept, and the first backup is never overwritten.
+	original := "Host work\r\n    User me\r\n"
+	os.WriteFile(cfg, []byte(original), 0o600)
+	m.must("ssh", "agent", "install", "--config")
+	data, _ := os.ReadFile(cfg)
+	if strings.Contains(strings.ReplaceAll(string(data), "\r\n", ""), "\n") || !strings.Contains(string(data), "IdentityAgent \"//./pipe/touchenv-ssh-test\"\r\n") {
+		t.Fatalf("config = %q", data)
+	}
+	if !strings.Contains(m.must("ssh", "agent", "status").stdout, cfg+" uses it") {
+		t.Fatal("status doesn't see a CRLF block")
+	}
+	m.must("ssh", "agent", "uninstall", "--config")
+	if data, _ := os.ReadFile(cfg); string(data) != original {
+		t.Fatalf("after uninstall: %q", data)
+	}
+	m.must("ssh", "agent", "install", "--config")
+	if backup, _ := os.ReadFile(cfg + ".touchenv-backup"); string(backup) != original {
+		t.Fatalf("backup = %q", backup)
+	}
+
+	// A begin marker with no end marker: nothing is changed.
+	broken := "Host a\n" + sshConfigBegin + "\nHost *\n    User keepme\n"
+	os.WriteFile(cfg, []byte(broken), 0o600)
+	for _, args := range [][]string{{"ssh", "agent", "install", "--config"}, {"ssh", "agent", "uninstall", "--config"}} {
+		if r := m.run(args...); r.code != 1 || !strings.Contains(r.stderr, "no end marker") {
+			t.Fatalf("%v: %d %q", args, r.code, r.stderr)
+		}
+		if data, _ := os.ReadFile(cfg); string(data) != broken {
+			t.Fatalf("%v changed a config it couldn't read safely: %q", args, data)
+		}
 	}
 }

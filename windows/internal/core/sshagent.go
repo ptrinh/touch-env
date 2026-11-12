@@ -19,6 +19,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -29,7 +31,8 @@ var sshTools = map[string]bool{"ssh": true, "scp": true, "sftp": true, "rsync": 
 	"ssh-add": true, "git-remote-https": true, "git-remote-ssh": true}
 
 const (
-	sshMaxWaiting = 4 // requests waiting for the one prompt shown at a time; more are refused at once
+	sshMaxWaiting = 4  // requests waiting behind the one prompt shown at a time; more are refused at once
+	sshMaxName    = 64 // runes of a user name or SSHSIG namespace shown in the prompt
 	sshLogMax     = 256 << 10
 )
 
@@ -120,13 +123,27 @@ func (r *sshReader) byte() (byte, bool) {
 	return v, true
 }
 
+// showable: text from the client that may go into the prompt as is: short, and nothing that could break the line
+// or hide what follows (spaces, control and formatting characters).
+func showable(b []byte) bool {
+	if len(b) == 0 || !utf8.Valid(b) || utf8.RuneCount(b) > sshMaxName {
+		return false
+	}
+	for _, r := range string(b) {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // parsePurpose reads what ssh wants signed: an ssh login (SSH_MSG_USERAUTH_REQUEST, RFC 4252 section 7) or an
 // SSHSIG signature (ssh-keygen -Y sign; git commit signing uses namespace "git"). Anything else is refused.
 func parsePurpose(data []byte) (sshPurpose, bool) {
 	if bytes.HasPrefix(data, []byte("SSHSIG")) {
 		r := sshReader{data[6:]}
 		ns, ok := r.bytes()
-		if !ok || len(ns) == 0 || len(ns) > 64 {
+		if !ok || !showable(ns) {
 			return sshPurpose{}, false
 		}
 		return sshPurpose{namespace: string(ns)}, true
@@ -137,7 +154,7 @@ func parsePurpose(data []byte) (sshPurpose, bool) {
 	user, ok3 := r.bytes()
 	service, ok4 := r.bytes()
 	method, ok5 := r.bytes()
-	if !(ok1 && ok2 && ok3 && ok4 && ok5) || kind != 50 || string(service) != "ssh-connection" || len(user) > 256 {
+	if !(ok1 && ok2 && ok3 && ok4 && ok5) || kind != 50 || string(service) != "ssh-connection" || !showable(user) {
 		return sshPurpose{}, false
 	}
 	p := sshPurpose{login: true, sessionID: session, user: string(user)}
@@ -178,8 +195,12 @@ func (a *sshAgent) knownHostNames(key ssh.PublicKey) []string {
 		}
 		for len(data) > 0 {
 			marker, hosts, pub, _, rest, err := ssh.ParseKnownHosts(data)
-			if err != nil {
-				break
+			if err != nil { // a line it can't read: skip it, not the rest of the file
+				if err == io.EOF || len(rest) >= len(data) {
+					break
+				}
+				data = rest
+				continue
 			}
 			data = rest
 			if marker != "" || !bytes.Equal(pub.Marshal(), key.Marshal()) {
@@ -203,14 +224,14 @@ func (a *sshAgent) serverLine(b *sshBinding) string {
 	if b == nil {
 		return "Server: unknown (this ssh didn't tell the agent which server it reached)."
 	}
-	forwarded := ""
-	if b.forwarding {
-		forwarded = " Through agent forwarding (ssh -A)."
+	return "Server: " + a.hostText(b.hostKey) + "."
+}
+
+func (a *sshAgent) hostText(key ssh.PublicKey) string {
+	if names := a.knownHostNames(key); len(names) > 0 {
+		return strings.Join(names, ", ") + ", its key as in your known_hosts"
 	}
-	if names := a.knownHostNames(b.hostKey); len(names) > 0 {
-		return fmt.Sprintf("Server: %s, its key as in your known_hosts.%s", strings.Join(names, ", "), forwarded)
-	}
-	return fmt.Sprintf("Server: not in your known_hosts (key %s).%s", ssh.FingerprintSHA256(b.hostKey), forwarded)
+	return "not in your known_hosts (key " + ssh.FingerprintSHA256(key) + ")"
 }
 
 // MARK: agent.ExtendedAgent
@@ -307,12 +328,18 @@ func (s *sshSession) sign(key ssh.PublicKey, data []byte, flags agent.SignatureF
 	}
 	who, via := a.requester(s.pid)
 	var what string
-	var binding *sshBinding
+	var binding, forwardedBy *sshBinding
 	if purpose.login {
 		if len(s.binds) > 0 {
 			for i := range s.binds {
 				if bytes.Equal(s.binds[i].sessionID, purpose.sessionID) {
 					binding = &s.binds[i]
+					break
+				}
+				// ssh -A binds the connection to the host it forwards the agent to first: what follows on this
+				// connection is asked by that host, not by a program on this PC.
+				if s.binds[i].forwarding && forwardedBy == nil {
+					forwardedBy = &s.binds[i]
 				}
 			}
 			if binding == nil {
@@ -341,13 +368,20 @@ func (s *sshSession) sign(key ssh.PublicKey, data []byte, flags agent.SignatureF
 	if purpose.login {
 		lines = append(lines, a.serverLine(binding))
 	}
+	if forwardedBy != nil || (binding != nil && binding.forwarding) {
+		from := binding
+		if forwardedBy != nil {
+			from = forwardedBy
+		}
+		lines = append(lines, "Asked through agent forwarding (ssh -A) by "+a.hostText(from.hostKey)+", not by a program on this PC.")
+	}
 	text := strings.Join(lines, "\n")
 
 	if err := a.c.h.Ready(); err != nil {
 		return nil, fmt.Errorf("%s for %s: nobody can answer Windows Hello here (%v)", name, who.Name, err)
 	}
 	a.mu.Lock()
-	if a.waiting >= sshMaxWaiting {
+	if a.waiting > sshMaxWaiting { // the one being asked, and sshMaxWaiting behind it
 		a.mu.Unlock()
 		return nil, fmt.Errorf("%s for %s: too many requests waiting", name, who.Name)
 	}

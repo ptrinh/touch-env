@@ -342,6 +342,7 @@ func (c *cmd) sshNextSteps(keyPath string) {
 		}
 	}
 	steps = append(steps, "ssh -T git@github.com     (or any server that has this key: Windows Hello asks)",
+		"for git: git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe     (Git's own ssh can't reach the agent)",
 		"then, once it works, delete the old file yourself: del \""+keyPath+"\"")
 	fmt.Fprintln(c.env.Stdout, "next:")
 	for i, s := range steps {
@@ -378,7 +379,7 @@ func (c *cmd) sshLs() error {
 		all = s.sshIdentities()
 	}
 	if len(all) == 0 {
-		io.WriteString(c.env.Stdout, "no SSH keys in touchenv; add one: touchenv ssh add %USERPROFILE%\\.ssh\\id_ed25519\n")
+		io.WriteString(c.env.Stdout, "no SSH keys in touchenv; add one: touchenv ssh add $HOME\\.ssh\\id_ed25519\n")
 		return nil
 	}
 	width := 0
@@ -386,7 +387,11 @@ func (c *cmd) sshLs() error {
 		width = max(width, len(id.name))
 	}
 	for _, id := range all {
-		c.writePub(id.name, s.SSHKeys[id.name]) // imported from another machine: give it its .pub here too
+		if path, err := c.sshPubPath(id.name); err == nil { // imported from another machine: give it its .pub here too
+			if have, _ := os.ReadFile(path); string(have) != s.SSHKeys[id.name]+"\n" {
+				c.writePub(id.name, s.SSHKeys[id.name])
+			}
+		}
 		fmt.Fprintf(c.env.Stdout, "%-*s  %s  %s  this PC\n", width, id.name, sshKeyLabel(id.pub), ssh.FingerprintSHA256(id.pub))
 	}
 	return nil
@@ -450,12 +455,26 @@ func (c *cmd) readSSHConfig() (string, error) {
 	return string(data), err
 }
 
+// sshConfigBlock: the lines for .ssh\config. The pipe is written with forward slashes, in quotes: ssh's config
+// parser turns "\\" into "\", so \\.\pipe\name would reach Windows as \.\pipe\name and never open.
 func sshConfigBlock(pipe string) string {
-	return sshConfigBegin + "\nHost *\n    IdentityAgent " + pipe + "\n" + sshConfigEnd + "\n"
+	return sshConfigBegin + "\nHost *\n    IdentityAgent \"" + strings.ReplaceAll(pipe, "\\", "/") + "\"\n" + sshConfigEnd + "\n"
 }
 
-// withoutBlock removes touchenv's block (the marker lines and what's between them); found says whether there was one.
-func withoutBlock(text string) (out string, found bool) {
+// unix: text with Windows line endings turned into "\n", to compare and edit; crlf says whether it had them.
+func unix(text string) (out string, crlf bool) {
+	return strings.ReplaceAll(text, "\r\n", "\n"), strings.Contains(text, "\r\n")
+}
+
+// hasBlock: whether the config holds touchenv's block for pipe, whatever its line endings.
+func hasBlock(text, pipe string) bool {
+	u, _ := unix(text)
+	return strings.Contains(u, sshConfigBlock(pipe))
+}
+
+// withoutBlock removes touchenv's block (the marker lines and what's between them); found says whether there was
+// one. A begin marker with no end marker after it is an error: removing "the block" would take the rest of the file.
+func withoutBlock(text string) (out string, found bool, err error) {
 	lines := strings.SplitAfter(text, "\n")
 	var kept []string
 	inside := false
@@ -470,18 +489,25 @@ func withoutBlock(text string) (out string, found bool) {
 			kept = append(kept, line)
 		}
 	}
-	return strings.Join(kept, ""), found
+	if inside {
+		return text, true, errors.New("touchenv's begin marker has no end marker after it")
+	}
+	return strings.Join(kept, ""), found, nil
 }
 
-// writeSSHConfig replaces .ssh\config with text, after copying it to config.touchenv-backup.
-func (c *cmd) writeSSHConfig(path, old, text string) error {
+// writeSSHConfig replaces .ssh\config with text (given with "\n"; written with the file's own line endings). The
+// first time, it copies the file as it was to config.touchenv-backup; that copy is never overwritten.
+func (c *cmd) writeSSHConfig(path, old, text string, crlf bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if old != "" {
+	if _, err := os.Stat(path + ".touchenv-backup"); old != "" && errors.Is(err, os.ErrNotExist) {
 		if err := c.p.WriteFilePrivate(path+".touchenv-backup", []byte(old)); err != nil {
 			return err
 		}
+	}
+	if crlf {
+		text = strings.ReplaceAll(text, "\n", "\r\n")
 	}
 	return c.p.WriteFilePrivate(path, []byte(text))
 }
@@ -507,22 +533,23 @@ func (c *cmd) sshAgentInstall(config bool) error {
 	if err != nil {
 		return die(1, "touchenv: %v", err)
 	}
+	original, err := c.readSSHConfig()
+	if err != nil {
+		return die(1, "touchenv: can't read %s: %v", path, err)
+	}
+	if hasBlock(original, pipe) {
+		fmt.Fprintf(c.env.Stdout, "%s already uses it\n", path)
+		return nil
+	}
 	if !config {
 		fmt.Fprintf(c.env.Stdout, "\nTo make ssh use it, add these lines to the end of %s (or run: touchenv ssh agent install --config):\n\n%s", path, sshConfigBlock(pipe))
 		return nil
 	}
-	old, err := c.readSSHConfig()
+	old, crlf := unix(original)
+	text, _, err := withoutBlock(old) // an older block, if any: replaced
 	if err != nil {
-		return die(1, "touchenv: can't read %s: %v", path, err)
+		return die(1, "touchenv: %s: %v; fix it by hand, nothing was changed", path, err)
 	}
-	if rest, found := withoutBlock(old); found {
-		if strings.Contains(old, sshConfigBlock(pipe)) {
-			fmt.Fprintf(c.env.Stdout, "%s already uses it\n", path)
-			return nil
-		}
-		old = rest // an older block: replace it
-	}
-	text := old
 	if text != "" && !strings.HasSuffix(text, "\n") {
 		text += "\n"
 	}
@@ -530,11 +557,11 @@ func (c *cmd) sshAgentInstall(config bool) error {
 		text += "\n"
 	}
 	text += sshConfigBlock(pipe)
-	if err := c.writeSSHConfig(path, old, text); err != nil {
+	if err := c.writeSSHConfig(path, original, text, crlf); err != nil {
 		return die(1, "touchenv: can't write %s: %v", path, err)
 	}
-	if old != "" {
-		fmt.Fprintf(c.env.Stdout, "added to %s (a copy of it before is in config.touchenv-backup):\n\n%s", path, sshConfigBlock(pipe))
+	if original != "" {
+		fmt.Fprintf(c.env.Stdout, "added to %s (the file as it was before touchenv is in config.touchenv-backup):\n\n%s", path, sshConfigBlock(pipe))
 	} else {
 		fmt.Fprintf(c.env.Stdout, "wrote %s:\n\n%s", path, sshConfigBlock(pipe))
 	}
@@ -553,11 +580,15 @@ func (c *cmd) sshAgentUninstall(config bool) error {
 	if err != nil {
 		return die(1, "touchenv: %v", err)
 	}
-	old, err := c.readSSHConfig()
+	original, err := c.readSSHConfig()
 	if err != nil {
 		return die(1, "touchenv: can't read %s: %v", path, err)
 	}
-	text, found := withoutBlock(old)
+	old, crlf := unix(original)
+	text, found, err := withoutBlock(old)
+	if err != nil {
+		return die(1, "touchenv: %s: %v; remove touchenv's lines by hand, nothing was changed", path, err)
+	}
 	switch {
 	case !found:
 		if config {
@@ -566,10 +597,10 @@ func (c *cmd) sshAgentUninstall(config bool) error {
 	case !config:
 		fmt.Fprintf(c.env.Stdout, "%s still points ssh at it: remove touchenv's lines (or run: touchenv ssh agent uninstall --config)\n", path)
 	default:
-		if err := c.writeSSHConfig(path, old, strings.TrimRight(text, "\n")+"\n"); err != nil {
+		if err := c.writeSSHConfig(path, original, strings.TrimRight(text, "\n")+"\n", crlf); err != nil {
 			return die(1, "touchenv: can't write %s: %v", path, err)
 		}
-		fmt.Fprintf(c.env.Stdout, "removed touchenv's lines from %s (a copy of it before is in config.touchenv-backup)\n", path)
+		fmt.Fprintf(c.env.Stdout, "removed touchenv's lines from %s\n", path)
 	}
 	return nil
 }
@@ -593,7 +624,7 @@ func (c *cmd) sshAgentStatus() error {
 		yes(atLogon, "starts at logon", "doesn't start at logon (touchenv ssh agent install)"))
 	path, _ := c.sshConfigPath()
 	text, _ := c.readSSHConfig()
-	fmt.Fprintf(c.env.Stdout, "ssh config: %s\n", yes(strings.Contains(text, sshConfigBlock(pipe)), path+" uses it",
+	fmt.Fprintf(c.env.Stdout, "ssh config: %s\n", yes(hasBlock(text, pipe), path+" uses it",
 		path+" doesn't use it (touchenv ssh agent install --config)"))
 	s, err := loadStore(c.p)
 	if err != nil {
