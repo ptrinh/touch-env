@@ -117,7 +117,9 @@ macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add A B C
 macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add --sync bad-name /x
 2 | err:touchenv: unknown option --local | ssh add --local /x
 2 | err:touchenv: unknown option --sync | ssh rm --sync A
-1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add /nonexistent/touchenv-test-key
+macos: 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add /nonexistent/touchenv-test-key
+# Git Bash rewrites /nonexistent/… into a Windows path before touchenv.exe sees it.
+windows: 1 | err:touchenv: can't read | ssh add /nonexistent/touchenv-test-key
 macos: 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add --sync MY_KEY /nonexistent/touchenv-test-key
 2 | err:usage: touchenv ssh ls | ssh ls A
 2 | err:usage: touchenv ssh rm NAME | ssh rm
