@@ -7,8 +7,9 @@
 //   touchenv run NAME[:file] [NAME2[:file] ...] -- command args...
 //                              run the command with each secret in env var NAME (one Touch ID for all);
 //                              ":file" puts it in a private temp file instead and NAME holds the path,
-//                              the file is removed when the command ends
-//   touchenv ls                list names, "(iCloud)" after synced ones (Touch ID: macOS guards even names; no values)
+//                              the file is removed when the command ends (a hang-up, TERM or QUIT is passed on
+//                              to the command first); one left by a killed touchenv goes at the next run
+//   touchenv ls               list names, "(iCloud)" after synced ones (Touch ID: macOS guards even names; no values)
 //   touchenv rm NAME           delete
 //   touchenv grant --for 8h --uses 20 NAME [NAME2 ...]
 //                              one Touch ID now; then the app that asked, and what it runs, reads those secrets
@@ -42,7 +43,8 @@
 // Synced items (set --sync) can't carry that access control, so iCloud Keychain will take them: only the signed app
 // can read them, and touchenv asks for Touch ID itself before every read.
 // The Touch ID prompt is touchenv's own window with the sensor embedded (LAAuthenticationView): who asks (the nearest
-// parent process that is not a shell), which secrets, the stated intent, and the command behind "More detail".
+// parent process that is not a shell; inside tmux or screen, that server), which secrets, the stated intent, and the
+// command: its first two lines always, all of it (a very long one as head and end) under "More detail", scrolling.
 // Without Touch ID, or on "Use Password…", the macOS dialog asks instead.
 // For run, the prompt offers "Don't ask again for 5 minutes" (only there: no flag, or an agent would always pass it).
 // Ticked, touchenv starts a background copy of itself (touchenv agent) that keeps those secrets in memory, each for 5
@@ -188,7 +190,7 @@ struct Requester { let pid: pid_t; let start: UInt64; let name: String; var isAg
 /// The nearest ancestor that is not a shell or a wrapper: the agent, or the terminal when you typed it yourself.
 func requester(from first: pid_t = getppid(), through extra: Set<String> = []) -> Requester {
     let passThrough: Set<String> = ["sh", "zsh", "bash", "fish", "dash", "ksh", "tcsh", "env", "sudo", "login",
-                                    "nohup", "time", "timeout", "xargs", "make", "script", "tmux", "screen"]
+                                    "nohup", "time", "timeout", "xargs", "make", "script"]
     // AI agents (by executable name, not the apps of the same name): they must say why (--intent).
     let agents: Set<String> = ["claude", "codex", "cursor-agent", "gemini", "aider", "goose", "opencode"]
     let known = ["claude": "Claude Code", "codex": "Codex", "cursor-agent": "Cursor", "Cursor": "Cursor",
@@ -197,17 +199,30 @@ func requester(from first: pid_t = getppid(), through extra: Set<String> = []) -
                  "Code Helper": "VS Code", "WezTerm": "WezTerm", "wezterm-gui": "WezTerm", "kitty": "kitty",
                  "alacritty": "Alacritty", "warp": "Warp", "stable": "Warp"]
     var pid = first
+    // tmux's and screen's servers are started by launchd, not by the terminal: inside one, the chain ends there.
+    var multiplexer: (pid: pid_t, name: String)?
     for _ in 0..<32 {
         guard pid > 1, let name = executableName(pid) else { break }
         let bare = name.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        if !passThrough.contains(bare) && !extra.contains(bare) {
-            return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? name, isAgent: agents.contains(name),
-                             exec: name)
+        if let kind = multiplexerKind(bare) {
+            if multiplexer == nil { multiplexer = (pid, kind) }
+        } else if !passThrough.contains(bare) && !extra.contains(bare) {
+            return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? visibleText(name, limit: 60),
+                             isAgent: agents.contains(name), exec: name)
         }
         guard let parent = parentPid(pid) else { break }
         pid = parent
     }
+    if let multiplexer, let start = startTime(multiplexer.pid) {
+        return Requester(pid: multiplexer.pid, start: start, name: multiplexer.name, exec: multiplexer.name)
+    }
     return Requester(pid: 0, start: 0, name: "a process")
+}
+
+/// "tmux" or "screen" for their processes (also "tmux: server", "SCREEN"), else nil.
+func multiplexerKind(_ name: String) -> String? {
+    let word = name.lowercased().split(whereSeparator: { $0 == ":" || $0 == " " }).first.map(String.init) ?? ""
+    return word == "tmux" || word == "screen" ? word : nil
 }
 
 /// The badge on the Touch ID disc: the icon of whoever asks. For an AI agent that runs in a terminal, its maker's
@@ -236,16 +251,49 @@ func requesterIcon(_ who: Requester = requester()) -> NSImage {
     return NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath)
 }
 
-func shortCommand(_ argv: [String]) -> String {
-    let joined = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
-    return joined.count > 160 ? String(joined.prefix(157)) + "…" : joined
+/// Text another process chose (its name, a command's arguments), made safe to show: a line break becomes ⏎ and a
+/// tab a space; any other control, format (a bidi override, strong()'s \u{1} and \u{2}), separator, private-use or
+/// unassigned character becomes �, so it can neither restyle the prompt nor disguise or hide what follows it.
+/// With `limit`, longer text keeps its head and tail (see elided).
+func visibleText(_ raw: String, limit: Int? = nil) -> String {
+    var scalars = String.UnicodeScalarView()
+    for scalar in raw.unicodeScalars {
+        switch scalar.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator, .surrogate, .privateUse, .unassigned:
+            scalars.append(scalar == "\n" || scalar == "\r" ? "⏎" : scalar == "\t" ? " " : "\u{FFFD}")
+        default:
+            scalars.append(scalar)
+        }
+    }
+    let text = String(scalars)
+    return limit.map { elided(text, limit: $0) } ?? text
 }
+
+/// At most about `limit` characters: the head and the tail, with how many were left out between them, so what comes
+/// last (the payload at the end of a long sh -c) is never cut off unseen.
+func elided(_ text: String, limit: Int) -> String {
+    guard text.count > limit else { return text }
+    let keep = max(limit - 30, 2)
+    let head = keep * 3 / 5, tail = keep - head
+    let hidden = text.count - head - tail
+    return String(text.prefix(head)) + " …[\(hidden) characters not shown]… " + String(text.suffix(tail))
+}
+
+/// A command line to show: each argument cleaned (visibleText), quoted when it has a space or is empty.
+func commandText(_ argv: [String]) -> String {
+    argv.map { argument -> String in
+        let shown = visibleText(argument)
+        return shown.isEmpty || shown.contains(" ") ? "'\(shown)'" : shown
+    }.joined(separator: " ")
+}
+
+func shortCommand(_ argv: [String]) -> String { elided(commandText(argv), limit: 160) }
 
 /// An AI agent must give a reason (--intent) for anything that asks for Touch ID or reads a secret, so the prompt
 /// always says why. Refused before any prompt: the agent reads the error and asks again with one.
-func requireIntent(_ intent: String?, example: String) {
+func requireIntent(_ intent: String?, example: String, who known: Requester? = nil) {
     guard intent == nil else { return }
-    let who = requester()
+    let who = known ?? requester()
     if who.isAgent {
         endAttempt("refused", note: "no --intent from an agent",
                    message: "touchenv: \(who.name) must say why, in a few words: \(example)\n"
@@ -333,12 +381,13 @@ func titleTextWithCopyIcons(_ marked: String) -> NSAttributedString {
 
 enum Outcome { case approved, denied, password }
 
-/// touchenv's own window: the question, the intent, the command behind "More detail", and the Touch ID sensor
+/// touchenv's own window: the question, the intent, the command (all of it under "More detail"), and the Touch ID sensor
 /// embedded, so macOS shows no dialog of its own. There is no Allow button: only a finger approves.
 final class Prompt: NSObject, NSTextViewDelegate {
     let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
     let detailToggle = NSButton(title: "More detail ›", target: nil, action: nil)
-    var detailField: NSTextField?
+    var detailPreview: NSTextField?
+    var detailScroll: NSScrollView?
     var sessionBox: NSButton?
     var keepFor5Minutes: Bool { sessionBox?.state == .on }
     var chosen: Outcome?
@@ -424,18 +473,61 @@ final class Prompt: NSObject, NSTextViewDelegate {
             views.append(label("No reason given. Check the command:", .systemFont(ofSize: 13), .systemOrange))
         }
         if let detail {
-            detailToggle.target = self
-            detailToggle.action = #selector(toggleDetail)
-            detailToggle.isBordered = false
-            detailToggle.refusesFirstResponder = true
-            detailToggle.contentTintColor = .linkColor
-            detailToggle.font = .systemFont(ofSize: 11)
-            let field = label(detail, .monospacedSystemFont(ofSize: 11, weight: .regular), .secondaryLabelColor)
-            field.isSelectable = true
-            field.isHidden = intent != nil
-            detailToggle.title = field.isHidden ? "More detail ›" : "Less detail ‹"
-            views += [detailToggle, field]
-            detailField = field
+            // The whole detail sits in a scroll view no taller than a third of the screen, so a long command never
+            // pushes Cancel off it. With an intent it starts folded to its first two lines: the command is always
+            // in view, "More detail" shows the rest.
+            let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: 10))
+            text.isEditable = false
+            text.isSelectable = true
+            text.drawsBackground = false
+            text.textContainerInset = .zero
+            text.textContainer?.lineFragmentPadding = 0
+            text.textContainer?.widthTracksTextView = true
+            text.isVerticallyResizable = true
+            text.isHorizontallyResizable = false
+            text.autoresizingMask = [.width]
+            text.textStorage?.setAttributedString(NSAttributedString(string: detail, attributes: [
+                .font: font, .foregroundColor: NSColor.secondaryLabelColor]))
+            var fullHeight: CGFloat = 0, lineHeight: CGFloat = 14
+            if let container = text.textContainer, let layout = text.layoutManager {
+                container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+                layout.ensureLayout(for: container)
+                fullHeight = ceil(layout.usedRect(for: container).height)
+                lineHeight = ceil(layout.defaultLineHeight(for: font))
+            }
+            text.frame.size.height = fullHeight
+            let maxHeight = min(240, max(80, (NSScreen.main?.visibleFrame.height ?? 800) / 3))
+            let scroll = NSScrollView()
+            scroll.documentView = text
+            scroll.hasVerticalScroller = fullHeight > maxHeight
+            scroll.autohidesScrollers = false
+            scroll.drawsBackground = false
+            scroll.borderType = .noBorder
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            scroll.widthAnchor.constraint(equalToConstant: width).isActive = true
+            scroll.heightAnchor.constraint(equalToConstant: min(fullHeight, maxHeight)).isActive = true
+            if fullHeight <= lineHeight * 2 + 1 {
+                views.append(scroll)   // two lines at most: all of it, nothing to fold
+            } else {
+                let preview = label(detail, font, .secondaryLabelColor)
+                preview.maximumNumberOfLines = 2
+                preview.lineBreakMode = .byCharWrapping
+                preview.cell?.truncatesLastVisibleLine = true
+                preview.isSelectable = false
+                detailToggle.target = self
+                detailToggle.action = #selector(toggleDetail)
+                detailToggle.isBordered = false
+                detailToggle.refusesFirstResponder = true
+                detailToggle.contentTintColor = .linkColor
+                detailToggle.font = .systemFont(ofSize: 11)
+                scroll.isHidden = intent != nil
+                preview.isHidden = !scroll.isHidden
+                detailToggle.title = scroll.isHidden ? "More detail ›" : "Less detail ‹"
+                views += [preview, scroll, detailToggle]
+                detailPreview = preview
+                detailScroll = scroll
+            }
         }
         if offerSession {
             let box = NSButton(checkboxWithTitle: "Don't ask again for 5 minutes", target: nil, action: nil)
@@ -492,13 +584,18 @@ final class Prompt: NSObject, NSTextViewDelegate {
     }
 
     @objc func toggleDetail() {
-        guard let field = detailField else { return }
-        field.isHidden.toggle()
-        detailToggle.title = field.isHidden ? "More detail ›" : "Less detail ‹"
+        guard let scroll = detailScroll, let preview = detailPreview else { return }
+        scroll.isHidden.toggle()
+        preview.isHidden = !scroll.isHidden
+        detailToggle.title = scroll.isHidden ? "More detail ›" : "Less detail ‹"
         let frame = panel.frame
         let size = panel.frameRect(forContentRect: NSRect(origin: .zero, size: panel.contentView!.fittingSize)).size
-        panel.setFrame(NSRect(x: frame.minX, y: frame.maxY - size.height, width: size.width, height: size.height),
-                       display: true, animate: true)
+        var y = frame.maxY - size.height
+        // Grown past the bottom of the screen: move it up, so the buttons stay on it.
+        if let visible = (panel.screen ?? NSScreen.main)?.visibleFrame, y < visible.minY {
+            y = min(visible.minY, visible.maxY - size.height)
+        }
+        panel.setFrame(NSRect(x: frame.minX, y: y, width: size.width, height: size.height), display: true, animate: true)
     }
 
     @objc func usePassword() { chosen = .password; context.invalidate() }
@@ -553,10 +650,10 @@ final class Prompt: NSObject, NSTextViewDelegate {
 /// Returns whether "Don't ask again for 5 minutes" was ticked (offered only with `offerSession`).
 @discardableResult
 func authenticate(_ title: String, intent: String?, detail: String? = nil, reason: String,
-                  offerSession: Bool = false) -> Bool {
+                  offerSession: Bool = false, asker: Requester? = nil) -> Bool {
     var keep = false
     if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) {
-        let prompt = Prompt(title: title, intent: intent, detail: detail, offerSession: offerSession)
+        let prompt = Prompt(title: title, intent: intent, detail: detail, offerSession: offerSession, asker: asker)
         let outcome = prompt.run(reason: reason)
         keep = prompt.keepFor5Minutes
         switch outcome {
@@ -637,8 +734,9 @@ func syncedNames() -> Set<String> {
 
 /// Whether the secret syncs through iCloud Keychain; nil when there is none. No Touch ID: a local item answers
 /// "interaction not allowed" when it exists.
-func synced(_ name: String) -> Bool? {
-    if syncedNames().contains(name) { return true }
+/// `all`: syncedNames(), when already at hand.
+func synced(_ name: String, among all: Set<String>? = nil) -> Bool? {
+    if (all ?? syncedNames()).contains(name) { return true }
     let probe = LAContext()
     probe.interactionNotAllowed = true
     var q = query(name)
@@ -665,10 +763,48 @@ func items() -> [String: Bool] {
 }
 
 /// Where the secrets live, for the prompt.
-func place(_ names: [String]) -> String {
-    let all = syncedNames()
+func place(_ names: [String], among all: Set<String>? = nil) -> String {
+    let all = all ?? syncedNames()
     let sync = Set(names.map { all.contains($0) })
     return sync == [true] ? "iCloud Keychain" : sync == [false] ? "your Keychain" : "your Keychain and iCloud Keychain"
+}
+
+/// Before a prompt: exits with "no secret named X" for the first name that isn't stored, so a typo costs no touch.
+/// No Touch ID (see synced).
+func requireStored(_ names: [String], among all: Set<String>? = nil) {
+    let all = all ?? syncedNames()
+    for name in names where synced(name, among: all) == nil {
+        endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)")
+    }
+}
+
+/// Gives a stored secret a new value. Where it lives stays the same unless `sync` differs from `wasSynced`: then
+/// the new item is added before the old one is deleted (synced or not is part of an item's identity, so the two
+/// can coexist for that moment), and a failed add leaves the old one as it was. `keep`: attributes of the old item
+/// to carry over (an SSH key's marker and public key line). Exits on a Keychain error.
+func replaceSecret(_ name: String, _ data: Data, sync: Bool, wasSynced: Bool, keep: [String] = []) {
+    var exact = query(name)
+    exact[kSecAttrSynchronizable as String] = wasSynced
+    if wasSynced == sync {
+        let status = SecItemUpdate(exact as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+        return
+    }
+    var extra: [String: Any] = [:]
+    if !keep.isEmpty {
+        var q = exact
+        q[kSecReturnAttributes as String] = true
+        var out: CFTypeRef?
+        if SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let old = out as? [String: Any] {
+            for key in keep { if let value = old[key] { extra[key] = value } }
+        }
+    }
+    add(name, data, sync: sync, extra: extra)
+    let status = SecItemDelete(exact as CFDictionary)
+    if status != errSecSuccess && status != errSecItemNotFound {
+        die("touchenv: stored the new \(name) \(sync ? "in iCloud Keychain" : "on this Mac only"), but couldn't delete "
+            + "the old one (keychain error \(status)); touchenv rm \(name) deletes both")
+    }
 }
 
 func add(_ name: String, _ data: Data, sync: Bool, extra: [String: Any] = [:]) {
@@ -713,8 +849,11 @@ func read(_ name: String) -> Data {
 
 func readStdin() -> Data {
     if isatty(0) != 0 {
-        guard let line = getpass("Secret (not shown): ") else { die("touchenv: no input") }
-        return Data(String(cString: line).utf8)
+        // The prompt goes to the terminal, as getpass() did, not to a redirected stdout.
+        let tty = open("/dev/tty", O_RDWR | O_CLOEXEC)
+        defer { if tty >= 0 { close(tty) } }
+        guard let data = readHiddenLine(tty >= 0 ? tty : 0, prompt: "Secret (not shown): ") else { die("touchenv: no input") }
+        return data
     }
     return FileHandle.standardInput.readDataToEndOfFile()
 }
@@ -1722,8 +1861,9 @@ func accessReport(_ entries: [AccessEntry], since: Date?, names: [String], summa
 struct AccessAttempt { var event: String; var secrets: [String]; var who: String; var program: String; var intent: String }
 var currentAttempt: AccessAttempt?
 
-func beginAttempt(_ event: String, _ names: [String], who: Requester, intent: String?) {
-    currentAttempt = AccessAttempt(event: event, secrets: names, who: who.name, program: callingProgram(who),
+func beginAttempt(_ event: String, _ names: [String], who: Requester, intent: String?, caller: Caller?? = nil) {
+    let program = caller.map { callingProgram(who, caller: $0) } ?? callingProgram(who)
+    currentAttempt = AccessAttempt(event: event, secrets: names, who: who.name, program: program,
                                    intent: intent ?? "")
 }
 
@@ -1913,6 +2053,38 @@ func pathSafetyProblem(_ path: String) -> String? {
 
 struct IdentityProblem: Error, CustomStringConvertible { let description: String; init(_ d: String) { description = d } }
 
+/// What `#!/usr/bin/env NAME` runs with this PATH: the real path of the first executable file NAME in it, the way
+/// env looks (an empty or relative entry is taken from `cwd`; no PATH means /usr/bin:/bin). nil when there is none.
+func envInterpreter(_ name: String, path: String?, cwd: String = FileManager.default.currentDirectoryPath) -> String? {
+    guard !name.isEmpty, !name.contains("/") else { return nil }
+    for entry in (path ?? "/usr/bin:/bin").split(separator: ":", omittingEmptySubsequences: false) {
+        let folder = entry.isEmpty ? cwd : entry.hasPrefix("/") ? String(entry) : cwd + "/" + entry
+        let candidate = folder + "/" + name
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory), !isDirectory.boolValue,
+           access(candidate, X_OK) == 0 {
+            return realPath(candidate) ?? candidate
+        }
+    }
+    return nil
+}
+
+/// Programs that run whatever code they are handed (a script, -c, -e): a standing grant to one of them reaches every
+/// script it runs. By file name, ignoring a version (python3.12, perl5.34).
+let codeRunners: Set<String> = ["python", "pythonw", "node", "nodejs", "deno", "bun", "ruby", "irb", "perl", "php",
+                                "lua", "luajit", "osascript", "jxa", "java", "jshell", "swift", "tclsh", "wish", "expect",
+                                "pwsh", "powershell", "rscript", "r", "julia", "elixir", "erl", "escript", "ghci",
+                                "runghc", "awk", "gawk", "nawk", "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh",
+                                "nu", "xonsh", "env", "xargs", "npx", "npm", "pnpm", "yarn", "uv", "uvx", "pipx", "make"]
+
+/// Whether a program (by path) runs whatever code it is given; see codeRunners.
+func runsAnyCode(_ path: String) -> Bool {
+    var name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+    if name.hasSuffix(".app") { return false }
+    while let last = name.last, last.isNumber || last == "." || last == "-" { name.removeLast() }
+    return codeRunners.contains(name)
+}
+
 /// What a standing grant for this path would be bound to: a script's real path and SHA-256, or a signed program's
 /// designated requirement. The secrets, times and counts are left for the caller to fill in.
 func identifyProgram(_ given: String) -> Result<StandingGrant, IdentityProblem> {
@@ -1930,7 +2102,25 @@ func identifyProgram(_ given: String) -> Result<StandingGrant, IdentityProblem> 
         if head.starts(with: Data("#!".utf8)) {
             let firstLine = String(decoding: head.prefix { $0 != 0x0A }.dropFirst(2), as: UTF8.self)
             var words = firstLine.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            if words.first == "/usr/bin/env", words.count > 1 { words = ["/bin/" + words[1]] }
+            if words.first == "/usr/bin/env", words.count > 1 {
+                let name = words[1]
+                words = ["/bin/" + name]
+                if interpreterPaths.contains("/bin/" + name) {
+                    // What env will run is the first one on PATH: a Homebrew bash, say, is not the Mac's own shell, so
+                    // the grant would never match and unattended runs would wait for Touch ID instead.
+                    switch envInterpreter(name, path: ProcessInfo.processInfo.environment["PATH"]) {
+                    case .some(let found) where interpreterPaths.contains(found):
+                        break
+                    case .some(let found):
+                        return .failure(IdentityProblem(
+                            "\(given) starts with #!/usr/bin/env \(name), which runs \(tilde(found)) here (the first \(name) "
+                            + "on your PATH), not the Mac's own /bin/\(name); standing grants trust only the shells in /bin, "
+                            + "so it would never match. Change its first line to #!/bin/\(name)"))
+                    case .none:
+                        return .failure(IdentityProblem("\(given) starts with #!/usr/bin/env \(name), and there is no \(name) on your PATH"))
+                    }
+                }
+            }
             guard let interpreter = words.first, interpreterPaths.contains(interpreter) else {
                 return .failure(IdentityProblem("\(given) is a script for \(words.first ?? "nothing"); standing grants take "
                                                 + "shell scripts (#!/bin/sh, bash, zsh, dash, ksh, csh) or signed programs"))
@@ -2024,8 +2214,11 @@ func interpretedScript(_ caller: Caller) -> String? {
 }
 
 /// The calling program's path for the log: the script when a shell runs one, else the asking app's executable.
-func callingProgram(_ who: Requester) -> String {
-    if let caller = callerInfo(getppid()), let script = interpretedScript(caller) { return script }
+func callingProgram(_ who: Requester) -> String { callingProgram(who, caller: callerInfo(getppid())) }
+
+/// The same, with the caller already looked up (callerInfo(getppid())).
+func callingProgram(_ who: Requester, caller: Caller?) -> String {
+    if let caller, let script = interpretedScript(caller) { return script }
     return who.pid > 1 ? processPath(who.pid) ?? "" : ""
 }
 
@@ -2382,6 +2575,60 @@ func withTypedPassword<T>(_ fd: Int32, prompt: String, _ body: (UnsafeBufferPoin
     }
     writeTTY(fd, "\n")
     return body(ended && count == 0 ? nil : UnsafeBufferPointer(start: buffer, count: count))
+}
+
+/// A secret typed (or pasted) at the terminal for touchenv set: echo off, read a byte at a time with the terminal's
+/// own line editing off, because getpass() stops at 128 characters and the terminal's line buffer at 1024, and either
+/// would store a cut API key without a word. Backspace and Ctrl-U still edit, Ctrl-D on an empty line ends the input,
+/// Ctrl-C stops it; the terminal comes back as it was every way out. nil at end of input; exits when the line is
+/// longer than `limit` bytes.
+func readHiddenLine(_ fd: Int32, prompt: String, limit: Int = 65536) -> Data? {
+    writeTTY(fd, prompt)
+    var saved = termios()
+    let isTerminal = tcgetattr(fd, &saved) == 0
+    var handlers: [(Int32, sig_t?)] = []
+    if isTerminal {
+        ttySavedState = saved
+        ttyEchoFd = fd
+        for s in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] { handlers.append((s, signal(s, ttySignalRestore))) }
+        handlers.append((SIGTSTP, signal(SIGTSTP, SIG_IGN)))
+        var raw = saved
+        raw.c_lflag &= ~tcflag_t(ECHO | ECHOE | ECHOK | ECHONL | ICANON | IEXTEN)
+        withUnsafeMutableBytes(of: &raw.c_cc) { $0[Int(VMIN)] = 1; $0[Int(VTIME)] = 0 }
+        tcsetattr(fd, TCSAFLUSH, &raw)   // also drops anything typed before the prompt
+    }
+    var bytes: [UInt8] = []
+    var ended = false, tooLong = false
+    var byte: UInt8 = 0
+    while true {
+        let n = read(fd, &byte, 1)
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 { ended = true; break }
+        if byte == 0x0A || byte == 0x0D { break }
+        if isTerminal {
+            if byte == 0x7F || byte == 0x08 {   // backspace: one whole UTF-8 character
+                while let last = bytes.popLast(), last & 0xC0 == 0x80 {}
+                continue
+            }
+            if byte == 0x15 { wipe(&bytes); bytes = []; continue }   // Ctrl-U
+            if byte == 0x04 {   // Ctrl-D
+                if bytes.isEmpty { ended = true; break }
+                continue
+            }
+        }
+        if bytes.count >= limit { tooLong = true; continue }   // read on to the end of the line, then say so
+        bytes.append(byte)
+    }
+    byte = 0
+    if isTerminal {
+        tcsetattr(fd, TCSANOW, &saved)
+        ttyEchoFd = -1
+        for (s, old) in handlers { signal(s, old) }
+    }
+    writeTTY(fd, "\n")
+    defer { wipe(&bytes) }
+    if tooLong { die("touchenv: that is longer than \(limit) bytes; for a file, use: touchenv set NAME < FILE") }
+    return ended && bytes.isEmpty ? nil : Data(bytes)
 }
 
 func withThrottleLock<T>(_ body: () -> T) -> T {
@@ -3610,16 +3857,21 @@ func sshAppendLog(_ line: String) {
 /// to ssh-keygen through SSH_ASKPASS: a two-line script in that folder that copies it from an inherited pipe (fd 3),
 /// so it is never in an argument, the environment or a file. Only the decrypted copy touches the disk, briefly.
 func convertWithSSHKeygen(_ original: [UInt8], passphrase: [UInt8]) throws -> [UInt8] {
-    var template = Array((FileManager.default.temporaryDirectory.path + "/touchenv-ssh-XXXXXX").utf8CString)
+    var template = Array((FileManager.default.temporaryDirectory.path + "/" + tempDirName("ssh") + "XXXXXX").utf8CString)
     guard let made = mkdtemp(&template) else { throw SSHFormatError("can't make a private temp folder") }
     let dir = String(cString: made)
+    // Ctrl-C, a hang-up, TERM or QUIT while the decrypted copy is on disk: ssh-keygen is stopped and the copy deleted.
+    registerTemp(folder: dir, files: [dir + "/key", dir + "/askpass"])
+    var previous: [(Int32, sig_t?)] = []
+    for s in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] { previous.append((s, signal(s, cleanUpAndExit))) }
     defer {
-        // Overwrite the copy before it goes.
-        if let size = (try? FileManager.default.attributesOfItem(atPath: dir + "/key"))?[.size] as? Int {
-            let fd = open(dir + "/key", O_WRONLY)
-            if fd >= 0 { _ = writeFull(fd, [UInt8](repeating: 0, count: size)); fsync(fd); close(fd) }
-        }
-        try? FileManager.default.removeItem(atPath: dir)
+        removeTempDir(dir)   // overwrites the copy before it goes
+        for (s, old) in previous { signal(s, old) }
+        tempChild = 0
+        tempFiles.forEach { free($0) }
+        tempFiles = []
+        free(tempFolder)
+        tempFolder = nil
     }
     guard chmod(dir, 0o700) == 0 else { throw SSHFormatError("can't make a private temp folder") }
     let keyFd = open(dir + "/key", O_WRONLY | O_CREAT | O_EXCL, 0o600)
@@ -3650,6 +3902,7 @@ func convertWithSSHKeygen(_ original: [UInt8], passphrase: [UInt8]) throws -> [U
     let env: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
     var pid = pid_t()
     let spawned = posix_spawn(&pid, "/usr/bin/ssh-keygen", &actions, &attributes, argv, env)
+    if spawned == 0 { tempChild = pid }
     argv.forEach { free($0) }
     env.forEach { free($0) }
     posix_spawn_file_actions_destroy(&actions)
@@ -3669,6 +3922,7 @@ func convertWithSSHKeygen(_ original: [UInt8], passphrase: [UInt8]) throws -> [U
     guard spawned == 0 else { throw SSHFormatError("can't run /usr/bin/ssh-keygen") }
     var status: Int32 = 0
     while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+    tempChild = 0   // reaped: its pid may be reused
     let message = String(decoding: errors, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     guard status == 0 else {
         if message.contains("incorrect passphrase") || message.contains("Bad passphrase") {
@@ -4022,6 +4276,93 @@ func serveSSHAgent() -> Never {
     }
     app.run()
     exit(0)
+}
+
+// MARK: Temp files (run NAME:file, ssh add's decrypted copy)
+
+// A private temp folder is named touchenv-PID-START-… (touchenv-ssh-PID-START-… for ssh add), after the touchenv
+// process that made it, so a later touchenv run can tell one left behind by a touchenv that is gone (killed with
+// SIGKILL, a crash) and delete it.
+
+func tempDirName(_ kind: String = "") -> String {
+    "touchenv-\(kind.isEmpty ? "" : kind + "-")\(getpid())-\(startTime(getpid()) ?? 0)-"
+}
+
+/// The pid and start time in a temp folder's name, or nil when it is not one of those.
+func tempDirOwner(_ name: String) -> (pid: pid_t, start: UInt64)? {
+    guard name.hasPrefix("touchenv-") else { return nil }
+    var rest = name.dropFirst("touchenv-".count)
+    if rest.hasPrefix("ssh-") { rest = rest.dropFirst(4) }
+    let parts = rest.split(separator: "-", maxSplits: 2, omittingEmptySubsequences: false)
+    // A start time in microseconds after 2001: an older touchenv's touchenv-UUID can't pass for one.
+    guard parts.count == 3, !parts[2].isEmpty, let pid = pid_t(parts[0]), pid > 0, let start = UInt64(parts[1]),
+          start > 1_000_000_000_000_000 else {
+        return nil
+    }
+    return (pid, start)
+}
+
+/// Overwrites the files in a temp folder with zeros, then deletes it.
+func removeTempDir(_ path: String) {
+    for file in (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? [] {
+        var st = stat()
+        guard lstat(path + "/" + file, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { continue }
+        let fd = open(path + "/" + file, O_WRONLY | O_NOFOLLOW | O_CLOEXEC)
+        if fd >= 0 { _ = writeFull(fd, [UInt8](repeating: 0, count: Int(st.st_size))); fsync(fd); close(fd) }
+    }
+    try? FileManager.default.removeItem(atPath: path)
+}
+
+/// Your temp folders in `dir` whose touchenv process is gone: `alive` says whether a pid with that start time runs.
+func staleTempDirs(in dir: String, alive: (pid_t, UInt64) -> Bool = { startTime($0) == $1 }) -> [String] {
+    ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).compactMap { name in
+        guard let owner = tempDirOwner(name), !alive(owner.pid, owner.start) else { return nil }
+        let path = dir + "/" + name
+        var st = stat()
+        guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR, st.st_uid == getuid() else { return nil }
+        return path
+    }
+}
+
+func sweepStaleTempDirs() {
+    for path in staleTempDirs(in: FileManager.default.temporaryDirectory.path) { removeTempDir(path) }
+}
+
+// What the signal handlers below need: plain globals, as C strings made beforehand.
+var tempFiles: [UnsafeMutablePointer<CChar>] = []
+var tempFolder: UnsafeMutablePointer<CChar>?
+var tempChild: pid_t = 0
+var tempSpawning = false
+var tempPendingSignal: Int32 = 0
+
+/// Registers a temp folder and the files that will be in it, for the signal handlers.
+func registerTemp(folder: String, files: [String]) {
+    tempFolder = strdup(folder)
+    tempFiles = files.map { strdup($0) }
+}
+
+func removeRegisteredTemp() {
+    for file in tempFiles { unlink(file) }
+    if let folder = tempFolder { rmdir(folder) }
+}
+
+/// touchenv run while it waits for the command: a hang-up (the terminal closed), TERM or QUIT is passed on to the
+/// command, and touchenv deletes the files once it has ended. Before the command started, the files go now and
+/// touchenv ends by that signal.
+func forwardOrCleanUp(_ signal: Int32) {
+    if tempChild > 0 { kill(tempChild, signal); return }
+    if tempSpawning { tempPendingSignal = signal; return }
+    removeRegisteredTemp()
+    Darwin.signal(signal, SIG_DFL)
+    raise(signal)
+}
+
+/// ssh add while ssh-keygen works on the decrypted copy: stop it, delete the copy, end by that signal.
+func cleanUpAndExit(_ signal: Int32) {
+    if tempChild > 0 { kill(tempChild, SIGKILL) }
+    removeRegisteredTemp()
+    Darwin.signal(signal, SIG_DFL)
+    raise(signal)
 }
 
 // MARK: Commands
@@ -4387,39 +4728,47 @@ case "set":
     let name = args[0]
     let data = readStdin()
     if data.isEmpty { die("touchenv: empty secret, nothing stored") }
+    let asker = requester()
     if let wasSynced = synced(name) {
-        beginAttempt("set", [name], who: requester(), intent: intent)
-        requireIntent(intent, example: "touchenv set --intent \"<why>\" \(name)")
-        let who = requester().name
-        let target = sync ? "iCloud Keychain" : "your Keychain"
-        authenticate("Allow \(who) to replace \(strong(name)) in \(target)?", intent: intent,
-                     reason: "let \(who) replace the secret \(name) in \(target)")
-        if wasSynced == sync {
-            let status = SecItemUpdate(query(name) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-            if status != errSecSuccess { die("touchenv: keychain error \(status)") }
-        } else {
-            // Syncing on or off changes the item's protection, which an update can't: store it anew.
-            let status = SecItemDelete(query(name) as CFDictionary)
-            if status != errSecSuccess { die("touchenv: keychain error \(status)") }
-            add(name, data, sync: sync)
-        }
-        logAttempt("replaced")
-        let copies = standingSecretChanged(name, to: data, who: requester().name)
+        beginAttempt("set", [name], who: asker, intent: intent)
+        requireIntent(intent, example: "touchenv set --intent \"<why>\" \(sync ? "--sync " : "")\(name)", who: asker)
+        let who = asker.name
+        // Syncing on or off is said in so many words: without --sync, a synced secret leaves every other Mac.
+        let (title, reason) = wasSynced == sync
+            ? ("Allow \(who) to replace \(strong(name)) in \(sync ? "iCloud Keychain" : "your Keychain")?",
+               "let \(who) replace the secret \(name)")
+            : sync ? ("Allow \(who) to replace \(strong(name)) and start syncing it? It goes into iCloud Keychain, on "
+                      + "your other Macs too, guarded by touchenv instead of macOS's own lock.",
+                      "let \(who) replace the secret \(name) and start syncing it through iCloud Keychain")
+                   : ("Allow \(who) to replace \(strong(name)) and stop syncing it? It is deleted from iCloud Keychain, "
+                      + "and so from your other Macs, and kept on this Mac only. (set --sync keeps it synced.)",
+                      "let \(who) replace the secret \(name) and stop syncing it: deleted from your other Macs")
+        authenticate(title, intent: intent, reason: reason, asker: asker)
+        replaceSecret(name, data, sync: sync, wasSynced: wasSynced,
+                      keep: [kSecAttrDescription as String, kSecAttrComment as String])
+        logAttempt("replaced", note: wasSynced == sync ? "" : sync ? "now synced" : "no longer synced")
+        let copies = standingSecretChanged(name, to: data, who: who)
         if copies > 0 { print("updated the copy \(copies) standing grant\(copies == 1 ? "" : "s") hold\(copies == 1 ? "s" : "") of \(name)") }
+        if wasSynced != sync {
+            print("stored \(name) (\(data.count) bytes), " + (sync ? "now synced through iCloud Keychain to your other Macs"
+                                                                    : "on this Mac only: no longer synced, deleted from iCloud Keychain"))
+            exit(0)
+        }
     } else {
         add(name, data, sync: sync)
-        logAccess(AccessEntry(event: "set", secrets: [name], outcome: "stored", who: requester().name,
-                              program: callingProgram(requester())))
+        logAccess(AccessEntry(event: "set", secrets: [name], outcome: "stored", who: asker.name,
+                              program: callingProgram(asker)))
     }
     print("stored \(name) (\(data.count) bytes)\(sync ? ", synced through iCloud Keychain" : "")")
 
 case "get":
     guard args.count == 1 else { die("usage: touchenv get NAME", 2) }
     let asker = requester()
-    beginAttempt("read", [args[0]], who: asker, intent: intent)
-    requireIntent(intent, example: "touchenv get --intent \"<why>\" \(args[0])")
+    let caller = callerInfo(getppid())
+    beginAttempt("read", [args[0]], who: asker, intent: intent, caller: caller)
+    requireIntent(intent, example: "touchenv get --intent \"<why>\" \(args[0])", who: asker)
     let who = asker.name
-    switch standingRead(names: [args[0]], caller: callerInfo(getppid()), who: who, intent: intent, stillThere: callerStillThere) {
+    switch standingRead(names: [args[0]], caller: caller, who: who, intent: intent, stillThere: callerStillThere) {
     case .secrets(let found):
         currentAttempt = nil
         FileHandle.standardOutput.write(found[args[0]]!)
@@ -4429,6 +4778,8 @@ case "get":
     case .none:
         break
     }
+    let syncedNow = syncedNames()
+    requireStored([args[0]], among: syncedNow)
     if usePassword {
         // The prompt and everything else go to the terminal; stdout gets only the secret.
         var summary = ["touchenv: show \(who) \(args[0]) from iCloud Keychain in full?"]
@@ -4436,20 +4787,26 @@ case "get":
         FileHandle.standardOutput.write(passwordRead(names: [args[0]], summary: summary, read: read)[args[0]]!)
         exit(0)
     }
-    authenticate("Show \(who) \(strong(args[0])) from \(place([args[0]])) in full?", intent: intent,
-                 reason: "show \(who) the secret \(args[0]) in full")
+    authenticate("Show \(who) \(strong(args[0])) from \(place([args[0]], among: syncedNow)) in full?", intent: intent,
+                 reason: "show \(who) the secret \(args[0]) in full", asker: asker)
     let value = read(args[0])
     logAttempt(ReadOutcome.touchID)
     FileHandle.standardOutput.write(value)
 
 case "rm":
     guard args.count == 1 else { die("usage: touchenv rm NAME", 2) }
-    beginAttempt("rm", [args[0]], who: requester(), intent: intent)
-    requireIntent(intent, example: "touchenv rm --intent \"<why>\" \(args[0])")
-    let who = requester().name
-    authenticate("Allow \(who) to delete \(strong(args[0])) from \(place([args[0]]))?", intent: intent,
-                 reason: "let \(who) delete the secret \(args[0])")
+    let asker = requester()
+    beginAttempt("rm", [args[0]], who: asker, intent: intent)
+    requireIntent(intent, example: "touchenv rm --intent \"<why>\" \(args[0])", who: asker)
+    let who = asker.name
+    let syncedNow = syncedNames()
+    requireStored([args[0]], among: syncedNow)
+    authenticate("Allow \(who) to delete \(strong(args[0])) from \(place([args[0]], among: syncedNow))?", intent: intent,
+                 reason: "let \(who) delete the secret \(args[0])", asker: asker)
     let status = SecItemDelete(query(args[0]) as CFDictionary)
+    if status == errSecItemNotFound {
+        endAttempt(ReadOutcome.refused, note: "no secret named \(args[0])", message: "touchenv: no secret named \(args[0])")
+    }
     if status != errSecSuccess { endAttempt(ReadOutcome.failed, note: "keychain error \(status)", message: "touchenv: keychain error \(status)") }
     logAttempt("deleted")
     let copies = standingSecretChanged(args[0], to: nil, who: who)
@@ -4471,16 +4828,20 @@ case "run":
         return (parts[0], parts.count == 2)
     }
     let argv = Array(args[(split + 1)...])
+    if specs.contains(where: \.file) { sweepStaleTempDirs() }
+    // Who asks and who ran touchenv, looked up once for the log, the checks and the prompt.
     let asker = requester()
-    beginAttempt("read", specs.map(\.name), who: asker, intent: intent)
-    requireIntent(intent, example: "touchenv run --intent \"<why>\" \(args[..<split].joined(separator: " ")) -- \(shortCommand(argv))")
+    let caller = callerInfo(getppid())
+    beginAttempt("read", specs.map(\.name), who: asker, intent: intent, caller: caller)
+    requireIntent(intent, example: "touchenv run --intent \"<why>\" \(args[..<split].joined(separator: " ")) -- \(shortCommand(argv))",
+                  who: asker)
     let names = specs.map(\.name).joined(separator: ", ")
-    let who = requester().name
+    let who = asker.name
     let wanted = specs.map(\.name)
     signal(SIGPIPE, SIG_IGN)
     var secrets: [String: Data] = [:]
     // A standing grant for the program that ran touchenv.
-    switch standingRead(names: wanted, caller: callerInfo(getppid()), who: who, intent: intent, stillThere: callerStillThere) {
+    switch standingRead(names: wanted, caller: caller, who: who, intent: intent, stillThere: callerStillThere) {
     case .secrets(let found):
         currentAttempt = nil
         secrets = found
@@ -4498,6 +4859,12 @@ case "run":
             logAttempt(via == "grant" ? ReadOutcome.grant : via == "5-minute" ? ReadOutcome.fiveMinute : "5-minute-or-grant")
         }
     }
+    var syncedNow: Set<String> = []
+    if !wanted.allSatisfy({ secrets[$0] != nil }) {
+        // A typo costs no touch: every name must be stored before anything asks.
+        syncedNow = syncedNames()
+        requireStored(wanted.filter { secrets[$0] == nil }, among: syncedNow)
+    }
     if !wanted.allSatisfy({ secrets[$0] != nil }) && usePassword {
         // No "Don't ask again for 5 minutes" from a password: each --password run asks; grant --password covers a while.
         var summary = ["touchenv: give \(who) \(names) from iCloud Keychain for the command: \(shortCommand(argv))?"]
@@ -4505,54 +4872,74 @@ case "run":
         secrets = passwordRead(names: wanted, summary: summary, read: read)
     }
     if !wanted.allSatisfy({ secrets[$0] != nil }) {
-        let full = argv.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
-        let keep = authenticate("Allow \(who) to read \(strong(wanted)) from \(place(wanted))?", intent: intent,
-                                detail: full.count > 2000 ? String(full.prefix(1999)) + "…" : full,
+        // The whole command, cleaned; a very long one keeps its head and its end (where a payload would be).
+        let keep = authenticate("Allow \(who) to read \(strong(wanted)) from \(place(wanted, among: syncedNow))?", intent: intent,
+                                detail: elided(commandText(argv), limit: 4000),
                                 reason: "give \(who) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))",
-                                offerSession: true)
+                                offerSession: true, asker: asker)
         for name in wanted where secrets[name] == nil { secrets[name] = read(name) }
         logAttempt(ReadOutcome.touchID, note: keep ? "\"Don't ask again for 5 minutes\" ticked" : "")
         if keep {
-            if !startAgent() || askAgent(["op": "grant", "secrets": secrets.mapValues { $0.base64EncodedString() }]) == nil {
-                FileHandle.standardError.write("touchenv: couldn't keep the approval; next time asks again\n".data(using: .utf8)!)
+            let kept = startAgent() ? askAgent(["op": "grant", "secrets": secrets.mapValues { $0.base64EncodedString() }]) : nil
+            if kept?["ok"] as? Bool != true {
+                let why = asker.pid > 1 ? "" : " (touchenv can't tell which app is asking, so there is nothing to keep it for)"
+                FileHandle.standardError.write("touchenv: couldn't keep the approval\(why); next time asks again\n".data(using: .utf8)!)
             }
         }
     }
 
+    // Every check before any file is written: nothing to leave behind on a refusal.
     var env = ProcessInfo.processInfo.environment
-    var tempDir: URL?
-    for spec in specs {
-        let data = secrets[spec.name]!
-        if spec.file {
-            if tempDir == nil {
-                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("touchenv-\(UUID().uuidString)")
-                do {
-                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false,
-                                                            attributes: [.posixPermissions: 0o700])
-                } catch { die("touchenv: \(error.localizedDescription)") }
-                tempDir = dir
-            }
-            let path = tempDir!.appendingPathComponent(spec.name)
-            FileManager.default.createFile(atPath: path.path, contents: data, attributes: [.posixPermissions: 0o600])
-            env[spec.name] = path.path
-        } else {
-            guard let value = String(data: data, encoding: .utf8) else {
-                die("touchenv: \(spec.name) is not text; use \(spec.name):file")
-            }
-            env[spec.name] = value
+    for spec in specs where !spec.file {
+        guard let value = String(data: secrets[spec.name]!, encoding: .utf8) else {
+            die("touchenv: \(spec.name) is not text; use \(spec.name):file")
         }
+        env[spec.name] = value
+    }
+    var tempDir: String?
+    let fileSpecs = specs.filter(\.file)
+    if !fileSpecs.isEmpty {
+        let dir = FileManager.default.temporaryDirectory.path + "/" + tempDirName() + UUID().uuidString
+        registerTemp(folder: dir, files: fileSpecs.map { dir + "/" + $0.name })
+        // From here a signal deletes the files: before the command starts, at once; after, once it has ended.
+        for s in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] { signal(s, forwardOrCleanUp) }
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch { die("touchenv: \(error.localizedDescription)") }
+        tempDir = dir
+        for spec in fileSpecs {
+            let path = dir + "/" + spec.name
+            guard FileManager.default.createFile(atPath: path, contents: secrets[spec.name]!,
+                                                 attributes: [.posixPermissions: 0o600]) else {
+                removeTempDir(dir)
+                die("touchenv: can't write \(path)")
+            }
+            env[spec.name] = path
+        }
+    } else {
+        for s in [SIGTERM, SIGHUP, SIGQUIT] { signal(s, forwardOrCleanUp) }
     }
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     process.arguments = argv
     process.environment = env
-    // Ctrl-C reaches the child through the terminal's process group; touchenv waits and still cleans up.
+    // Ctrl-C reaches the command through the terminal's process group; touchenv waits and still cleans up. A hang-up
+    // (the terminal closed), TERM or QUIT sent to touchenv is passed on to the command (forwardOrCleanUp).
     signal(SIGINT, SIG_IGN)
-    signal(SIGTERM) { _ in }
-    do { try process.run() } catch { die("touchenv: \(error.localizedDescription)") }
+    tempSpawning = true
+    do { try process.run() } catch {
+        tempSpawning = false
+        if let dir = tempDir { removeTempDir(dir) }
+        die("touchenv: \(error.localizedDescription)")
+    }
+    tempChild = process.processIdentifier
+    tempSpawning = false
+    if tempPendingSignal != 0 { kill(tempChild, tempPendingSignal) }
     process.waitUntilExit()
-    if let dir = tempDir { try? FileManager.default.removeItem(at: dir) }
+    tempChild = 0
+    if let dir = tempDir { removeTempDir(dir) }
     exit(process.terminationReason == .uncaughtSignal ? 128 + process.terminationStatus : process.terminationStatus)
 
 case "grant" where listGrants:
@@ -4603,8 +4990,9 @@ case "grant" where always || forProgram != nil:
     if grantUses != nil { example += " --uses \(grantUsesText)" }
     let asker = requester()
     currentAttempt = AccessAttempt(event: "grant", secrets: wanted, who: asker.name, program: grant.program, intent: intent ?? "")
-    requireIntent(intent, example: example + " \(wanted.joined(separator: " "))")
-    for name in wanted where synced(name) == nil { endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)") }
+    requireIntent(intent, example: example + " \(wanted.joined(separator: " "))", who: asker)
+    let syncedNow = syncedNames()
+    requireStored(wanted, among: syncedNow)
     var limits: [String] = []
     if let length = grantLength { limits.append("for \(Int(length / 86400) >= 2 ? "\(Int(length / 86400)) days" : spokenLength(length))") }
     if let uses = grantUses { limits.append("up to \(times(uses))") }
@@ -4612,8 +5000,19 @@ case "grant" where always || forProgram != nil:
     let identity = grant.kind == "script"
         ? "Script \(grant.program)\nSHA-256 \(grant.sha256 ?? "")\nIf the script changes, the grant stops working."
         : "Signed program \(grant.program)\nSigner: \(grant.signer ?? "?")\nRequirement: \(grant.requirement ?? "")"
-    let question = "Allow \(strong(tilde(grant.program))) to read \(strong(wanted)) from \(place(wanted)) without asking, "
+    // A program that runs any code it is handed (python, node, a shell…) passes the secrets to every script it runs.
+    let runsAnything = grant.kind == "signed" && runsAnyCode(grant.program)
+    let programName = URL(fileURLWithPath: grant.program).lastPathComponent
+    if runsAnything {
+        FileHandle.standardError.write("""
+            touchenv: warning: \(programName) runs whatever script or code it is given, so this grant reaches every \
+            script it runs, not one tool. Prefer a grant to a shell script (bound to its contents) or to a signed \
+            program that uses the secret itself.\n
+            """.data(using: .utf8)!)
+    }
+    let question = "Allow \(strong(tilde(grant.program))) to read \(strong(wanted)) from \(place(wanted, among: syncedNow)) without asking, "
         + "\(limitText)? Also while the Mac is locked. Any program running as you could start it and get them through it."
+        + (runsAnything ? " Warning: \(programName) runs any script it is given, so every script it runs gets them." : "")
     if usePassword {
         var summary = ["touchenv: " + question.filter { $0 != "\u{1}" && $0 != "\u{2}" }]
         if let intent { summary.append("  Intent: \(intent)") }
@@ -4621,7 +5020,7 @@ case "grant" where always || forProgram != nil:
         approveWithPassword(names: wanted, summary: summary)
     } else {
         authenticate(question, intent: intent, detail: identity,
-                     reason: "let \(tilde(grant.program)) read \(list) without asking, \(limitText)")
+                     reason: "let \(tilde(grant.program)) read \(list) without asking, \(limitText)", asker: asker)
     }
     var values: [String: Data] = [:]
     for name in wanted { values[name] = read(name) }
@@ -4639,6 +5038,7 @@ case "grant" where always || forProgram != nil:
     logAttempt("standing", note: [usePassword ? "approved with the Mac password typed in the terminal" : nil,
                                   limits.isEmpty ? "no limit" : limits.joined(separator: ", "),
                                   grant.kind == "script" ? "sha256 \(grant.sha256 ?? "")" : "signer \(grant.signer ?? "")",
+                                  runsAnything ? "warned: \(programName) runs any script it is given" : nil,
                                   replaced.map { "replaces the grant for \($0.names.joined(separator: ","))" }]
                                   .compactMap { $0 }.joined(separator: "; "))
     print("""
@@ -4791,7 +5191,10 @@ case "import":
     }
     if incoming.isEmpty { die("touchenv: \(path) holds no secrets") }
     let names = incoming.map(\.name)
-    let existing = Set(names.filter { synced($0) != nil })
+    let syncedNow = syncedNames()
+    var existingSync: [String: Bool] = [:]
+    for name in names { existingSync[name] = synced(name, among: syncedNow) }
+    let existing = Set(existingSync.keys)
     let who = requester().name
     var title = "Allow \(who) to add \(strong(names)) from \(from)?"
     if !existing.isEmpty {
@@ -4801,15 +5204,18 @@ case "import":
     authenticate(title, intent: intent, reason: "let \(who) add secrets from \(from)")
     var stored = 0
     for secret in incoming {
-        if existing.contains(secret.name) {
+        if let wasSynced = existingSync[secret.name] {
             guard replace else {
                 print("skipped \(secret.name): already here (touchenv import --replace to overwrite)")
                 continue
             }
-            let status = SecItemDelete(query(secret.name) as CFDictionary)
-            if status != errSecSuccess { die("touchenv: keychain error \(status)") }
+            // The new value goes in before the old one is deleted, and standing grants' copies follow it.
+            replaceSecret(secret.name, secret.data, sync: secret.sync, wasSynced: wasSynced)
+            let copies = standingSecretChanged(secret.name, to: secret.data, who: who)
+            if copies > 0 { print("updated the copy \(copies) standing grant\(copies == 1 ? "" : "s") hold\(copies == 1 ? "s" : "") of \(secret.name)") }
+        } else {
+            add(secret.name, secret.data, sync: secret.sync)
         }
-        add(secret.name, secret.data, sync: secret.sync)
         stored += 1
         print("stored \(secret.name) (\(secret.data.count) bytes)\(secret.sync ? ", synced through iCloud Keychain" : "")")
     }

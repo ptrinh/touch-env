@@ -42,8 +42,11 @@ with each test file:
   checked with `ssh-keygen -Y verify`, `ssh-add` and `ssh-keygen -Y sign` talking to the agent, a throwaway
   `ssh-agent` for `load`.
 - `tests/standing-tests.swift` runs the standing-grant checks on real shells and real signature checks, with the
-  grants kept in memory, and tests the access log.
-- `tests/password-tests.swift` drives the `--password` prompt on a pseudo-terminal with a fake password check.
+  grants kept in memory, and tests the access log; also how the prompt shows a command (cleaned, a long one as head
+  and end), `#!/usr/bin/env` resolved through PATH, the interpreter warning, tmux/screen names, and the sweep of
+  temp folders left by a killed `run`.
+- `tests/password-tests.swift` drives the `--password` prompt on a pseudo-terminal with a fake password check, and
+  the typed `set` prompt (a 2,000-character paste, line editing, Ctrl-D).
 
 None of it reads your keys, agent, config, Keychain or password, or shows a prompt.
 
