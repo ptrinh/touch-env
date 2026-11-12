@@ -162,3 +162,12 @@ stock agent first if it runs (`Get-Service ssh-agent`), so it can't answer inste
     shows the same entries as before. Uninstall with `--config`: the same.
 46. **Remove.** `touchenv ssh agent uninstall --config`: stopped, not at logon, the block gone from `.ssh\config`
     (backup kept). `touchenv ssh rm SSH_TENV_TEST`: one Hello prompt; the `.pub` is gone.
+
+## A signed release
+
+47. **Signature.** Download the release zip in Edge (so it carries the mark of the web), extract it, and in PowerShell
+    `Get-AuthenticodeSignature .\touchenv.exe`: `Valid`, signer `CN=SENPRINTS LLC`, a timestamp certificate. Explorer >
+    Properties > Digital Signatures shows the same. Run `touchenv version` from it: note whether SmartScreen or
+    Defender says anything. Do the same with the arm64 zip on an Arm PC.
+48. **The sign helper is signed too.** It is the same exe: during an SSH signature (42), Process Explorer shows the
+    `ssh agent sign` process with "(Verified) SENPRINTS LLC".

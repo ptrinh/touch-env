@@ -10,8 +10,17 @@ have not yet been tried on a real PC.
 Windows 10 or 11, x64 or Arm, with Windows Hello set up (a PIN at least; fingerprint or face too if you like).
 Download `touchenv-<version>-windows-x64.zip` (or `-arm64`) from
 [Releases](https://github.com/ptrinh/touch-env/releases/latest), check it against the `.sha256` file
-(`Get-FileHash touchenv-*.zip`), and put `touchenv.exe` in a folder on your `PATH`. The exe isn't code-signed yet,
-so SmartScreen may warn the first time.
+(`Get-FileHash touchenv-*.zip`), and put `touchenv.exe` in a folder on your `PATH`.
+
+`touchenv.exe` is code-signed by **SENPRINTS LLC** (Microsoft's Trusted Signing), with a timestamp, from the
+releases after 1.7.2 on (older zips aren't signed). To check it in PowerShell:
+
+```powershell
+Get-AuthenticodeSignature .\touchenv.exe | Format-List Status, SignerCertificate, TimeStamperCertificate
+```
+
+`Status` must be `Valid` and the signer's subject start with `CN=SENPRINTS LLC`. The certificate is new, so
+SmartScreen may still warn the first time until it has built a reputation; the signature is what to check.
 
 ## How it differs from the Mac
 
