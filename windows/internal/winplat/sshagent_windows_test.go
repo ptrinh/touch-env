@@ -43,56 +43,70 @@ func TestSSHAgentPipe(t *testing.T) {
 		t.Fatal("the agent didn't start serving")
 	}
 
-	// Clients of both kinds (ssh opens the pipe for overlapped I/O; other programs may not), writing at once and
-	// after the agent is already waiting to read. None may hang.
-	for _, c := range []struct {
-		name       string
-		overlapped bool
-		delay      time.Duration
-	}{{"overlapped", true, 0}, {"overlapped, agent reading first", true, 300 * time.Millisecond},
-		{"synchronous", false, 0}, {"synchronous, agent reading first", false, 300 * time.Millisecond}} {
-		flags := uint32(0)
-		if c.overlapped {
-			flags = windows.FILE_FLAG_OVERLAPPED
-		}
-		h, err := windows.CreateFile(utf16z(pipe), windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil,
-			windows.OPEN_EXISTING, flags, 0)
-		if err != nil {
-			t.Fatalf("%s: %v", c.name, err)
-		}
-		var conn io.ReadWriteCloser = os.NewFile(uintptr(h), pipe)
-		if c.overlapped {
-			if conn, err = newPipeConn(h); err != nil {
-				t.Fatal(err)
-			}
-		}
-		time.Sleep(c.delay)
-		listed := make(chan error, 1)
-		go func() {
-			keys, err := agent.NewClient(conn).List()
-			if err == nil && len(keys) != 0 {
-				err = fmt.Errorf("%d keys from an empty keyring", len(keys))
-			}
-			listed <- err
-		}()
+	// ssh opens the pipe for overlapped I/O. So does this client; Go's agent client reads in the background while
+	// it writes, which a synchronous handle can't do (the pending read would hold up the write for ever).
+	answered := func(name string, ask func() error) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- ask() }()
 		select {
-		case err := <-listed:
+		case err := <-done:
 			if err != nil {
-				t.Errorf("%s client: %v", c.name, err)
+				t.Errorf("%s client: %v", name, err)
 			}
-			conn.Close()
 		case <-time.After(10 * time.Second):
-			t.Errorf("%s client: no answer in 10 seconds", c.name) // left open: closing could block too
+			t.Errorf("%s client: no answer in 10 seconds", name)
 		}
 		select {
 		case pid := <-pids:
 			if pid != windows.GetCurrentProcessId() {
-				t.Errorf("%s client: pid %d, want %d", c.name, pid, windows.GetCurrentProcessId())
+				t.Errorf("%s client: pid %d, want %d", name, pid, windows.GetCurrentProcessId())
 			}
 		case <-time.After(2 * time.Second):
-			t.Errorf("%s client: the agent never saw it", c.name)
+			t.Errorf("%s client: the agent never saw it", name)
 		}
 	}
+	open := func(flags uint32) windows.Handle {
+		t.Helper()
+		h, err := windows.CreateFile(utf16z(pipe), windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil,
+			windows.OPEN_EXISTING, flags, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	for len(pids) > 0 { // pipeServer's probes
+		<-pids
+	}
+	answered("overlapped", func() error {
+		f := os.NewFile(uintptr(open(windows.FILE_FLAG_OVERLAPPED)), pipe)
+		defer f.Close()
+		keys, err := agent.NewClient(f).List()
+		if err == nil && len(keys) != 0 {
+			err = fmt.Errorf("%d keys from an empty keyring", len(keys))
+		}
+		return err
+	})
+	// A synchronous client that writes its request and then reads the answer, after the agent is already waiting.
+	answered("synchronous", func() error {
+		h := open(0)
+		defer windows.CloseHandle(h)
+		time.Sleep(300 * time.Millisecond)
+		var n uint32
+		if err := windows.WriteFile(h, []byte{0, 0, 0, 1, 11}, &n, nil); err != nil { // SSH_AGENTC_REQUEST_IDENTITIES
+			return err
+		}
+		reply := make([]byte, 9)
+		for got := 0; got < len(reply); got += int(n) {
+			if err := windows.ReadFile(h, reply[got:], &n, nil); err != nil {
+				return err
+			}
+		}
+		if want := []byte{0, 0, 0, 5, 12, 0, 0, 0, 0}; string(reply) != string(want) { // SSH_AGENT_IDENTITIES_ANSWER, none
+			return fmt.Errorf("reply % x, want % x", reply, want)
+		}
+		return nil
+	})
 
 	if err := (SSHHost{}).Serve(func(io.ReadWriteCloser, uint32) {}); err == nil {
 		t.Fatal("a second agent started beside the first")
