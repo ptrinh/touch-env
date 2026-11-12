@@ -29,10 +29,23 @@ programs running as you can't read them.
   icon, are read from the running processes: they tell you who asks, but a program could fake them.
 - **5-minute approvals and timed grants** hand the key to anything that app runs, without asking, until they end:
   including a command a booby-trapped web page talked an agent into. Each use flashes a notice. They are kept only
-  in the memory of touchenv's background copy, which hands them out only to touchenv itself, signed like it, and
-  only for processes under the app that was approved.
+  in the memory of touchenv's background copy, and only for processes under the app that was approved. Each key in a
+  5-minute approval has its own 5 minutes: approving another key later doesn't lengthen it. A 5-minute approval
+  given on an SSH signing prompt covers signatures only: `touchenv run` from that app still asks before handing out
+  the key itself.
+- **The background copy's socket.** Every message to and from touchenv's background copy is sealed (AES-GCM) with a
+  random key kept in the Keychain in touchenv's access group (this device only, no Touch ID lock, so reading it never
+  asks), which only the signed touchenv can read. A program running as you can connect to the socket, or put its own
+  in its place, but can't read what is sent there or make a request the background copy will take: checking the
+  code signature of the process at the other end alone isn't enough, because macOS describes whatever that process
+  runs *now*, and a program can connect and then start touchenv in its place. Each request also carries the sender's
+  process id, checked against the socket's, a time and a one-time number, so one can't be relayed through another
+  process or replayed; each reply is sealed to its request. Anything that doesn't open is refused, and touchenv asks
+  for Touch ID as if no approval existed.
 - **SSH keys loaded into `ssh-agent`** (`touchenv ssh load`) sign for any program running as you, without a prompt
-  or a notice, until the time runs out. See [ssh.md](ssh.md).
+  or a notice, until the time runs out. touchenv hands the key only to the ssh-agent launchd runs for macOS
+  (`com.openssh.ssh-agent`), recognised by the process serving the connection rather than by its signature alone.
+  See [ssh.md](ssh.md#loaded-into-ssh-agent-for-a-while).
 
 ## Standing grants
 
@@ -50,8 +63,10 @@ secrets without asking, also while the Mac is locked, until you revoke it.
   program can also start the script's shell with exported shell functions (`BASH_FUNC_…`, which `/bin/sh` takes
   too) or `BASH_ENV`; its own code then runs inside that shell and gets the secret, even when the script never
   prints it. macOS doesn't let touchenv see another process's environment to spot that. Between the shell reading
-  the script and touchenv checking its hash, a program running as you could swap the file and put it back. It is
-  not a defence against malware aimed at you.
+  the script and touchenv checking its hash, a program running as you could swap the file and put it back. And the
+  program is recognised as the process that ran touchenv, by its process id: a program can start a `touchenv get`
+  that waits a moment, then replace itself with the granted script or program (same process id, same start time),
+  and the read then passes for that program's. It is not a defence against malware aimed at you.
 - **Ending one** needs no Touch ID, so anything running as you can revoke a grant; that only means it asks again.
 
 ## Typing the Mac password

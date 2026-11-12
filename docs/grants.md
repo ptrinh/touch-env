@@ -17,7 +17,9 @@ Tick **Don't ask again for 5 minutes** on a `run` prompt (only `run` offers it; 
 always pass one). For those 5 minutes any command from that same app (that Claude Code session, say) gets those
 keys **without asking**, including one a booby-trapped page talked it into. Each use flashes a notice at the top
 right; the menu bar shows the time left and **Lock Now**. It never covers other apps or other keys, and ends when
-the app quits. Don't tick it for the keys that matter most.
+the app quits. Each key gets its own 5 minutes from the prompt that approved it: approving another key later doesn't
+lengthen the first one's. Ticked on an SSH signing prompt, it covers signatures with that key only, never a
+`touchenv run` or `get` of it. Don't tick it for the keys that matter most.
 
 ## While you step away: timed grants
 
@@ -80,8 +82,14 @@ It is not tied to the app that runs the program: scheduled tasks start it from `
 `claude` CLI, not from the terminal where you made the grant, and a rule like that would stop the very runs it is
 for.
 
+**The check is on the process, by its id.** touchenv checks its parent process, and the parent is known by process
+id and start time, which stay the same when a process replaces itself with another program. So a program running as
+you can start a `touchenv get` that waits a moment, then turn itself into the granted script or program: by the
+time touchenv looks, its parent *is* that program, and the read goes through. touchenv can't tell this apart, and
+macOS gives it no way to: treat a standing grant as reachable by anything running as you, as below.
+
 **What it does not stop.** Any program running as you can run that script or program and read what it prints, or
-start the script's shell with code of its own slipped in, and so get the secret. See
+start the script's shell with code of its own slipped in, or use the trick above, and so get the secret. See
 [security.md](security.md#standing-grants). Grant one program and the fewest secrets, and prefer a program that uses
 the secret itself over one that prints it.
 
@@ -99,6 +107,9 @@ touchenv lock --all          # ends standing grants too
 **Lock Now** in the menu bar ends 5-minute approvals and timed grants and leaves standing grants on. The menu bar
 icon shows only while a 5-minute approval or timed grant is on; its menu then also lists the standing grants.
 Revoking needs no Touch ID: anything running as you can end a grant, which only means it asks again.
+
+Right after an update from touchenv 1.7.2 or older, a background copy still running from before can't be used:
+touchenv says so and asks for Touch ID instead. `touchenv lock` (or **Lock Now**) ends it.
 
 ## Typing the Mac password instead (synced secrets only)
 

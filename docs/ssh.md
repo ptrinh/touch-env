@@ -49,7 +49,8 @@ the server.
   login for any other session, and looks the key up in your `known_hosts`: *Server: github.com, its key as in your
   known_hosts*. The name comes from the ssh command line, the key from the server. When ssh sends nothing, the
   prompt says the server is unknown. Commit signing (`gpg.format ssh`) reads *sign a git commit or tag*.
-- **Not asking every time.** "Don't ask again for 5 minutes" is on the prompt, and timed grants cover signatures:
+- **Not asking every time.** "Don't ask again for 5 minutes" is on the prompt (it covers signatures only: a
+  `touchenv run` of the key from the same app still asks), and timed grants cover signatures:
   `touchenv grant --for 1h --uses 50 SSH_ID_ED25519` before a long deploy. One use per signature; an ssh connection
   or a `git fetch` normally signs once. Each silent use flashes the usual notice. See [grants.md](grants.md).
 - **Locked screen, or a request through an SSH session to this Mac:** nobody can touch, so touchenv refuses at
@@ -70,7 +71,10 @@ the server.
 **What the socket protects.** It is `0600` in a `0700` folder: only programs running as you can connect. touchenv
 can't check who connects by code signature as it does for its own pieces (`ssh` is Apple's), so any program running
 as you can list your public keys and ask for a signature. Asking shows a prompt naming that program; it gets no
-signature without your touch or a grant or 5-minute approval that covers it, and never the key. The app named in the
+signature without your touch or a grant or 5-minute approval that covers it, and never the key: a 5-minute
+approval given on a signing prompt covers only signatures, so `touchenv run` of that key from the same app asks
+again. touchenv's SSH agent talks to touchenv's background copy over a socket whose messages are sealed with a key
+only touchenv can read (see [security.md](security.md#what-a-touch-approves)). The app named in the
 prompt is read from the processes (a program can call itself `ssh`); the server line is checked cryptographically.
 
 ## Loaded into ssh-agent for a while
@@ -80,8 +84,21 @@ touchenv ssh load --for 8h SSH_ID_ED25519    # one touch; 1 hour without --for, 
 touchenv ssh unload SSH_ID_ED25519
 ```
 
-The key goes to macOS's own `ssh-agent` (the one `SSH_AUTH_SOCK` names, checked to be Apple-signed) over its
-socket, with a lifetime, as `ssh-add -t` would, but straight from memory: no file, no `ssh-add`. Until the time runs
+The key goes to macOS's own `ssh-agent` over the socket `SSH_AUTH_SOCK` names, with a lifetime, as `ssh-add -t`
+would, but straight from memory: no file, no `ssh-add`.
+
+**Which ssh-agent.** Only the one launchd starts for macOS (`com.openssh.ssh-agent`, from
+`/System/Library/LaunchAgents`, running `/usr/bin/ssh-agent`). touchenv first has the agent list its keys, then asks
+the kernel which process served that connection and launchd which process is its ssh-agent: they must be the same
+process. A code-signature check alone isn't enough here: the socket's folder belongs to you, so a program running
+as you could put its own socket there, accept the connection, keep it open in a child process and turn itself into
+Apple's `ssh-agent`; it would pass a signature check and its child would read the key. The process launchd started
+was `ssh-agent` from its first instruction, and never hands a connection on, so that trick fails the check. An
+`ssh-agent` you started yourself (`eval $(ssh-agent)`) is refused: touchenv can't tell it from a program posing as
+one; use touchenv's own agent instead. If a macOS update changes what `launchctl print` shows, `load` refuses rather
+than guesses.
+
+Until the time runs
 out, **any program running as you can have ssh-agent sign with it, without a prompt and without a notice**. It
 can't take the key away: the agent protocol has no way to read a key back, and ssh-agent refuses debuggers, so
 getting it out of its memory takes root. With `ssh -A`, the servers you forward to can use it too.
