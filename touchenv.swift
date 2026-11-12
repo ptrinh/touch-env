@@ -85,7 +85,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.7.3"
+let version = "1.7.4"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
