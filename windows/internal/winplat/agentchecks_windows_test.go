@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -103,7 +104,9 @@ func TestRewriteFileKeepsACL(t *testing.T) {
 	if data, _ := os.ReadFile(path); string(data) != "Host *\n" {
 		t.Fatalf("%q", data)
 	}
-	if after := sddl(t, path); after != before {
+	// The entries, not the flags before them: Windows may add "AI" (auto-inherited) without changing who may do what.
+	entries := func(s string) string { return s[strings.Index(s, "("):] }
+	if after := sddl(t, path); entries(after) != entries(before) {
 		t.Fatalf("DACL changed: %s -> %s", before, after)
 	}
 	if left, _ := filepath.Glob(path + ".new-*"); len(left) != 0 {

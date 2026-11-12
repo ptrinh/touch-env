@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -190,7 +191,7 @@ func TestSSHConfigLink(t *testing.T) {
 	if !strings.Contains(string(data), "IdentityAgent") {
 		t.Fatalf("target = %q", data)
 	}
-	if info, _ := os.Stat(target); info.Mode().Perm() != 0o644 {
+	if info, _ := os.Stat(target); runtime.GOOS != "windows" && info.Mode().Perm() != 0o644 { // Windows has ACLs instead
 		t.Fatalf("mode %v", info.Mode().Perm())
 	}
 	m.must("ssh", "agent", "uninstall", "--config")

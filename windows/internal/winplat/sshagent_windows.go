@@ -38,6 +38,17 @@ var (
 	procConsoleList = kernel32.NewProc("GetConsoleProcessList")
 )
 
+// sameFile: whether two paths name one file. By the file itself where both can be read, so a short (8.3) name,
+// a different case or a link still match; by spelling otherwise.
+func sameFile(a, b string) bool {
+	if ia, err := os.Stat(a); err == nil {
+		if ib, err := os.Stat(b); err == nil {
+			return os.SameFile(ia, ib)
+		}
+	}
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
 type SSHHost struct{}
 
 func NewSSHHost() *SSHHost { return &SSHHost{} }
@@ -151,7 +162,7 @@ func (a pipeAnswer) checkServer(pid uint32) pipeAnswer {
 	}
 	path := windows.UTF16ToString(buf[:size])
 	for _, want := range []string{runKeyExe(), func() string { e, _ := ownExe(); return e }()} {
-		if want != "" && size > 0 && strings.EqualFold(filepath.Clean(path), filepath.Clean(want)) {
+		if want != "" && size > 0 && sameFile(path, want) {
 			a.ours = true
 			return a
 		}
