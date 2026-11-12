@@ -217,6 +217,82 @@ do {
     check(Agent.coveringGrant([used], names: ["SSH_A"], above: tree, now: now) == nil, "a used-up grant covers nothing")
 }
 
+// MARK: The agent socket: sealed messages, replays, per-secret approvals
+
+do {
+    let key = SymmetricKey(size: .bits256), other = SymmetricKey(size: .bits256)
+    let me = getpid(), myStart = startTime(getpid())!
+    var seen: [Data: Date] = [:]
+    let request = AgentWire.sealRequest(["op": "get", "names": ["A"]], key: key, pid: me, start: myStart)!
+    if case .success(let opened) = AgentWire.openRequest(request.data, key: key, peer: me, peerStart: myStart, seen: &seen) {
+        check(opened.message["op"] as? String == "get" && opened.nonce == request.nonce, "a sealed request opens")
+    } else { check(false, "a sealed request opens") }
+    func refusal(_ r: Result<(message: [String: Any], nonce: Data), AgentWire.Refusal>) -> AgentWire.Refusal? {
+        if case .failure(let why) = r { return why }
+        return nil
+    }
+    check(refusal(AgentWire.openRequest(request.data, key: key, peer: me, peerStart: myStart, seen: &seen)) == .replayed,
+          "the same request twice: refused")
+    var fresh: [Data: Date] = [:]
+    let lock = AgentWire.sealRequest(["op": "lock"], key: key, pid: me, start: myStart)!
+    check(refusal(AgentWire.openRequest(lock.data, key: other, peer: me, peerStart: myStart, seen: &fresh)) == .forged,
+          "sealed with another key: refused")
+    check(refusal(AgentWire.openRequest(lock.data, key: key, peer: me + 1, peerStart: myStart, seen: &fresh)) == .wrongPeer,
+          "relayed by another process: refused")
+    check(refusal(AgentWire.openRequest(lock.data, key: key, peer: me, peerStart: myStart + 1, seen: &fresh)) == .wrongPeer,
+          "a reused pid: refused")
+    let old = AgentWire.sealRequest(["op": "lock"], key: key, pid: me, start: myStart, now: Date() - 120)!
+    check(refusal(AgentWire.openRequest(old.data, key: key, peer: me, peerStart: myStart, seen: &fresh)) == .stale,
+          "a request two minutes old: refused")
+    let plain = try! JSONSerialization.data(withJSONObject: ["op": "get", "names": ["A"], "for": 1, "forStart": 1])
+    check(refusal(AgentWire.openRequest(plain, key: key, peer: me, peerStart: myStart, seen: &fresh)) == .notSealed,
+          "an old touchenv's plain JSON: not taken as a request")
+    var tampered = AgentWire.box(lock.data)!
+    tampered[tampered.count - 1] ^= 1
+    check(refusal(AgentWire.openRequest(AgentWire.envelope(tampered)!, key: key, peer: me, peerStart: myStart, seen: &fresh)) == .forged,
+          "a changed byte: refused")
+    // Replies are sealed to their request.
+    let reply = AgentWire.sealReply(["ok": true, "secrets": ["A": "eA=="]], key: key, nonce: request.nonce)!
+    check(AgentWire.openReply(reply, key: key, nonce: request.nonce)?["ok"] as? Bool == true, "a reply opens")
+    check(AgentWire.openReply(reply, key: key, nonce: lock.nonce) == nil, "a reply to another request doesn't")
+    check(AgentWire.openReply(reply, key: other, nonce: request.nonce) == nil, "a reply under another key doesn't")
+    check(refusal(AgentWire.openRequest(reply, key: key, peer: me, peerStart: myStart, seen: &fresh)) == .forged,
+          "a reply reflected back as a request: refused")
+    check(AgentWire.openReply(request.data, key: key, nonce: request.nonce) == nil, "a request reflected as a reply: refused")
+    check(!String(decoding: request.data, as: UTF8.self).contains("names"), "nothing readable on the wire")
+}
+do {
+    let t0 = Date()
+    var a = Agent.Approval(start: 1, who: "Terminal", secrets: [:])
+    a = Agent.adding(["A": Data([1])], signOnly: false, to: a, now: t0)
+    a = Agent.adding(["B": Data([2])], signOnly: false, to: a, now: t0 + 290)
+    check(Agent.approved(a, names: ["A", "B"], signing: false, now: t0 + 299) != nil, "both approved within A's 5 minutes")
+    check(Agent.approved(a, names: ["A"], signing: false, now: t0 + 301) == nil, "a later approval of B doesn't extend A")
+    check(Agent.approved(a, names: ["B"], signing: false, now: t0 + 589) != nil, "B runs its own 5 minutes")
+    check(Agent.approved(a, names: ["A", "B"], signing: false, now: t0 + 301) == nil, "all or nothing")
+    check(Agent.approved(a, names: ["A", "B"], signing: false, now: t0 + 10)?.ends == t0 + 300, "the notice counts down to the first end")
+    check(Agent.groups(a, now: t0 + 10).map(\.names) == [["A"], ["B"]], "the menu shows each end")
+    check(Agent.groups(a, now: t0 + 301).map(\.names) == [["B"]], "the menu drops A when it ends")
+    // From touchenv's SSH agent: signatures only.
+    var s = Agent.Approval(start: 1, who: "Terminal", secrets: [:])
+    s = Agent.adding(["SSH_K": Data([3])], signOnly: true, to: s, now: t0)
+    check(Agent.approved(s, names: ["SSH_K"], signing: false, now: t0 + 1) == nil, "an SSH approval doesn't hand out the key")
+    check(Agent.approved(s, names: ["SSH_K"], signing: true, now: t0 + 1) != nil, "an SSH approval covers a signature")
+    check(Agent.groups(s, now: t0).first?.signOnly == true, "listed as signing only")
+    // A run approval of the same key lets ssh sign too; a later SSH approval narrows it.
+    var r = Agent.adding(["SSH_K": Data([3])], signOnly: false, to: Agent.Approval(start: 1, who: "T", secrets: [:]), now: t0)
+    check(Agent.approved(r, names: ["SSH_K"], signing: true, now: t0 + 1) != nil, "a run approval covers signing too")
+    r = Agent.adding(["SSH_K": Data([3])], signOnly: true, to: r, now: t0 + 10)
+    check(Agent.approved(r, names: ["SSH_K"], signing: false, now: t0 + 11) == nil, "the newer, signing-only approval wins")
+}
+do {
+    let text = "gui/501/com.openssh.ssh-agent = {\n\tactive count = 1\n\tpath = /System/Library/LaunchAgents/com.openssh.ssh-agent.plist\n"
+        + "\tprogram = /usr/bin/ssh-agent\n\tinherited environment = {\n\t\tpid = 9\n\t}\n\tpid = 22821\n}\n"
+    let job = parseLaunchdJob(text)
+    check(job?.pid == 22821 && job?.program == "/usr/bin/ssh-agent" && job?.path == macSSHAgentPlist, "launchctl print parsed: \(String(describing: job))")
+    check(parseLaunchdJob(text.replacingOccurrences(of: "\tpid = 22821\n", with: "")) == nil, "a job not running: no pid")
+}
+
 // MARK: Command lines, known_hosts, names
 
 do {
@@ -253,11 +329,12 @@ final class Recorder {
     var inside = 0, maxInside = 0
     var refuse = false
     var cover = false
+    var listings = 0
 }
 let recorder = Recorder()
 var logLines: [String] = []
 let server = SSHAgentServer(
-    identities: { identities },
+    identities: { recorder.lock.lock(); recorder.listings += 1; recorder.lock.unlock(); return identities },
     covered: { a in
         recorder.lock.lock(); defer { recorder.lock.unlock() }
         return recorder.cover ? storedText[String(a.identity.name.dropFirst(4)).lowercased()] : nil
@@ -301,6 +378,7 @@ do {
     check(sh(["/usr/bin/ssh-add", "-d", testDir + "/ed.pub"], env: agentEnv).status != 0, "ssh-add -d refused")
     check(logLines.contains { $0.contains("add, remove or lock") }, "refusals logged")
 }
+recorder.listings = 0
 for name in ["ed", "ec384", "rsa2048"] {
     try? FileManager.default.removeItem(atPath: testDir + "/msg.sig")
     let r = sh(["/usr/bin/ssh-keygen", "-Y", "sign", "-f", testDir + "/\(name).pub", "-n", "git", testDir + "/msg"], env: agentEnv)
@@ -310,6 +388,7 @@ for name in ["ed", "ec384", "rsa2048"] {
     check(v.status == 0, "\(name): agent signature verifies: \(v.out)\(v.err)")
 }
 check(recorder.asks.count == 3 && recorder.asks.allSatisfy { $0.purpose == .sshsig(namespace: "git") }, "each signature asked; purpose git")
+check(recorder.listings <= 3, "keys listed once per connection, not per request: \(recorder.listings) listings for 3 signatures")
 check(recorder.asks.first?.action == "sign a git commit or tag", "git signing is named")
 check(recorder.asks.first?.via.contains("ssh-keygen") == true, "via ssh-keygen: \(recorder.asks.first?.via ?? [])")
 do {
@@ -492,6 +571,12 @@ do {
     for _ in 0..<50 where fd == nil { usleep(50_000); fd = connectUnix("stock.sock") }
     if let fd {
         check(peerIsApple(fd), "Apple's ssh-agent passes the peer check")
+        var list = SSHWriter()
+        list.u8(11)
+        check(agentRequest(fd, list.bytes)?.first == 12, "the throwaway ssh-agent lists its keys")
+        // Apple's binary, but started by us, not launchd's job: it could have been exec'd by anything. (Reads launchd's
+        // description of your com.openssh.ssh-agent job; touches neither it nor its socket.)
+        check(macSSHAgentProblem(fd) != nil, "an ssh-agent that isn't launchd's own: refused for ssh load")
         let key = parsed["ec521"]!
         check(agentRequest(fd, addIdentityMessage(key, comment: "SSH_EC521", seconds: 120)) == SSHAgentServer.success, "added with a lifetime")
         let rsaKey = parsed["rsa3072"]!

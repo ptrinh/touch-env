@@ -33,7 +33,8 @@
 //                              touchenv as ssh's agent (IdentityAgent): a LaunchAgent whose socket launchd holds;
 //                              every signature asks for Touch ID, unless a grant or a 5-minute approval covers it
 //   touchenv ssh load [--for 1h] NAME ... · ssh unload NAME ...
-//                              one Touch ID, then the key is in the stock ssh-agent for that long
+//                              one Touch ID, then the key is in the stock ssh-agent for that long (only launchd's
+//                              com.openssh.ssh-agent, identified by the pid serving the connection)
 //
 // Items are generic passwords (service "touchenv") in the Data Protection keychain, in the keychain access group
 // the signed touchenv.app holds (its only keychain-access-groups entitlement), with a userPresence access control:
@@ -44,16 +45,20 @@
 // parent process that is not a shell), which secrets, the stated intent, and the command behind "More detail".
 // Without Touch ID, or on "Use Password…", the macOS dialog asks instead.
 // For run, the prompt offers "Don't ask again for 5 minutes" (only there: no flag, or an agent would always pass it).
-// Ticked, touchenv starts a background copy of itself (touchenv agent) that keeps those secrets in memory for 5
-// minutes and hands them to later touchenv runs from the same requester (same pid and start time). Both ends check
-// that the other is touchenv signed like itself. A menu bar timer shows the approval; each use flashes a notice.
+// Ticked, touchenv starts a background copy of itself (touchenv agent) that keeps those secrets in memory, each for 5
+// minutes from its own approval, and hands them to later touchenv runs from the same requester (same pid and start
+// time). Every message on its socket is AES-GCM sealed with a key only the signed touchenv can read from the Keychain
+// (see "The background copy's socket" below); both ends also check the other's code signature. One approved from
+// touchenv's SSH agent is good for signatures only, never for run. A menu bar timer shows the approval; each use
+// flashes a notice.
 // grant: the same background copy keeps the named secrets for the length given (24 hours at most) and a number of
 // uses (one per touchenv run). It covers the requester of the grant command and every process below it, checked from
 // the kernel's process tree, and goes on while the screen is locked. It ends at the time, at the last use, on
 // touchenv lock, when that requester quits, or at logout.
 // grant --always: a standing grant to one program (a shell script, by real path and SHA-256, or a signed program, by
 // designated requirement), kept as a Keychain item in touchenv's access group with a copy of the secrets; get and run
-// check the process that ran them against it and read without a prompt (see "Standing grants" below). lock leaves
+// check the process that ran them (their parent, by pid) against it and read without a prompt (see "Standing
+// grants" below). That parent can have forked touchenv before it exec'd the granted program: docs/grants.md. lock leaves
 // those on unless --all. Every read, grant, revoke, set, rm, export and import is a line in the access log
 // (~/Library/Logs/touchenv-access-YYYY-MM.log, kept two years; see "The access log" below).
 // export/import: the receiving key lives in the new Mac's Secure Enclave (a keychain item, this device only, when there
@@ -788,7 +793,9 @@ func socketAddress(_ path: String) -> sockaddr_un {
     return address
 }
 
-/// Whether the process at the other end of the socket is touchenv, signed like this one.
+/// Whether the process at the other end of the socket is touchenv, signed like this one. Defence in depth only: the
+/// kernel describes whatever that pid runs now, so a process that connects and then execs touchenv passes. What
+/// actually guards the socket is the sealing below.
 func peerIsTouchenv(_ fd: Int32) -> Bool {
     var token = audit_token_t()
     var length = socklen_t(MemoryLayout<audit_token_t>.size)
@@ -808,9 +815,132 @@ func peerPid(_ fd: Int32) -> pid_t? {
     return getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0 ? pid : nil
 }
 
-/// One JSON message each way: write it, then close the writing half.
+// The background copy's socket: every message sealed.
+//
+// Each message on touchenv-agent.sock is AES-GCM sealed with a 32-byte key kept as a Keychain item in touchenv's
+// access group (service "touchenv-agent-key", this device only, readable after first unlock, no Touch ID lock, so
+// reading it never shows a prompt; made by whichever touchenv needs it first). Only the signed touchenv can read that
+// item, so a process that merely passes the code-signature check (connect, then exec touchenv) can neither forge a
+// request nor read a reply. A request carries the sender's pid and start time, a time and a random nonce, all
+// sealed: the agent refuses one whose pid is not the socket's peer (a relay), whose time is off by more than a
+// minute, or whose nonce it has seen. A reply is sealed to that request's nonce, so it can't be replayed to another
+// client or reflected back as a request. On the wire: {"touchenv": 2, "box": base64(nonce | ciphertext | tag)}.
+
+let agentKeyService = "touchenv-agent-key"
+let agentWireVersion = 2
+let agentRequestWindow: TimeInterval = 60
+
+enum AgentWire {
+    static let requestLabel = Data("touchenv-agent request \(agentWireVersion)".utf8)
+    static let replyLabel = Data("touchenv-agent reply \(agentWireVersion)".utf8)
+
+    static func envelope(_ box: Data) -> Data? {
+        try? JSONSerialization.data(withJSONObject: ["touchenv": agentWireVersion, "box": box.base64EncodedString()])
+    }
+
+    /// The sealed box inside an envelope; nil for anything else (an old touchenv's plain JSON, garbage).
+    static func box(_ data: Data) -> Data? {
+        guard let outer = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              outer["touchenv"] as? Int == agentWireVersion, let text = outer["box"] as? String else { return nil }
+        return Data(base64Encoded: text)
+    }
+
+    /// A request, sealed: the bytes to send and the nonce its reply will be sealed to.
+    static func sealRequest(_ message: [String: Any], key: SymmetricKey, pid: pid_t, start: UInt64,
+                            now: Date = Date()) -> (data: Data, nonce: Data)? {
+        let nonce = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        let inner: [String: Any] = ["m": message, "pid": Int(pid), "start": NSNumber(value: start),
+                                    "time": now.timeIntervalSince1970, "nonce": nonce.base64EncodedString()]
+        guard let plain = try? JSONSerialization.data(withJSONObject: inner),
+              let sealed = try? AES.GCM.seal(plain, using: key, authenticating: requestLabel).combined,
+              let data = envelope(sealed) else { return nil }
+        return (data, nonce)
+    }
+
+    enum Refusal: Error, Equatable { case notSealed, forged, wrongPeer, stale, replayed }
+
+    /// Opens a request from `peer` (pid and start time, as the kernel says), remembering its nonce in `seen`.
+    static func openRequest(_ data: Data, key: SymmetricKey, peer: pid_t, peerStart: UInt64?, now: Date = Date(),
+                            seen: inout [Data: Date]) -> Result<(message: [String: Any], nonce: Data), Refusal> {
+        guard let box = box(data) else { return .failure(.notSealed) }
+        guard let sealed = try? AES.GCM.SealedBox(combined: box),
+              let plain = try? AES.GCM.open(sealed, using: key, authenticating: requestLabel),
+              let inner = (try? JSONSerialization.jsonObject(with: plain)) as? [String: Any],
+              let message = inner["m"] as? [String: Any], let pid = inner["pid"] as? Int,
+              let start = (inner["start"] as? NSNumber)?.uint64Value, let time = inner["time"] as? Double,
+              let nonceText = inner["nonce"] as? String, let nonce = Data(base64Encoded: nonceText), nonce.count == 16 else {
+            return .failure(.forged)
+        }
+        guard pid == Int(peer), peerStart == start else { return .failure(.wrongPeer) }
+        guard abs(now.timeIntervalSince1970 - time) <= agentRequestWindow else { return .failure(.stale) }
+        seen = seen.filter { now.timeIntervalSince($0.value) <= 2 * agentRequestWindow }
+        guard seen[nonce] == nil else { return .failure(.replayed) }
+        seen[nonce] = now
+        return .success((message, nonce))
+    }
+
+    static func sealReply(_ message: [String: Any], key: SymmetricKey, nonce: Data) -> Data? {
+        guard let plain = try? JSONSerialization.data(withJSONObject: message),
+              let sealed = try? AES.GCM.seal(plain, using: key, authenticating: replyLabel + nonce).combined else { return nil }
+        return envelope(sealed)
+    }
+
+    static func openReply(_ data: Data, key: SymmetricKey, nonce: Data) -> [String: Any]? {
+        guard let box = box(data), let sealed = try? AES.GCM.SealedBox(combined: box),
+              let plain = try? AES.GCM.open(sealed, using: key, authenticating: replyLabel + nonce) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: plain)) as? [String: Any]
+    }
+}
+
+private let agentKeyLock = NSLock()
+private var agentKeyCache: SymmetricKey?
+
+/// The key that seals the agent socket's messages, made on first use; nil if the Keychain won't give it (then
+/// nothing is sent, and touchenv asks for Touch ID as if no agent ran). Never shows a prompt: the item has no access
+/// control, and the query forbids any UI.
+func agentKey() -> SymmetricKey? {
+    agentKeyLock.lock()
+    defer { agentKeyLock.unlock() }
+    if let key = agentKeyCache { return key }
+    let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: agentKeyService,
+                               kSecAttrAccount as String: "agent", kSecUseDataProtectionKeychain as String: true,
+                               kSecAttrSynchronizable as String: false]
+    func lookUp() -> Data? {
+        var q = base
+        q[kSecReturnData as String] = true
+        q[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+        let quiet = LAContext()
+        quiet.interactionNotAllowed = true
+        q[kSecUseAuthenticationContext as String] = quiet
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let data = out as? Data, data.count == 32 else { return nil }
+        return data
+    }
+    var data = lookUp()
+    if data == nil {
+        var fresh = Data(count: 32)
+        let made = fresh.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        guard made == errSecSuccess else { return nil }
+        var q = base
+        q[kSecValueData as String] = fresh
+        q[kSecAttrLabel as String] = "touchenv: background agent key"
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(q as CFDictionary, nil)
+        // Another touchenv made it at the same moment: use theirs.
+        data = status == errSecSuccess ? fresh : status == errSecDuplicateItem ? lookUp() : nil
+    }
+    guard let data else { return nil }
+    agentKeyCache = SymmetricKey(data: data)
+    return agentKeyCache
+}
+
+/// One message each way: write it, then close the writing half.
 func sendMessage(_ fd: Int32, _ message: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: message) else { return }
+    sendData(fd, data)
+}
+
+func sendData(_ fd: Int32, _ data: Data) {
     data.withUnsafeBytes { raw in
         var offset = 0
         while offset < raw.count {
@@ -822,24 +952,37 @@ func sendMessage(_ fd: Int32, _ message: [String: Any]) {
     shutdown(fd, SHUT_WR)
 }
 
-func receiveMessage(_ fd: Int32) -> [String: Any]? {
+func receiveData(_ fd: Int32) -> Data {
     var data = Data()
     var buffer = [UInt8](repeating: 0, count: 16384)
     while data.count < 4 << 20 {
         let n = read(fd, &buffer, buffer.count)
+        if n < 0 && errno == EINTR { continue }
         if n <= 0 { break }
         data.append(buffer, count: n)
     }
-    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    return data
 }
 
-/// A connection to a running agent that is really touchenv, or nil.
+func receiveMessage(_ fd: Int32) -> [String: Any]? {
+    (try? JSONSerialization.jsonObject(with: receiveData(fd))) as? [String: Any]
+}
+
+/// Neither end waits on a stalled peer for long.
+func setSocketTimeouts(_ fd: Int32, seconds: Int) {
+    var timeout = timeval(tv_sec: seconds, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+}
+
+/// A connection to a running agent that passes the code-signature check, or nil.
 func connectAgent() -> Int32? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     var address = socketAddress(agentSocketPath())
     var on: Int32 = 1
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+    setSocketTimeouts(fd, seconds: 5)
     let connected = withUnsafePointer(to: &address) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
     }
@@ -847,11 +990,33 @@ func connectAgent() -> Int32? {
     return fd
 }
 
+/// Said once per process, when the agent running is a touchenv from before the update (it speaks unsealed JSON).
+private var toldOldAgent = false
+
+/// One sealed request, one sealed reply; nil when there is no agent, it is an older touchenv, or anything doesn't
+/// open (then the caller asks for Touch ID as if no agent ran). `lock` alone still reaches an older agent, in its
+/// own unsealed form: ending approvals gives nothing away, and leaves no stale agent behind an update.
 func askAgent(_ message: [String: Any]) -> [String: Any]? {
-    guard let fd = connectAgent() else { return nil }
-    defer { close(fd) }
-    sendMessage(fd, message)
-    return receiveMessage(fd)
+    guard let key = agentKey(), let start = startTime(getpid()),
+          let sealed = AgentWire.sealRequest(message, key: key, pid: getpid(), start: start),
+          let fd = connectAgent() else { return nil }
+    sendData(fd, sealed.data)
+    let data = receiveData(fd)
+    close(fd)
+    if let reply = AgentWire.openReply(data, key: key, nonce: sealed.nonce) { return reply }
+    // An agent from before an update closes without a word on a message it can't read; this one always answers.
+    guard data.isEmpty else { return nil }
+    if message["op"] as? String == "lock", let fd = connectAgent() {
+        defer { close(fd) }
+        sendMessage(fd, ["op": "lock"])
+        return receiveMessage(fd)
+    }
+    if !toldOldAgent {
+        toldOldAgent = true
+        FileHandle.standardError.write(Data(("touchenv: the touchenv agent still running is from before an update, so its "
+            + "approvals and grants can't be used; touchenv lock ends it\n").utf8))
+    }
+    return nil
 }
 
 /// Starts `touchenv agent` in its own session (so Ctrl-C in the terminal doesn't reach it) unless one runs already.
@@ -879,10 +1044,17 @@ func startAgent() -> Bool {
     return false
 }
 
-/// The background copy: keeps approved secrets in memory, per requester, for 5 minutes or for a grant's length,
-/// then exits.
+/// The background copy: keeps approved secrets in memory, per requester, each for 5 minutes from its own approval or
+/// for a grant's length, then exits. Each connection is read and answered on a worker thread with short timeouts, so
+/// a peer that stalls holds up only itself; the approvals and grants are touched on the main thread only.
 final class Agent: NSObject {
-    struct Approval { var start: UInt64; var who: String; var secrets: [String: Data]; var expires: Date }
+    /// One secret under a 5-minute approval: its own end, and whether it came from touchenv's SSH agent, which makes
+    /// it good for signatures only (never for touchenv run or get to hand out the key).
+    struct Kept { var data: Data; var expires: Date; var signOnly: Bool }
+    struct Approval {
+        var start: UInt64; var who: String; var secrets: [String: Kept]
+        var expires: Date { secrets.values.map(\.expires).max() ?? .distantPast }
+    }
     /// From touchenv grant: covers the requester (pid, start) and every process below it.
     struct Grant { var pid: pid_t; var start: UInt64; var who: String; var secrets: [String: Data]; var expires: Date; var uses: Int }
     var approvals: [pid_t: Approval] = [:]
@@ -893,10 +1065,57 @@ final class Agent: NSObject {
     let born = Date()
     var standingPrograms: [String] = []
     var standingCheckedAt = Date.distantPast
+    var key: SymmetricKey!
+    /// Nonces of the requests opened in the last two minutes: none is taken twice.
+    var seen: [Data: Date] = [:]
+    var shownMenu: [String]?
+    var connections = 0
+    let maxConnections = 16
+    let io = DispatchQueue(label: "touchenv.agent.io", attributes: .concurrent)
+
+    /// The secrets of `names` an approval holds for a request, and when the first of them ends; nil unless it holds
+    /// every one, unexpired, and, unless the request is for a signature, none of them for signing only.
+    static func approved(_ approval: Approval, names: [String], signing: Bool, now: Date) -> (secrets: [String: Data], ends: Date)? {
+        guard !names.isEmpty else { return nil }
+        var out: [String: Data] = [:]
+        var ends = Date.distantFuture
+        for name in names {
+            guard let kept = approval.secrets[name], kept.expires > now, signing || !kept.signOnly else { return nil }
+            out[name] = kept.data
+            ends = min(ends, kept.expires)
+        }
+        return (out, ends)
+    }
+
+    /// The approval with `secrets` added, each for 5 minutes from now: a new approval never lengthens an older one's.
+    static func adding(_ secrets: [String: Data], signOnly: Bool, to approval: Approval, now: Date) -> Approval {
+        var out = approval
+        for (name, data) in secrets {
+            out.secrets[name] = Kept(data: data, expires: now.addingTimeInterval(approvalLength), signOnly: signOnly)
+        }
+        return out
+    }
+
+    /// The approval's unexpired secrets, grouped by when they end and whether they only sign.
+    static func groups(_ approval: Approval, now: Date) -> [(names: [String], expires: Date, signOnly: Bool)] {
+        var out: [(names: [String], expires: Date, signOnly: Bool)] = []
+        for (name, kept) in approval.secrets.sorted(by: { $0.key < $1.key }) where kept.expires > now {
+            let end = Date(timeIntervalSince1970: kept.expires.timeIntervalSince1970.rounded(.up))
+            if let i = out.firstIndex(where: { $0.expires == end && $0.signOnly == kept.signOnly }) {
+                out[i].names.append(name)
+            } else {
+                out.append(([name], end, kept.signOnly))
+            }
+        }
+        return out.sorted { $0.expires < $1.expires }
+    }
 
     func run() -> Never {
         let path = agentSocketPath()
         if let fd = connectAgent() { close(fd); exit(0) }
+        // Without the sealing key no request could be opened: no agent, and touchenv asks for Touch ID instead.
+        guard let key = agentKey() else { exit(1) }
+        self.key = key
         unlink(path)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         var address = socketAddress(path)
@@ -908,7 +1127,14 @@ final class Agent: NSObject {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
         source.setEventHandler { [unowned self] in
             let client = accept(fd, nil, nil)
-            if client >= 0 { self.handle(client); close(client) }
+            guard client >= 0 else { return }
+            guard self.connections < self.maxConnections else { close(client); return }
+            self.connections += 1
+            self.io.async {
+                self.serve(client)
+                close(client)
+                DispatchQueue.main.async { self.connections -= 1 }
+            }
         }
         source.resume()
         listener = source
@@ -923,32 +1149,76 @@ final class Agent: NSObject {
         exit(0)
     }
 
-    func handle(_ fd: Int32) {
-        var timeout = timeval(tv_sec: 2, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        guard peerIsTouchenv(fd), let peer = peerPid(fd), var parent = parentPid(peer),
-              let message = receiveMessage(fd), let op = message["op"] as? String else { return }
+    /// One connection, on a worker thread: read, open, answer on the main thread, seal, send.
+    func serve(_ fd: Int32) {
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+        setSocketTimeouts(fd, seconds: 2)
+        let data = receiveData(fd)
+        // The peer as the kernel sees it now, after it wrote: the pid sealed in the request must be this one.
+        guard !data.isEmpty else { return }
+        // Never an empty answer from here on: touchenv takes silence for an agent from before an update.
+        guard peerIsTouchenv(fd), let peer = peerPid(fd), var parent = parentPid(peer) else {
+            sendMessage(fd, ["ok": false, "refused": "peer"])
+            return
+        }
+        let peerStart = startTime(peer)
+        let opened = DispatchQueue.main.sync {
+            AgentWire.openRequest(data, key: key, peer: peer, peerStart: peerStart, seen: &seen)
+        }
+        let message: [String: Any], nonce: Data
+        switch opened {
+        case .success(let request):
+            (message, nonce) = request
+        case .failure(.notSealed):
+            // A touchenv from before an update. Lock alone is honoured, as it gives nothing away; nothing else is.
+            if let plain = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], plain["op"] as? String == "lock" {
+                sendMessage(fd, DispatchQueue.main.sync { lockAll() })
+            } else {
+                sendMessage(fd, ["ok": false])
+            }
+            return
+        case .failure(let why):
+            sendMessage(fd, ["ok": false, "refused": "\(why)"])
+            return
+        }
         // The agent works out the requester itself, from the kernel's process tree; it takes no one's word for it.
-        // Except touchenv's SSH agent's (the peer is touchenv, checked above): it asks for the process at the other end
-        // of its own socket, as the kernel told it (LOCAL_PEERPID), named by pid and start time.
+        // Except touchenv's SSH agent's (the request is sealed, so it is touchenv): it asks for the process at the other
+        // end of its own socket, as the kernel told it (LOCAL_PEERPID), named by pid and start time.
         var who = requester(from: parent)
-        if let asker = message["for"] as? Int, let start = message["forStart"] as? Int {
-            guard asker > 1, startTime(pid_t(asker)).map({ Int($0) }) == start else { sendMessage(fd, ["ok": false]); return }
+        let forSSH = message["for"] != nil
+        if forSSH {
+            guard let asker = message["for"] as? Int, let start = message["forStart"] as? Int, asker > 1,
+                  startTime(pid_t(asker)).map({ Int($0) }) == start else {
+                if let sealed = AgentWire.sealReply(["ok": false], key: key, nonce: nonce) { sendData(fd, sealed) }
+                return
+            }
             parent = pid_t(asker)
             who = requester(from: parent, through: sshTools)
         }
+        let above = lineage(parent)
+        let reply = DispatchQueue.main.sync { answer(message, who: who, above: above, forSSH: forSSH) }
+        if let sealed = AgentWire.sealReply(reply, key: key, nonce: nonce) { sendData(fd, sealed) }
+    }
+
+    /// The reply to one opened request; on the main thread.
+    func answer(_ message: [String: Any], who: Requester, above: [(pid: pid_t, start: UInt64)], forSSH: Bool) -> [String: Any] {
+        let now = Date()
         let ssh = message["ssh"] as? String
-        switch op {
+        switch message["op"] as? String {
         case "grant":
             guard who.pid > 1, let encoded = message["secrets"] as? [String: String] else { break }
-            var approval = approvals[who.pid].flatMap { $0.start == who.start ? $0 : nil }
-                ?? Approval(start: who.start, who: who.name, secrets: [:], expires: .distantPast)
-            for (name, value) in encoded { approval.secrets[name] = Data(base64Encoded: value) }
-            approval.expires = Date().addingTimeInterval(approvalLength)
-            approvals[who.pid] = approval
-            sendMessage(fd, ["ok": true])
-            tick()
-            return
+            var secrets: [String: Data] = [:]
+            for (name, value) in encoded {
+                guard let data = Data(base64Encoded: value) else { return ["ok": false] }
+                secrets[name] = data
+            }
+            let old = approvals[who.pid].flatMap { $0.start == who.start ? $0 : nil }
+                ?? Approval(start: who.start, who: who.name, secrets: [:])
+            // From touchenv's SSH agent: good for signatures only.
+            approvals[who.pid] = Agent.adding(secrets, signOnly: forSSH || message["signOnly"] as? Bool == true, to: old, now: now)
+            DispatchQueue.main.async { self.tick() }
+            return ["ok": true]
         case "allow":
             guard who.pid > 1, let encoded = message["secrets"] as? [String: String], !encoded.isEmpty,
                   let seconds = message["seconds"] as? Double, seconds >= 60,
@@ -958,60 +1228,58 @@ final class Agent: NSObject {
             // A new grant to the same requester for the same secrets replaces the old one.
             grants.removeAll { $0.pid == who.pid && $0.start == who.start && Set($0.secrets.keys) == Set(secrets.keys) }
             grants.append(Grant(pid: who.pid, start: who.start, who: who.name, secrets: secrets,
-                                expires: Date().addingTimeInterval(min(seconds, maxGrantLength)),
+                                expires: now.addingTimeInterval(min(seconds, maxGrantLength)),
                                 uses: min(uses, maxGrantUses)))
-            sendMessage(fd, ["ok": true, "who": who.name])
-            tick()
-            return
+            DispatchQueue.main.async { self.tick() }
+            return ["ok": true, "who": who.name]
         case "get":
             guard let names = message["names"] as? [String], !names.isEmpty else { break }
-            let now = Date()
             let intent = message["intent"] as? String
-            if let approval = approvals[who.pid], approval.start == who.start, approval.expires > now,
-               names.allSatisfy({ approval.secrets[$0] != nil }) {
-                var out: [String: String] = [:]
-                for name in names { out[name] = approval.secrets[name]!.base64EncodedString() }
-                sendMessage(fd, ["ok": true, "secrets": out, "via": "5-minute"])
-                let left = Int(approval.expires.timeIntervalSince(now).rounded(.up))
+            let signing = forSSH && message["sign"] as? Bool == true
+            if let approval = approvals[who.pid], approval.start == who.start,
+               let found = Agent.approved(approval, names: names, signing: signing, now: now) {
+                let left = Int(found.ends.timeIntervalSince(now).rounded(.up))
                 showNotice(who: approval.who, names: names, intent: intent, left: "approved for \(clock(left)) more", ssh: ssh)
-                return
+                return ["ok": true, "secrets": found.secrets.mapValues { $0.base64EncodedString() }, "via": "5-minute"]
             }
             // A grant: the asking process must sit below the requester the grant was given to.
-            guard let index = Agent.coveringGrant(grants, names: names, above: lineage(parent), now: now) else { break }
+            guard let index = Agent.coveringGrant(grants, names: names, above: above, now: now) else { break }
             grants[index].uses -= 1
             let grant = grants[index]
             var out: [String: String] = [:]
             for name in names { out[name] = grant.secrets[name]!.base64EncodedString() }
-            sendMessage(fd, ["ok": true, "secrets": out, "via": "grant"])
             let left = Int(grant.expires.timeIntervalSince(now).rounded(.up))
             showNotice(who: who.name, names: names, intent: intent,
                        left: grant.uses == 0 ? "that was the last use granted"
                                              : "granted for \(clock(left)) more, \(times(grant.uses)) left", ssh: ssh)
-            return
+            return ["ok": true, "secrets": out, "via": "grant"]
         case "list":
             // What is on, for touchenv grant --list: names, who, time and uses left; never a value.
-            let now = Date()
             var on: [[String: Any]] = []
-            for approval in approvals.values where approval.expires > now {
-                on.append(["who": approval.who, "names": approval.secrets.keys.sorted(), "kind": "5-minute",
-                           "left": Int(approval.expires.timeIntervalSince(now).rounded(.up))])
+            for approval in approvals.values {
+                for group in Agent.groups(approval, now: now) {
+                    on.append(["who": approval.who, "names": group.names, "kind": group.signOnly ? "5-minute-sign" : "5-minute",
+                               "left": Int(group.expires.timeIntervalSince(now).rounded(.up))])
+                }
             }
             for grant in grants where grant.expires > now && grant.uses > 0 {
                 on.append(["who": grant.who, "names": grant.secrets.keys.sorted(), "kind": "grant", "uses": grant.uses,
                            "left": Int(grant.expires.timeIntervalSince(now).rounded(.up))])
             }
-            sendMessage(fd, ["ok": true, "on": on])
-            return
+            return ["ok": true, "on": on]
         case "lock":
-            let ended = grants.map { ($0.who, $0.secrets.keys.sorted()) }
-            approvals.removeAll()
-            grants.removeAll()
-            sendMessage(fd, ["ok": true, "ended": ended.map { ["who": $0.0, "names": $0.1] }])
-            DispatchQueue.main.async { self.tick() }
-            return
+            return lockAll()
         default: break
         }
-        sendMessage(fd, ["ok": false])
+        return ["ok": false]
+    }
+
+    func lockAll() -> [String: Any] {
+        let ended = grants.map { ($0.who, $0.secrets.keys.sorted()) }
+        approvals.removeAll()
+        grants.removeAll()
+        DispatchQueue.main.async { self.tick() }
+        return ["ok": true, "ended": ended.map { ["who": $0.0, "names": $0.1] }]
     }
 
     /// The grant that covers a process (`above`: it and its ancestors) for every one of `names`, if any.
@@ -1022,10 +1290,44 @@ final class Agent: NSObject {
         }
     }
 
-    /// Drops what expired or whose requester ended; quits when nothing is left.
+    /// "until 14:05:30".
+    static func until(_ date: Date) -> String {
+        "until " + DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .medium)
+    }
+
+    /// The menu's lines: "-" a separator, "!" before Lock Now. Ends are shown as times, so the lines change only when
+    /// what is on changes.
+    func menuLines(now: Date) -> [String] {
+        var lines: [String] = []
+        for approval in approvals.values.sorted(by: { $0.who < $1.who }) {
+            for group in Agent.groups(approval, now: now) {
+                let names = group.names.joined(separator: ", ")
+                lines.append("\(approval.who) can \(group.signOnly ? "sign with" : "read") \(names) without asking, "
+                             + Agent.until(group.expires))
+            }
+        }
+        for grant in grants.sorted(by: { $0.who < $1.who }) {
+            let names = grant.secrets.keys.sorted().joined(separator: ", ")
+            lines.append("\(grant.who) and what it runs can read \(names) without asking: \(times(grant.uses)), "
+                         + Agent.until(grant.expires))
+        }
+        if !standingPrograms.isEmpty {
+            let count = standingPrograms.count
+            lines += ["-", "\(count) standing grant\(count == 1 ? "" : "s") (not ended by Lock Now): "
+                      + standingPrograms.joined(separator: ", "), "touchenv grant --list · touchenv lock --all ends them"]
+        }
+        return lines + ["-", "!Lock Now"]
+    }
+
+    /// Drops what expired or whose requester ended; quits when nothing is left. The menu is rebuilt only when its
+    /// lines change; the time left in the menu bar, every second.
     func tick() {
         let now = Date()
-        approvals = approvals.filter { pid, approval in approval.expires > now && startTime(pid) == approval.start }
+        approvals = approvals.compactMapValues { approval in
+            var approval = approval
+            approval.secrets = approval.secrets.filter { $0.value.expires > now }
+            return approval.secrets.isEmpty ? nil : approval
+        }.filter { pid, approval in startTime(pid) == approval.start }
         grants = grants.filter { $0.expires > now && $0.uses > 0 && startTime($0.pid) == $0.start }
         guard let last = (approvals.values.map(\.expires) + grants.map(\.expires)).max() else {
             // Empty: quit, except in the first seconds, while whoever started the agent is still sending its approval,
@@ -1038,41 +1340,28 @@ final class Agent: NSObject {
         }
         let left = Int(last.timeIntervalSince(now).rounded(.up))
         statusItem.button?.title = " " + clock(left)
-        let menu = NSMenu()
         // Standing grants live in the Keychain, not here; looked up every 30 seconds, names only.
         if now.timeIntervalSince(standingCheckedAt) > 30 {
             standingPrograms = standingStore.list().map { tilde($0.program) }
             standingCheckedAt = now
         }
-        for approval in approvals.values.sorted(by: { $0.who < $1.who }) {
-            let names = approval.secrets.keys.sorted().joined(separator: ", ")
-            let item = NSMenuItem(title: "\(approval.who) can read \(names) without asking", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
+        let lines = menuLines(now: now)
+        guard lines != shownMenu else { return }
+        shownMenu = lines
+        let menu = NSMenu()
+        for line in lines {
+            if line == "-" {
+                menu.addItem(.separator())
+            } else if line.hasPrefix("!") {
+                let lock = NSMenuItem(title: String(line.dropFirst()), action: #selector(lockNow), keyEquivalent: "")
+                lock.target = self
+                menu.addItem(lock)
+            } else {
+                let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
         }
-        for grant in grants.sorted(by: { $0.who < $1.who }) {
-            let names = grant.secrets.keys.sorted().joined(separator: ", ")
-            let left = clock(Int(grant.expires.timeIntervalSince(now).rounded(.up)))
-            let item = NSMenuItem(title: "\(grant.who) and what it runs can read \(names) without asking: "
-                                  + "\(times(grant.uses)), \(left) left", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-        if !standingPrograms.isEmpty {
-            menu.addItem(.separator())
-            let count = standingPrograms.count
-            let item = NSMenuItem(title: "\(count) standing grant\(count == 1 ? "" : "s") (not ended by Lock Now): "
-                                  + standingPrograms.joined(separator: ", "), action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-            let hint = NSMenuItem(title: "touchenv grant --list · touchenv lock --all ends them", action: nil, keyEquivalent: "")
-            hint.isEnabled = false
-            menu.addItem(hint)
-        }
-        menu.addItem(.separator())
-        let lock = NSMenuItem(title: "Lock Now", action: #selector(lockNow), keyEquivalent: "")
-        lock.target = self
-        menu.addItem(lock)
         statusItem.menu = menu
     }
 
@@ -2708,7 +2997,7 @@ enum SSHKeyFile {
 
 /// Reads a private key file's text. Unencrypted OpenSSH keys are parsed here; anything else ssh-keygen can read
 /// (encrypted keys, the older PEM and PKCS#8 formats) comes back as .convert.
-func parseSSHKeyFile(_ text: [UInt8]) throws -> SSHKeyFile {
+func parseSSHKeyFile(_ text: [UInt8], selfTest: Bool = true) throws -> SSHKeyFile {
     let s = String(decoding: text.prefix(200), as: UTF8.self)
     if s.contains("BEGIN SSH2 ENCRYPTED PRIVATE KEY") || s.contains("PuTTY-User-Key-File") {
         throw SSHFormatError("not an OpenSSH key file: convert it with ssh-keygen or PuTTYgen first")
@@ -2757,7 +3046,8 @@ func parseSSHKeyFile(_ text: [UInt8]) throws -> SSHKeyFile {
     if key.kind == .rsa { out.p = rsa[0]; out.q = rsa[1]; out.iqmp = rsa[2] }
     wipe(&record); wipe(&secret)
     for i in rsa.indices { wipe(&rsa[i]) }
-    guard out.selfTest() else { throw SSHFormatError("the key fails a test signature") }
+    // A test signature once, when the key is added (ssh add); signing later checks the key against its public half.
+    guard !selfTest || out.selfTest() else { throw SSHFormatError("the key fails a test signature") }
     return .openssh(out)
 }
 
@@ -2993,6 +3283,8 @@ final class SSHAgentServer {
         let peerStart: UInt64
         var binds: [SessionBind] = []
         var tainted = false
+        /// The keys, listed once per connection: ssh asks for them, then signs, on the same connection.
+        var identities: [SSHIdentity]?
         init(fd: Int32, peer: pid_t) { self.fd = fd; self.peer = peer; peerStart = startTime(peer) ?? 0 }
     }
 
@@ -3012,6 +3304,13 @@ final class SSHAgentServer {
         }
     }
 
+    func knownIdentities(_ state: Connection) -> [SSHIdentity] {
+        if let known = state.identities { return known }
+        let all = identities()
+        state.identities = all
+        return all
+    }
+
     static let failure: [UInt8] = [5]
     static let success: [UInt8] = [6]
 
@@ -3021,7 +3320,7 @@ final class SSHAgentServer {
         switch type {
         case 11:   // SSH_AGENTC_REQUEST_IDENTITIES
             guard r.done else { return Self.failure }
-            let all = identities()
+            let all = knownIdentities(state)
             var out = SSHWriter()
             out.u8(12)
             out.u32(UInt32(all.count))
@@ -3082,7 +3381,7 @@ final class SSHAgentServer {
     }
 
     func sign(blob: [UInt8], data: [UInt8], flags: UInt32, _ state: Connection) -> [UInt8] {
-        guard !state.tainted, let identity = identities().first(where: { $0.key.blob == blob }) else { return Self.failure }
+        guard !state.tainted, let identity = knownIdentities(state).first(where: { $0.key.blob == blob }) else { return Self.failure }
         guard let purpose = signPurpose(data, key: blob) else {
             log("refused \(identity.name): the login names a different key")
             return Self.failure
@@ -3127,7 +3426,7 @@ final class SSHAgentServer {
             }
         }
         defer { wipe(&key) }
-        guard case .openssh(let privateKey)? = try? parseSSHKeyFile(key), privateKey.publicKey.blob == blob,
+        guard case .openssh(let privateKey)? = try? parseSSHKeyFile(key, selfTest: false), privateKey.publicKey.blob == blob,
               let signature = try? privateKey.sign(data, flags: flags) else {
             log("failed \(identity.name): the stored key doesn't parse or doesn't match its public half")
             return Self.failure
@@ -3242,8 +3541,10 @@ func writePublicKey(_ identity: SSHIdentity) -> Bool {
 }
 
 /// The SSH keys touchenv holds, with no Touch ID: synced items from their attributes (iCloud items carry no access
-/// control), local ones from the .pub files `ssh add` wrote, each checked to still exist.
+/// control), local ones from the .pub files `ssh add` wrote, each checked to still exist. Two listings, then one probe
+/// per local key; touchenv's SSH agent asks once per connection.
 func sshIdentities() -> [SSHIdentity] {
+    let allSynced = syncedNames()
     var out: [String: SSHIdentity] = [:]
     let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
                             kSecAttrSynchronizable as String: true, kSecUseDataProtectionKeychain as String: true,
@@ -3263,10 +3564,21 @@ func sshIdentities() -> [SSHIdentity] {
         let name = String(file.dropLast(4))
         guard validName(name), out[name] == nil, let data = FileManager.default.contents(atPath: publicKeyPath(name)),
               data.count < 65536, let key = SSHPublicKey(line: String(decoding: data, as: UTF8.self)),
-              synced(name) == false else { continue }
+              !allSynced.contains(name), localItemExists(name) else { continue }
         out[name] = SSHIdentity(name: name, key: key, synced: false)
     }
     return out.values.sorted { $0.name < $1.name }
+}
+
+/// Whether a local (not synced) secret of that name exists. No Touch ID: such an item answers "interaction not
+/// allowed" when it exists.
+func localItemExists(_ name: String) -> Bool {
+    let probe = LAContext()
+    probe.interactionNotAllowed = true
+    var q = query(name)
+    q[kSecAttrSynchronizable as String] = false
+    q[kSecUseAuthenticationContext as String] = probe
+    return SecItemCopyMatching(q as CFDictionary, nil) != errSecItemNotFound
 }
 
 /// "SSH_ID_ED25519" from "~/.ssh/id_ed25519".
@@ -3397,7 +3709,9 @@ func agentRequest(_ fd: Int32, _ body: [UInt8]) -> [UInt8]? {
     return readFull(fd, length)
 }
 
-/// Whether the process behind a socket is signed by Apple (/usr/bin/ssh-agent, or launchd holding its socket).
+/// Whether the process behind a socket is signed by Apple now. Not enough on its own: before the agent has answered,
+/// a launchd-held socket's peer is launchd itself, and a process can pass by exec'ing an Apple program after
+/// accepting (a child it forked keeps the connection). See macSSHAgentProblem.
 func peerIsApple(_ fd: Int32) -> Bool {
     var token = audit_token_t()
     var length = socklen_t(MemoryLayout<audit_token_t>.size)
@@ -3407,6 +3721,47 @@ func peerIsApple(_ fd: Int32) -> Bool {
     guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributeAudit: tokenData] as CFDictionary, [], &peer) == errSecSuccess,
           let peer, SecRequirementCreateWithString("anchor apple" as CFString, [], &requirement) == errSecSuccess else { return false }
     return SecCodeCheckValidity(peer, [], requirement) == errSecSuccess
+}
+
+/// pid, program and plist of a job, from `launchctl print`'s top-level lines; nil when any is missing.
+func parseLaunchdJob(_ text: String) -> (pid: pid_t, program: String, path: String)? {
+    var fields: [String: String] = [:]
+    for line in text.split(separator: "\n") where line.hasPrefix("\t") && !line.hasPrefix("\t\t") {
+        let parts = line.dropFirst().components(separatedBy: " = ")
+        if parts.count == 2 { fields[parts[0]] = parts[1] }
+    }
+    guard let pidText = fields["pid"], let pid = pid_t(pidText), pid > 1, let program = fields["program"],
+          let path = fields["path"] else { return nil }
+    return (pid, program, path)
+}
+
+let macSSHAgentPlist = "/System/Library/LaunchAgents/com.openssh.ssh-agent.plist"
+
+/// Why the connection is not to macOS's own ssh-agent, or nil when it is. Call after the agent has answered a request
+/// on this connection: the kernel then names the process that last used the other end (LOCAL_PEERPID). It must be
+/// the process launchd started for com.openssh.ssh-agent from the system's own plist, running /usr/bin/ssh-agent and
+/// signed by Apple. That process was exec'd by launchd, so no other code ever ran in it, and it hands no connection
+/// on: unlike a code-signature check alone, a listener that execs ssh-agent after accepting (while a child keeps
+/// the connection) is not that process. launchctl print's format isn't an API: if it changes, load refuses.
+func macSSHAgentProblem(_ fd: Int32) -> String? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = ["print", "gui/\(getuid())/com.openssh.ssh-agent"]
+    let out = Pipe()
+    process.standardOutput = out
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return "launchctl didn't run" }
+    let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    guard process.terminationStatus == 0, let job = parseLaunchdJob(text) else {
+        return "launchd's com.openssh.ssh-agent isn't running"
+    }
+    guard job.path == macSSHAgentPlist, job.program == "/usr/bin/ssh-agent" else {
+        return "launchd's com.openssh.ssh-agent isn't the system's own (\(job.path))"
+    }
+    guard let peer = peerPid(fd), peer == job.pid else { return "the socket isn't served by launchd's ssh-agent" }
+    guard processPath(peer) == "/usr/bin/ssh-agent", peerIsApple(fd) else { return "the process behind it isn't Apple's ssh-agent" }
+    return nil
 }
 
 /// SSH_AGENTC_ADD_ID_CONSTRAINED with a lifetime: the key as ssh-add -t would send it.
@@ -3629,7 +3984,7 @@ func serveSSHAgent() -> Never {
         identities: sshIdentities,
         covered: { a in
             guard let reply = askAgent(["op": "get", "names": [a.identity.name], "for": Int(a.peer),
-                                        "forStart": Int(a.peerStart), "ssh": a.action]),
+                                        "forStart": Int(a.peerStart), "ssh": a.action, "sign": true]),
                   reply["ok"] as? Bool == true, let encoded = (reply["secrets"] as? [String: String])?[a.identity.name],
                   let data = Data(base64Encoded: encoded) else { return nil }
             return [UInt8](data)
@@ -3654,7 +4009,7 @@ func serveSSHAgent() -> Never {
             guard let data else { return .failure(.refused("keychain error \(status)")) }
             if keep, startAgent() {
                 _ = askAgent(["op": "grant", "secrets": [a.identity.name: data.base64EncodedString()],
-                              "for": Int(a.peer), "forStart": Int(a.peerStart)])
+                              "for": Int(a.peer), "forStart": Int(a.peerStart), "signOnly": true])
             }
             return .success([UInt8](data))
         },
@@ -3846,9 +4201,16 @@ func sshCommand(_ arguments: [String], intent globalIntent: String?) -> Never {
             }
             exit(0)
         }
-        // The key goes only to Apple's ssh-agent, on this very connection: no ssh-add, no file, no argument.
-        guard peerIsApple(fd) else {
-            die("touchenv: \(socketPath) isn't Apple's ssh-agent; touchenv hands keys to that one only")
+        // The key goes only to macOS's own ssh-agent, on this very connection: no ssh-add, no file, no argument. It
+        // answers a harmless request first (the list of its keys), so the kernel can name the process that serves
+        // this connection.
+        var list = SSHWriter()
+        list.u8(11)   // SSH_AGENTC_REQUEST_IDENTITIES
+        guard agentRequest(fd, list.bytes)?.first == 12 else { die("touchenv: ssh-agent at \(socketPath) doesn't answer") }
+        if let problem = macSSHAgentProblem(fd) {
+            die("touchenv: \(socketPath) isn't macOS's own ssh-agent (\(problem)); touchenv ssh load hands keys to that one "
+                + "only. An ssh-agent you started yourself can't be told apart from a program posing as one: use "
+                + "touchenv's agent (touchenv ssh agent install) instead")
         }
         let length = loadFor ?? sshDefaultLoad
         requireIntent(intent, example: "touchenv ssh load --intent \"<why>\" --for 1h \(names.joined(separator: " "))")
@@ -3860,7 +4222,7 @@ func sshCommand(_ arguments: [String], intent globalIntent: String?) -> Never {
         for identity in chosen {
             var text = [UInt8](read(identity.name))
             defer { wipe(&text) }
-            guard case .openssh(let key)? = try? parseSSHKeyFile(text), key.publicKey == identity.key else {
+            guard case .openssh(let key)? = try? parseSSHKeyFile(text, selfTest: false), key.publicKey == identity.key else {
                 die("touchenv: \(identity.name) doesn't hold the SSH key its public half says")
             }
             var message = addIdentityMessage(key, comment: identity.name, seconds: UInt32(length))
@@ -4208,6 +4570,8 @@ case "grant" where listGrants:
             let left = clock(item["left"] as? Int ?? 0)
             if item["kind"] as? String == "grant" {
                 print("  \(item["who"] as? String ?? "?") and what it runs: \(names) · \(times(item["uses"] as? Int ?? 0)), \(left) left")
+            } else if item["kind"] as? String == "5-minute-sign" {
+                print("  \(item["who"] as? String ?? "?"): \(names) · 5-minute approval for SSH signatures only, \(left) left")
             } else {
                 print("  \(item["who"] as? String ?? "?"): \(names) · 5-minute approval, \(left) left")
             }
