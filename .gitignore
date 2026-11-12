@@ -4,3 +4,4 @@ dist/
 .DS_Store
 windows/*.exe
 windows/signing.local.env
+.claude/
