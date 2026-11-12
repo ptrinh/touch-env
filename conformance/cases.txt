@@ -144,3 +144,5 @@ windows: 2 | err:touchenv: ssh load is macOS only for now | ssh load A
 windows: 2 | err:touchenv: ssh load is macOS only for now | ssh load --for 1h A
 windows: 2 | err:touchenv: ssh unload is macOS only for now | ssh unload A
 windows: 0 | out:touchenv ssh add [NAME] KEYFILE | help
+windows: 1 | err:touchenv: ssh agent sign is started by touchenv's SSH agent | ssh agent sign
+windows: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent sign --config

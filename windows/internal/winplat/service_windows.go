@@ -53,6 +53,7 @@ var (
 	advapi32                      = windows.NewLazySystemDLL("advapi32.dll")
 	procImpersonateNamedPipe      = advapi32.NewProc("ImpersonateNamedPipeClient")
 	procGetNamedPipeClientSession = kernel32.NewProc("GetNamedPipeClientSessionId")
+	procPeekNamedPipe             = kernel32.NewProc("PeekNamedPipe")
 	wtsapi32                      = windows.NewLazySystemDLL("wtsapi32.dll")
 	procWTSEnumerateProcessesEx   = wtsapi32.NewProc("WTSEnumerateProcessesExW")
 	procWTSFreeMemoryEx           = wtsapi32.NewProc("WTSFreeMemoryExW")
@@ -275,6 +276,13 @@ func (p *pipeConn) Write(b []byte) (int, error) {
 		}
 	}
 	return written, nil
+}
+
+// ClientGone (core.ClientGone): the client has closed its end. PeekNamedPipe doesn't wait and reads nothing; on a
+// pipe whose client is gone it fails with ERROR_BROKEN_PIPE.
+func (p *pipeConn) ClientGone() bool {
+	r, _, err := procPeekNamedPipe.Call(uintptr(p.h), 0, 0, 0, 0, 0)
+	return r == 0 && (errors.Is(err, windows.ERROR_BROKEN_PIPE) || errors.Is(err, windows.ERROR_PIPE_NOT_CONNECTED))
 }
 
 func (p *pipeConn) Close() error {

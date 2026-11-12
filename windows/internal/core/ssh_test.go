@@ -23,23 +23,42 @@ type fakeSSHHost struct {
 	home      string
 	installed bool
 	running   bool
+	other     string
 	procs     ProcTable
+	m         *machine
+	helpers   int // sign helpers run
 }
 
 func (h *fakeSSHHost) HomeDir() (string, error)   { return h.home, nil }
 func (h *fakeSSHHost) AgentPipe() (string, error) { return `\\.\pipe\touchenv-ssh-test`, nil }
 func (h *fakeSSHHost) InstallAgent() error        { h.installed, h.running = true, true; return nil }
 func (h *fakeSSHHost) UninstallAgent() error      { h.installed, h.running = false, false; return nil }
-func (h *fakeSSHHost) AgentState() (bool, bool)   { return h.installed, h.running }
+func (h *fakeSSHHost) AgentState() AgentState {
+	return AgentState{AtLogon: h.installed, Running: h.running, Other: h.other}
+}
 func (h *fakeSSHHost) Serve(func(io.ReadWriteCloser, uint32)) error {
 	return nil
 }
 func (h *fakeSSHHost) Procs() ProcTable { return h.procs }
 
+// SignHelper runs touchenv ssh agent sign as the real one does, in-process: same store and Hello, no SSH host.
+func (h *fakeSSHHost) SignHelper(request []byte) ([]byte, error) {
+	h.helpers++
+	r := h.m.runHelper(request)
+	return []byte(r.stdout), nil
+}
+
+func (m *machine) runHelper(request []byte) result {
+	var out, errOut bytes.Buffer
+	code := Main([]string{"ssh", "agent", "sign"}, Env{Stdin: bytes.NewReader(request), Stdout: &out, Stderr: &errOut,
+		Platform: m.p, Hello: m.h, Now: func() time.Time { return m.now }})
+	return result{code, out.String(), errOut.String(), out.Bytes()}
+}
+
 // Process 100 is ssh.exe, run by git.exe (101), run by bash (102) under claude.exe (103).
 func newSSHMachine(t *testing.T, keyIndex int) *machine {
 	m := newMachine(t, keyIndex)
-	m.ssh = &fakeSSHHost{home: t.TempDir(), procs: ProcTable{
+	m.ssh = &fakeSSHHost{home: t.TempDir(), m: m, procs: ProcTable{
 		100: {Parent: 101, Start: 40, Name: "ssh.exe"},
 		101: {Parent: 102, Start: 30, Name: "git.exe"},
 		102: {Parent: 103, Start: 20, Name: "bash.exe"},
@@ -70,12 +89,24 @@ func writeKey(t *testing.T, key any, passphrase string) string {
 
 // agentClient serves one connection from process pid with a fresh agent, as the pipe would.
 func (m *machine) agentClient(pid uint32) agent.ExtendedAgent {
+	return m.agentClientConn(pid, func(c net.Conn) io.ReadWriteCloser { return c })
+}
+
+// goneConn is a connection whose client has gone, as winplat's pipe reports it.
+type goneConn struct {
+	net.Conn
+	gone *bool
+}
+
+func (g goneConn) ClientGone() bool { return *g.gone }
+
+func (m *machine) agentClientConn(pid uint32, wrap func(net.Conn) io.ReadWriteCloser) agent.ExtendedAgent {
 	env := Env{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard, Platform: m.p, Hello: m.h,
 		SSH: m.ssh, Now: func() time.Time { return m.now }}
 	c := &cmd{env: &env, p: m.p, h: m.h, ssh: m.ssh}
 	a := &sshAgent{c: c}
 	server, client := net.Pipe()
-	go a.serve(server, pid)
+	go a.serve(wrap(server), pid)
 	m.t.Cleanup(func() { client.Close() })
 	return agent.NewClient(client)
 }

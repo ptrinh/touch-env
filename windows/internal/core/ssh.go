@@ -224,6 +224,11 @@ func (c *cmd) sshCmd(args []string) error {
 			return c.sshAgentStatus()
 		case "serve": // what InstallAgent starts, at logon and now
 			return c.sshAgentServe()
+		case "sign": // what the agent starts for each signature (sshagent.go)
+			if config {
+				return die(2, "%s", sshAgentUsage)
+			}
+			return c.sshAgentSign()
 		}
 		return die(2, "%s", sshAgentUsage)
 	}
@@ -326,8 +331,12 @@ func (c *cmd) sshAdd(rest []string) error {
 // sshNextSteps: what's left to do on this PC. touchenv never deletes the key file itself.
 func (c *cmd) sshNextSteps(keyPath string) {
 	var steps []string
+	pipe := `\\.\pipe\touchenv-ssh-<your SID>`
 	if c.ssh != nil {
-		atLogon, _ := c.ssh.AgentState()
+		atLogon := c.ssh.AgentState().AtLogon
+		if p, err := c.ssh.AgentPipe(); err == nil {
+			pipe = p
+		}
 		configured := false
 		if text, err := c.readSSHConfig(); err == nil {
 			configured = strings.Contains(text, sshConfigBegin)
@@ -343,6 +352,7 @@ func (c *cmd) sshNextSteps(keyPath string) {
 	}
 	steps = append(steps, "ssh -T git@github.com     (or any server that has this key: Windows Hello asks)",
 		"for git: git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe     (Git's own ssh can't reach the agent)",
+		"for apps that don't read .ssh\\config (JetBrains IDEs, apps built on libgit2): setx SSH_AUTH_SOCK "+pipe,
 		"then, once it works, delete the old file yourself: del \""+keyPath+"\"")
 	fmt.Fprintln(c.env.Stdout, "next:")
 	for i, s := range steps {
@@ -496,9 +506,16 @@ func withoutBlock(text string) (out string, found bool, err error) {
 }
 
 // writeSSHConfig replaces .ssh\config with text (given with "\n"; written with the file's own line endings). The
-// first time, it copies the file as it was to config.touchenv-backup; that copy is never overwritten.
+// first time, it copies the file as it was to config.touchenv-backup; that copy is never overwritten. A config that
+// is a link (to a dotfiles folder, say) stays one: the file it points to is rewritten, keeping its permissions.
 func (c *cmd) writeSSHConfig(path, old, text string, crlf bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	target := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		target = resolved
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if _, err := os.Stat(path + ".touchenv-backup"); old != "" && errors.Is(err, os.ErrNotExist) {
@@ -509,7 +526,7 @@ func (c *cmd) writeSSHConfig(path, old, text string, crlf bool) error {
 	if crlf {
 		text = strings.ReplaceAll(text, "\n", "\r\n")
 	}
-	return c.p.WriteFilePrivate(path, []byte(text))
+	return c.p.RewriteFile(target, []byte(text))
 }
 
 func (c *cmd) sshAgentInstall(config bool) error {
@@ -523,10 +540,12 @@ func (c *cmd) sshAgentInstall(config bool) error {
 	if err := c.ssh.InstallAgent(); err != nil {
 		return die(1, "touchenv: can't install the agent: %v", err)
 	}
-	_, running := c.ssh.AgentState()
-	if running {
+	switch state := c.ssh.AgentState(); {
+	case state.Running:
 		fmt.Fprintf(c.env.Stdout, "the agent is running on %s, and starts at every logon\n", pipe)
-	} else {
+	case state.Other != "":
+		fmt.Fprintf(c.env.Stdout, "installed: the agent starts at every logon, but it isn't what answers on %s now: %s\n", pipe, state.Other)
+	default:
 		fmt.Fprintf(c.env.Stdout, "installed: the agent starts at every logon; it didn't answer yet on %s (touchenv ssh agent status)\n", pipe)
 	}
 	path, err := c.sshConfigPath()
@@ -613,15 +632,19 @@ func (c *cmd) sshAgentStatus() error {
 	if err != nil {
 		return die(1, "touchenv: %v", err)
 	}
-	atLogon, running := c.ssh.AgentState()
+	state := c.ssh.AgentState()
 	yes := func(b bool, y, n string) string {
 		if b {
 			return y
 		}
 		return n
 	}
-	fmt.Fprintf(c.env.Stdout, "agent:      %s, %s\n", yes(running, "running on "+pipe, "not running"),
-		yes(atLogon, "starts at logon", "doesn't start at logon (touchenv ssh agent install)"))
+	now := yes(state.Running, "running on "+pipe, "not running")
+	if state.Other != "" {
+		now = "not touchenv's agent on " + pipe + ": " + state.Other
+	}
+	fmt.Fprintf(c.env.Stdout, "agent:      %s, %s\n", now,
+		yes(state.AtLogon, "starts at logon", "doesn't start at logon (touchenv ssh agent install)"))
 	path, _ := c.sshConfigPath()
 	text, _ := c.readSSHConfig()
 	fmt.Fprintf(c.env.Stdout, "ssh config: %s\n", yes(hasBlock(text, pipe), path+" uses it",

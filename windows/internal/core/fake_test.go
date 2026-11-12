@@ -22,6 +22,7 @@ type fakeHello struct {
 	deny     bool
 	notReady error
 	prompts  []string
+	onPrompt func() // run once, at the next Decrypt (something else happening while Hello asks)
 }
 
 var sharedKeys struct {
@@ -55,6 +56,10 @@ func (h *fakeHello) PublicKey(create bool) (*rsa.PublicKey, error) {
 
 func (h *fakeHello) Decrypt(message string, ciphertext []byte) ([]byte, error) {
 	h.prompts = append(h.prompts, message)
+	if f := h.onPrompt; f != nil {
+		h.onPrompt = nil
+		f()
+	}
 	if h.deny {
 		return nil, ErrCancelled
 	}
@@ -83,15 +88,35 @@ type fakePlatform struct {
 	exitCode  int
 	ran       []ranCommand
 	runDirs   []string
+	snapshots int // Ancestors calls
 }
 
-func (p *fakePlatform) Ancestors() []Process { return p.ancestors }
+func (p *fakePlatform) Ancestors() []Process { p.snapshots++; return p.ancestors }
 func (p *fakePlatform) DataDir() (string, error) {
 	return p.dir, os.MkdirAll(p.dir, 0o700)
 }
 func (p *fakePlatform) WriteFilePrivate(path string, data []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// RewriteFile keeps the file's permissions, as the real one keeps its ACL.
+func (p *fakePlatform) RewriteFile(path string, data []byte) error {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		p.t.Errorf("RewriteFile given a link: %s", path)
+	}
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, mode); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

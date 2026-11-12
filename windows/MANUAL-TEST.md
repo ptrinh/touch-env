@@ -139,10 +139,26 @@ stock agent first if it runs (`Get-Service ssh-agent`), so it can't answer inste
     Commit signing (`git config gpg.format ssh`, `user.signingkey` = the `.pub`, `git commit -S`): "sign a git commit
     or tag".
 40. **Nobody to ask.** `ssh` from another PC into this one (or Remote Desktop), then `ssh -T git@github.com` there:
-    refused at once. With the screen locked and a request made some other way (a scheduled `git fetch`): note what
-    happens; touchenv doesn't check for the lock yet, so a prompt may be waiting after you unlock.
-    Also: does the Windows Hello prompt come to the front, or open behind other windows?
+    refused at once. **Locked screen:** a Task Scheduler task that runs `ssh -T git@github.com` (as you, "run only when
+    user is logged on") a minute from now; lock the PC (Win+L) and wait. After unlocking: no Windows Hello prompt is
+    waiting, and `touchenv ssh agent status` lists "the PC is locked". Also `touchenv get A` from the same kind of task:
+    refused with the same message. Also: does the Windows Hello prompt come to the front, or open behind other windows?
 41. **Logon and console.** Sign out and in: the agent runs again (status). Note whether a console window flashes at
     logon and for how long.
-42. **Remove.** `touchenv ssh agent uninstall --config`: stopped, not at logon, the block gone from `.ssh\config`
+42. **The sign helper.** During a signature's Windows Hello prompt, Task Manager (Details) shows a second
+    `touchenv.exe` (`ssh agent sign`) with no window, and it is gone once you answer. Cancel, then sign again: both
+    work. Leave a prompt unanswered: after 3 minutes it closes and ssh says "agent refused operation"; status says why.
+    From PowerShell, `'{}' | touchenv ssh agent sign` prints an error reply and asks nothing; a hand-made request with
+    a prompt that doesn't end "with the SSH key NAME?" is refused without a prompt.
+43. **Abandoned requests.** Start `ssh -T git@github.com` in three windows at once; with the first prompt showing,
+    Ctrl-C the other two, then answer the first: no further prompts appear, and status lists "ssh went away".
+44. **Something else on the pipe.** `touchenv ssh agent uninstall`. In PowerShell:
+    `$s = [System.IO.Pipes.NamedPipeServerStream]::new("touchenv-ssh-<SID>", "InOut", 4); $s.WaitForConnection()`.
+    `touchenv ssh agent status` says "not touchenv's agent on …: C:\…\pwsh.exe (pid …)"; `touchenv ssh agent install`
+    says the same instead of "running". Close PowerShell, install again: running.
+45. **A linked config.** `mklink %USERPROFILE%\.ssh\config D:\dotfiles\ssh_config` (Developer Mode or an elevated
+    prompt), with an extra read entry for another account on the target (`icacls`). `touchenv ssh agent install
+    --config`: `dir %USERPROFILE%\.ssh` still shows `<SYMLINK>`, the block is in the target, and `icacls` on the target
+    shows the same entries as before. Uninstall with `--config`: the same.
+46. **Remove.** `touchenv ssh agent uninstall --config`: stopped, not at logon, the block gone from `.ssh\config`
     (backup kept). `touchenv ssh rm SSH_TENV_TEST`: one Hello prompt; the `.pub` is gone.

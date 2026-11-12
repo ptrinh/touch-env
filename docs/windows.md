@@ -23,7 +23,8 @@ which keys, the intent and the command. Differences:
 - **`touchenv status`** lists grants and approvals, and each use.
 - **No `--sync`.** Keys stay on the PC they were saved on.
 - **`ls` doesn't ask.** The names sit in the store file anyway.
-- **Not over Remote Desktop, SSH or from a service.** touchenv refuses rather than ask where you can't answer.
+- **Not over Remote Desktop, SSH, from a service or while the PC is locked.** touchenv refuses rather than ask
+  where you can't answer.
 - **SSH keys** (`touchenv ssh add`, `ls`, `rm`, `agent install`) work as on a Mac, with Windows Hello for every
   signature: see [ssh.md](ssh.md#on-windows). No grants or 5-minute approvals for signatures, and no
   `ssh load`/`unload`.

@@ -42,6 +42,9 @@ type Platform interface {
 	DataDir() (string, error)
 	// WriteFilePrivate replaces path atomically with data, readable and writable by the user only.
 	WriteFilePrivate(path string, data []byte) error
+	// RewriteFile replaces the contents of an existing file of the user's (.ssh\config) atomically, keeping its own
+	// ACL; a file that doesn't exist yet is made as WriteFilePrivate makes one. path must not be a link.
+	RewriteFile(path string, data []byte) error
 	// Lock serializes changes to the store across touchenv processes.
 	Lock(path string) (unlock func(), err error)
 	// ReadSecret reads a secret from stdin: one line with no echo from a console, else everything.
@@ -97,11 +100,30 @@ type SSHHost interface {
 	// InstallAgent makes the agent start at every logon, and starts it now. UninstallAgent stops it and undoes that.
 	InstallAgent() error
 	UninstallAgent() error
-	// AgentState says whether the agent starts at logon and whether it answers now.
-	AgentState() (atLogon, running bool)
+	// AgentState says whether the agent starts at logon, and what answers on the pipe now.
+	AgentState() AgentState
 	// Serve answers connections on the pipe until the agent is told to stop (by UninstallAgent), each on its own
-	// goroutine, with the client's process id. It fails at once when the pipe is held by something else.
+	// goroutine, with the client's process id. It fails at once when the pipe is held by something else. A
+	// connection may implement ClientGone.
 	Serve(handle func(conn io.ReadWriteCloser, clientPID uint32)) error
 	// Procs lists the processes, to name who is asking for a signature.
 	Procs() ProcTable
+	// SignHelper runs "touchenv ssh agent sign" (this executable, in a process of its own with no window) with
+	// request on its stdin, waits for it, and returns what it wrote to its stdout. The helper asks Windows Hello,
+	// opens one key and signs, then exits: the agent, which runs for as long as you're logged on, never holds the
+	// store's key or a private key. The error is only for a helper that couldn't run or didn't finish in time.
+	SignHelper(request []byte) ([]byte, error)
+}
+
+// AgentState is what touchenv ssh agent status reports about the agent.
+type AgentState struct {
+	AtLogon bool   // started at every logon
+	Running bool   // this touchenv's agent answers on the pipe
+	Other   string // not "": something else answers on the pipe, or what answers couldn't be checked; says what
+}
+
+// ClientGone is implemented by a connection that can tell whether its client has gone away (ssh was stopped while
+// its request waited its turn): the agent then drops the request instead of asking Windows Hello for nobody.
+type ClientGone interface {
+	ClientGone() bool
 }

@@ -174,6 +174,51 @@ func (Platform) WriteFilePrivate(path string, data []byte) error {
 	return err
 }
 
+var procReplaceFile = kernel32.NewProc("ReplaceFileW")
+
+const (
+	replaceFileIgnoreMergeErrors = 0x2 // REPLACEFILE_IGNORE_MERGE_ERRORS
+	replaceFileIgnoreACLErrors   = 0x4 // REPLACEFILE_IGNORE_ACL_ERRORS
+)
+
+// RewriteFile writes a new file next to path, private while it is written, and puts it in place with ReplaceFileW,
+// which keeps the replaced file's DACL (and its other attributes): the user's file keeps whatever access they gave
+// it. If the ACL can't be carried over, the file is left private, never more open. A missing file is made private.
+func (p Platform) RewriteFile(path string, data []byte) error {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return p.WriteFilePrivate(path, data)
+	}
+	sa, err := privateAttributes(false)
+	if err != nil {
+		return err
+	}
+	var suffix [8]byte
+	rand.Read(suffix[:])
+	tmp := path + ".new-" + hex.EncodeToString(suffix[:])
+	h, err := windows.CreateFile(utf16z(tmp), windows.GENERIC_WRITE, 0, sa, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(h), tmp)
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		if r, _, e := procReplaceFile.Call(uintptr(unsafe.Pointer(utf16z(path))), uintptr(unsafe.Pointer(utf16z(tmp))), 0,
+			replaceFileIgnoreMergeErrors|replaceFileIgnoreACLErrors, 0, 0); r == 0 {
+			err = e
+		}
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
+}
+
 func (Platform) Lock(path string) (func(), error) {
 	sa, err := privateAttributes(false)
 	if err != nil {
