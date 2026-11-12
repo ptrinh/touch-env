@@ -6,11 +6,17 @@ package core
 // session (session-bind@openssh.com), and touchenv checks that signature and looks the key up in known_hosts.
 // Clients can't add, remove or lock keys, and never get one. No grants or 5-minute approvals cover signatures on
 // Windows (docs/windows.md): each one is a Windows Hello prompt.
+//
+// The agent runs for as long as you're logged on, so it never unlocks the store itself: once it has checked a request
+// and written the prompt, it starts "touchenv ssh agent sign" (SSHHost.SignHelper), a process that asks Windows
+// Hello, opens that one key, signs and exits, taking the store's key and the private key with it. Any program
+// running as you can start that helper too, so it checks the request again on its own (signHelper below).
 
 import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +40,12 @@ const (
 	sshMaxWaiting = 4  // requests waiting behind the one prompt shown at a time; more are refused at once
 	sshMaxName    = 64 // runes of a user name or SSHSIG namespace shown in the prompt
 	sshLogMax     = 256 << 10
+	// The prompt the agent hands the sign helper: at most this many lines and runes; lines after the first (the
+	// server, forwarding) are cut to sshMaxLine runes.
+	sshMaxPromptLines = 4
+	sshMaxPrompt      = 1500
+	sshMaxLine        = 300
+	sshMaxRequest     = 1 << 20 // bytes of a request to the sign helper
 )
 
 var errRefused = errors.New("refused")
@@ -57,19 +69,26 @@ type sshBinding struct {
 // sshSession is one client connection (one ssh process, usually).
 type sshSession struct {
 	a     *sshAgent
+	conn  io.ReadWriteCloser
 	pid   uint32
 	binds []sshBinding
 }
 
 func (a *sshAgent) serve(conn io.ReadWriteCloser, pid uint32) {
 	defer conn.Close()
-	agent.ServeAgent(&sshSession{a: a, pid: pid}, conn)
+	agent.ServeAgent(&sshSession{a: a, conn: conn, pid: pid}, conn)
+}
+
+// gone: the client closed its end while its request waited (ssh stopped with Ctrl-C, a git fetch cancelled).
+func (s *sshSession) gone() bool {
+	g, ok := s.conn.(ClientGone)
+	return ok && g.ClientGone()
 }
 
 // MARK: who asks
 
 // requester names who asks for a signature: the nearest process above the client that is neither a shell nor an
-// ssh tool, and the ssh tools in between (nearest last: "git, ssh").
+// ssh tool, and the ssh tools in between (nearest last: "git, ssh"). The name is made fit for the prompt.
 func (a *sshAgent) requester(pid uint32) (Requester, []string) {
 	t := a.c.ssh.Procs()
 	var chain []Process
@@ -86,7 +105,60 @@ func (a *sshAgent) requester(pid uint32) (Requester, []string) {
 		chain = append(chain, Process{Name: name})
 	}
 	r, _ := classify(chain)
+	r.Name = cut(promptClean(r.Name), sshMaxName)
 	return r, via
+}
+
+// MARK: the prompt's text
+
+// promptClean: s with every character that isn't printable (control and formatting characters, line breaks,
+// spaces other than the plain one) shown as "?", so a name can't break the prompt's lines or hide what follows.
+func promptClean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r != utf8.RuneError && unicode.IsPrint(r) {
+			return r
+		}
+		return '?'
+	}, s)
+}
+
+func cut(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n-1]) + "…"
+}
+
+// sshPromptText joins the prompt's lines, each made printable, the later ones cut to sshMaxLine runes.
+func sshPromptText(lines []string) string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = promptClean(l)
+		if i > 0 {
+			out[i] = cut(out[i], sshMaxLine)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// sshPromptOK: whether text is a prompt the sign helper shows: printable lines only, no more than the agent writes,
+// and a first line that says what is signed with which key, as the agent writes it (firstEnd).
+func sshPromptOK(text, firstEnd string) bool {
+	lines := strings.Split(text, "\n")
+	if !utf8.ValidString(text) || utf8.RuneCountInString(text) > sshMaxPrompt || len(lines) > sshMaxPromptLines {
+		return false
+	}
+	for _, l := range lines {
+		if l == "" || promptClean(l) != l {
+			return false
+		}
+	}
+	return strings.HasPrefix(lines[0], "touchenv: Allow ") && strings.HasSuffix(lines[0], firstEnd)
+}
+
+// sshFirstEnd: how the prompt's first line ends for a signature of purpose with the key name.
+func sshFirstEnd(p sshPurpose, name string) string {
+	return " to " + p.what() + " with the SSH key " + name + "?"
 }
 
 // MARK: what is signed
@@ -97,6 +169,42 @@ type sshPurpose struct {
 	user      string
 	hostKey   ssh.PublicKey // publickey-hostbound-v00@openssh.com carries the server key too
 	namespace string        // SSHSIG
+}
+
+// what: the purpose as the prompt says it ("log in as git", "sign a git commit or tag").
+func (p sshPurpose) what() string {
+	if p.login {
+		return "log in as " + p.user
+	}
+	switch p.namespace {
+	case "git":
+		return "sign a git commit or tag"
+	case "file":
+		return "sign a file"
+	}
+	return "make an SSH signature (" + p.namespace + ")"
+}
+
+// sshAlgorithm: the signature algorithm for key and the client's flags; "" for ssh-rsa (SHA-1), which is refused.
+func sshAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
+	if key.Type() != ssh.KeyAlgoRSA {
+		return key.Type()
+	}
+	switch {
+	case flags&agent.SignatureFlagRsaSha512 != 0:
+		return ssh.KeyAlgoRSASHA512
+	case flags&agent.SignatureFlagRsaSha256 != 0:
+		return ssh.KeyAlgoRSASHA256
+	}
+	return ""
+}
+
+// sshAlgorithmOK: algorithm is one touchenv signs with for key (never ssh-rsa, SHA-1).
+func sshAlgorithmOK(key ssh.PublicKey, algorithm string) bool {
+	if key.Type() == ssh.KeyAlgoRSA {
+		return algorithm == ssh.KeyAlgoRSASHA256 || algorithm == ssh.KeyAlgoRSASHA512
+	}
+	return algorithm == key.Type()
 }
 
 type sshReader struct{ b []byte }
@@ -295,7 +403,7 @@ func (s *sshSession) Lock([]byte) error              { return errRefused }
 func (s *sshSession) Unlock([]byte) error            { return errRefused }
 func (s *sshSession) Signers() ([]ssh.Signer, error) { return nil, errRefused }
 
-// sign checks the request, asks Windows Hello, and signs.
+// sign checks the request, writes the prompt, and has the sign helper ask Windows Hello and sign.
 func (s *sshSession) sign(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
 	a := s.a
 	st, err := loadStore(a.c.p)
@@ -311,53 +419,34 @@ func (s *sshSession) sign(key ssh.PublicKey, data []byte, flags agent.SignatureF
 	if name == "" {
 		return nil, fmt.Errorf("a key touchenv doesn't have (%s)", ssh.FingerprintSHA256(key))
 	}
-	algorithm := key.Type()
-	if algorithm == ssh.KeyAlgoRSA {
-		switch {
-		case flags&agent.SignatureFlagRsaSha512 != 0:
-			algorithm = ssh.KeyAlgoRSASHA512
-		case flags&agent.SignatureFlagRsaSha256 != 0:
-			algorithm = ssh.KeyAlgoRSASHA256
-		default:
-			return nil, errors.New("ssh-rsa (SHA-1) signatures are refused; the server needs rsa-sha2-256 or -512")
-		}
+	algorithm := sshAlgorithm(key, flags)
+	if algorithm == "" {
+		return nil, errors.New("ssh-rsa (SHA-1) signatures are refused; the server needs rsa-sha2-256 or -512")
 	}
 	purpose, ok := parsePurpose(data)
 	if !ok {
 		return nil, fmt.Errorf("%s: neither an ssh login nor an SSHSIG signature", name)
 	}
 	who, via := a.requester(s.pid)
-	var what string
+	what := purpose.what()
 	var binding, forwardedBy *sshBinding
-	if purpose.login {
-		if len(s.binds) > 0 {
-			for i := range s.binds {
-				if bytes.Equal(s.binds[i].sessionID, purpose.sessionID) {
-					binding = &s.binds[i]
-					break
-				}
-				// ssh -A binds the connection to the host it forwards the agent to first: what follows on this
-				// connection is asked by that host, not by a program on this PC.
-				if s.binds[i].forwarding && forwardedBy == nil {
-					forwardedBy = &s.binds[i]
-				}
+	if purpose.login && len(s.binds) > 0 {
+		for i := range s.binds {
+			if bytes.Equal(s.binds[i].sessionID, purpose.sessionID) {
+				binding = &s.binds[i]
+				break
 			}
-			if binding == nil {
-				return nil, fmt.Errorf("%s: a login for a session this ssh didn't bind", name)
-			}
-			if purpose.hostKey != nil && !bytes.Equal(purpose.hostKey.Marshal(), binding.hostKey.Marshal()) {
-				return nil, fmt.Errorf("%s: the login names another server than the session", name)
+			// ssh -A binds the connection to the host it forwards the agent to first: what follows on this
+			// connection is asked by that host, not by a program on this PC.
+			if s.binds[i].forwarding && forwardedBy == nil {
+				forwardedBy = &s.binds[i]
 			}
 		}
-		what = fmt.Sprintf("log in as %s", purpose.user)
-	} else {
-		switch purpose.namespace {
-		case "git":
-			what = "sign a git commit or tag"
-		case "file":
-			what = "sign a file"
-		default:
-			what = fmt.Sprintf("make an SSH signature (%s)", purpose.namespace)
+		if binding == nil {
+			return nil, fmt.Errorf("%s: a login for a session this ssh didn't bind", name)
+		}
+		if purpose.hostKey != nil && !bytes.Equal(purpose.hostKey.Marshal(), binding.hostKey.Marshal()) {
+			return nil, fmt.Errorf("%s: the login names another server than the session", name)
 		}
 	}
 	through := ""
@@ -375,7 +464,7 @@ func (s *sshSession) sign(key ssh.PublicKey, data []byte, flags agent.SignatureF
 		}
 		lines = append(lines, "Asked through agent forwarding (ssh -A) by "+a.hostText(from.hostKey)+", not by a program on this PC.")
 	}
-	text := strings.Join(lines, "\n")
+	text := sshPromptText(lines)
 
 	if err := a.c.h.Ready(); err != nil {
 		return nil, fmt.Errorf("%s for %s: nobody can answer Windows Hello here (%v)", name, who.Name, err)
@@ -394,14 +483,119 @@ func (s *sshSession) sign(key ssh.PublicKey, data []byte, flags agent.SignatureF
 		a.waiting--
 		a.mu.Unlock()
 	}()
+	// While it waited its turn, ssh may have been stopped, or the screen locked.
+	if s.gone() {
+		return nil, fmt.Errorf("%s for %s: ssh went away while the request waited its turn; not asked", name, who.Name)
+	}
+	if err := a.c.h.Ready(); err != nil {
+		return nil, fmt.Errorf("%s for %s: nobody can answer Windows Hello here (%v)", name, who.Name, err)
+	}
 
-	storeKey, err := st.unlock(a.c.h, text)
+	request, err := json.Marshal(sshSignRequest{Key: name, PublicKey: key.Marshal(), Algorithm: algorithm, Data: data, Prompt: text})
 	if err != nil {
+		return nil, err
+	}
+	out, err := a.c.ssh.SignHelper(request)
+	if err != nil {
+		return nil, fmt.Errorf("%s for %s: %v", name, who.Name, err)
+	}
+	var reply sshSignReply
+	if err := json.Unmarshal(out, &reply); err != nil {
+		return nil, fmt.Errorf("%s for %s: the sign helper gave no answer", name, who.Name)
+	}
+	if reply.Error != "" {
+		return nil, fmt.Errorf("%s for %s: %s", name, who.Name, cut(promptClean(reply.Error), sshMaxLine))
+	}
+	sig := &ssh.Signature{Format: reply.Format, Blob: reply.Blob}
+	if sig.Format != algorithm || key.Verify(data, sig) != nil {
+		return nil, fmt.Errorf("%s for %s: the sign helper's signature doesn't check", name, who.Name)
+	}
+	a.c.sshLog("signed: %s%s, %s with %s", who.Name, through, what, name)
+	return sig, nil
+}
+
+// MARK: the sign helper (touchenv ssh agent sign)
+
+// sshSignRequest is what the agent sends the sign helper on its stdin, as JSON.
+type sshSignRequest struct {
+	Key       string `json:"key"`        // the key's name in the store
+	PublicKey []byte `json:"public_key"` // its public half, as ssh sent it
+	Algorithm string `json:"algorithm"`
+	Data      []byte `json:"data"` // what to sign: an ssh login or an SSHSIG
+	Prompt    string `json:"prompt"`
+}
+
+// sshSignReply is the helper's answer on its stdout: the signature, or why not.
+type sshSignReply struct {
+	Format string `json:"format,omitempty"`
+	Blob   []byte `json:"blob,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// sshAgentSign is the sign helper: one request in, one reply out. Any program running as you can start it, so it
+// checks everything again: the key is an SSH key in the store with that public half, the data is an ssh login or
+// an SSHSIG signature, the algorithm isn't SHA-1, and the prompt is printable, short, and its first line says what is
+// signed with which key as the agent says it. What it can't check (who asks, the server) is what any program running
+// as you could put in a Windows Hello prompt of its own anyway (docs/windows.md, "Weaker than on a Mac").
+func (c *cmd) sshAgentSign() error {
+	data, err := io.ReadAll(io.LimitReader(c.env.Stdin, sshMaxRequest+1))
+	var req sshSignRequest
+	if err != nil || len(data) == 0 || len(data) > sshMaxRequest || json.Unmarshal(data, &req) != nil {
+		return die(1, "touchenv: ssh agent sign is started by touchenv's SSH agent, with a request on its stdin")
+	}
+	defer wipe(data)
+	defer wipe(req.Data)
+	var reply sshSignReply
+	sig, err := c.signHelper(req)
+	if err != nil {
+		msg := err.Error()
 		var f fail
 		if errors.As(err, &f) {
-			err = errors.New(strings.TrimPrefix(f.msg, "touchenv: "))
+			msg = f.msg
 		}
-		return nil, fmt.Errorf("%s for %s: %v", name, who.Name, err)
+		reply.Error = strings.TrimPrefix(msg, "touchenv: ")
+	} else {
+		reply.Format, reply.Blob = sig.Format, sig.Blob
+	}
+	if json.NewEncoder(c.env.Stdout).Encode(reply) != nil || err != nil {
+		return exitCode(1)
+	}
+	return nil
+}
+
+func (c *cmd) signHelper(req sshSignRequest) (*ssh.Signature, error) {
+	name := req.Key
+	if !validName(name) {
+		return nil, errors.New("not a key name")
+	}
+	key, err := ssh.ParsePublicKey(req.PublicKey)
+	if err != nil {
+		return nil, errors.New("not a public key")
+	}
+	st, err := loadStore(c.p)
+	if err != nil {
+		return nil, err
+	}
+	if st == nil || st.Secrets[name] == nil || st.SSHKeys[name] == "" {
+		return nil, fmt.Errorf("no SSH key named %s", name)
+	}
+	stored, err := parsePublicLine(st.SSHKeys[name])
+	if err != nil || !bytes.Equal(stored.Marshal(), key.Marshal()) {
+		return nil, fmt.Errorf("%s isn't that key", name)
+	}
+	if !sshAlgorithmOK(key, req.Algorithm) {
+		return nil, fmt.Errorf("%s: %q signatures are refused", name, req.Algorithm)
+	}
+	purpose, ok := parsePurpose(req.Data)
+	if !ok {
+		return nil, fmt.Errorf("%s: neither an ssh login nor an SSHSIG signature", name)
+	}
+	if !sshPromptOK(req.Prompt, sshFirstEnd(purpose, name)) {
+		return nil, fmt.Errorf("%s: the prompt isn't one touchenv's agent writes", name)
+	}
+	storeKey, err := st.unlock(c.h, req.Prompt)
+	if err != nil {
+		return nil, err
 	}
 	secret, err := OpenSecret(storeKey, name, st.Secrets[name])
 	if err != nil {
@@ -417,13 +611,12 @@ func (s *sshSession) sign(key ssh.PublicKey, data []byte, flags agent.SignatureF
 	}
 	algSigner, ok := signer.(ssh.AlgorithmSigner)
 	if !ok {
-		return nil, fmt.Errorf("%s can't sign with %s", name, algorithm)
+		return nil, fmt.Errorf("%s can't sign with %s", name, req.Algorithm)
 	}
-	sig, err := algSigner.SignWithAlgorithm(rand.Reader, data, algorithm)
+	sig, err := algSigner.SignWithAlgorithm(rand.Reader, req.Data, req.Algorithm)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %v", name, err)
 	}
-	a.c.sshLog("signed: %s%s, %s with %s", who.Name, through, what, name)
 	return sig, nil
 }
 

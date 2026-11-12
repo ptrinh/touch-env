@@ -74,10 +74,30 @@ A Go module in [`windows/`](../windows), standard library plus `golang.org/x/sys
   holds and for how long, tested anywhere; `internal/winplat/service_windows.go` is the named pipe
   (`\\.\pipe\touchenv`, interactive users only, the client identified from its token and pid, never from what it
   says) and the process list.
+- The SSH agent (`touchenv ssh agent serve`, `internal/core/sshagent.go`) never unlocks the store: for each
+  signature it starts `touchenv ssh agent sign`, which checks the request again, asks Windows Hello, signs and exits.
 - On a real PC, go through [`windows/MANUAL-TEST.md`](../windows/MANUAL-TEST.md).
 
 ## Releases
 
-`release.sh` (maintainer only) builds into `dist/`, notarizes, staples and zips the Mac app. Publishing the GitHub
-release then runs [`windows.yml`](../.github/workflows/windows.yml), which tests the Windows build and attaches its
-zips.
+`release.sh` (maintainer only) builds into `dist/`, notarizes, staples and zips the Mac app. Then, after
+`gh release create v<version>`:
+
+```sh
+windows/release.sh                     # builds x64 and arm64, signs, verifies, zips into dist/
+gh release upload v<version> dist/touchenv-<version>-windows-x64.zip dist/touchenv-<version>-windows-x64.zip.sha256 \
+    dist/touchenv-<version>-windows-arm64.zip dist/touchenv-<version>-windows-arm64.zip.sha256 --clobber
+```
+
+[`windows/release.sh`](../windows/release.sh) builds `touchenv.exe` with exactly the flags CI uses (version from
+`touchenv.swift`), signs it with `jsign` through Azure Trusted Signing (RFC 3161 timestamp), checks each signature
+with `osslsigncode` against Microsoft's Identity Verification root
+([`windows/microsoft-identity-verification-root-2020.pem`](../windows/microsoft-identity-verification-root-2020.pem),
+from Microsoft's PKI repository, fingerprint pinned in the script), fails unless the signer's CN is the expected
+publisher, zips each with `LICENSE` and writes the `.sha256` files. It prints the upload command rather than running
+it. The signing target (`TOUCHENV_SIGN_ENDPOINT`, `TOUCHENV_SIGN_ACCOUNT`, `TOUCHENV_SIGN_PROFILE`,
+`TOUCHENV_EXPECTED_PUBLISHER`) comes from the environment or the git-ignored `windows/signing.local.env`; the token
+from `az login`. Without a target it refuses; `--unsigned` makes `-UNSIGNED` zips for testing only.
+
+Publishing the GitHub release also runs [`windows.yml`](../.github/workflows/windows.yml), which only tests the
+tagged source on Windows: it no longer builds or attaches anything.

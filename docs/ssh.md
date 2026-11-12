@@ -133,13 +133,15 @@ ssh -T git@github.com                       # Windows Hello asks
 - **The same as on a Mac:** which keys are accepted (a passphrase is asked once; touchenv keeps the key without one,
   behind Windows Hello), names, `.pub` files (in `%LOCALAPPDATA%\touchenv\ssh`), the prompt (who, through which
   tools, which key, the server checked against your `known_hosts`), refusing `ssh-rsa` (SHA-1), refusing at once when
-  nobody can answer Windows Hello (Remote Desktop, an SSH session into the PC), one prompt at a time, and touchenv
-  never deleting your key file.
+  nobody can answer Windows Hello (a locked screen, Remote Desktop, an SSH session into the PC), one prompt at a time,
+  and touchenv never deleting your key file.
 - **The agent** is `touchenv ssh agent serve`, started at logon by a value under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` and at once by `install`. It runs in your session and serves
   `\\.\pipe\touchenv-ssh-<your SID>`, which only your account (and SYSTEM) can open, never over the network. A
-  console window may flash at logon while it starts. `--config` adds this to the end of `%USERPROFILE%\.ssh\config`,
-  after copying it to `config.touchenv-backup`:
+  console window may flash at logon while it starts. `touchenv ssh agent status` checks that what answers on the pipe
+  is touchenv's agent (its program file and your account), and says so when it's something else. `--config` adds
+  this to the end of `%USERPROFILE%\.ssh\config`, after copying it to `config.touchenv-backup` (if `config` is a link,
+  the file it points to is changed, and keeps its permissions):
 
   ```
   Host *
@@ -147,8 +149,8 @@ ssh -T git@github.com                       # Windows Hello asks
   ```
 
   (Forward slashes on purpose: ssh's config parser turns `\\` into `\`, so the usual `\\.\pipe\…` spelling never opens.)
-  Programs that don't read `.ssh\config` (some IDEs) need the environment variable instead:
-  `setx SSH_AUTH_SOCK \\.\pipe\touchenv-ssh-<your SID>`.
+  Programs that don't read `.ssh\config` (JetBrains IDEs, apps built on libgit2) need the environment variable
+  instead: `setx SSH_AUTH_SOCK \\.\pipe\touchenv-ssh-<your SID>`.
 - **Use Windows' own OpenSSH**, 8.9 or later (`ssh -V`; Windows 11 has it, Windows 10 may need the newer
   [Win32-OpenSSH](https://github.com/PowerShell/Win32-OpenSSH/releases)). Older ones don't tell the agent which
   server they reached, so the prompt says the server is unknown. The ssh that comes with Git for Windows can't reach
@@ -160,12 +162,15 @@ ssh -T git@github.com                       # Windows Hello asks
   `ssh load`.
 - **Weaker than on a Mac,** as everything on Windows is (see [windows.md](windows.md#weaker-than-on-a-mac)): any
   program running as you can ask Windows Hello for a signature with its own prompt text, so only touch for a prompt
-  you expected. The agent never hands a key to a client. But it runs for as long as you're logged on, and after a
-  signature its memory can still hold what Windows Hello unlocked (the store's key, the SSH key) until Go's garbage
-  collector reuses it: a program running as you that reads the agent's memory could then decrypt the store without
-  a prompt. `touchenv run` and `get` have the same exposure only for the moment they run.
-- **Not done yet:** it doesn't check for a locked screen (a request then leaves a prompt waiting behind it), and a
-  request whose ssh was cancelled still shows its prompt.
+  you expected. The agent never hands a key to a client, and never holds one: it runs for as long as you're logged
+  on, so for each signature it starts `touchenv ssh agent sign`, a process of its own that asks Windows Hello, opens
+  that one key, signs and exits. What Windows Hello unlocked (the store's key, the SSH key) is gone with it, as it is
+  when `touchenv run` or `get` ends; a program reading the agent's memory finds public keys and requests only. Any
+  program running as you can start that helper too, with its own text: that is the limit above, not a new one. The
+  helper still signs only an ssh login or a git/SSHSIG signature, with a key you added, and only with a prompt whose
+  first line says what is signed with which key.
+- **A request nobody waits for any more is dropped:** if ssh is stopped (Ctrl-C, a cancelled `git fetch`) while its
+  request waits its turn, there's no prompt for it. A prompt left unanswered for 3 minutes is closed and refused.
 - Refusals and signatures are logged to `%LOCALAPPDATA%\touchenv\ssh-agent.log`; `touchenv ssh agent status` shows
   the latest.
 - An SSH key moved with `export`/`import` (either way between a Mac and a PC) is an SSH key again on Windows:

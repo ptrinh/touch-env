@@ -216,15 +216,23 @@ func run(args []string, env *Env) error {
 }
 
 type cmd struct {
-	env *Env
-	o   options
-	p   Platform
-	h   Hello
-	svc Service
-	ssh SSHHost
+	env      *Env
+	o        options
+	p        Platform
+	h        Hello
+	svc      Service
+	ssh      SSHHost
+	whoCache *Requester
 }
 
-func (c *cmd) who() Requester { return ClassifyChain(c.p.Ancestors()) }
+// who names the program that ran touchenv. The process list is read once per command.
+func (c *cmd) who() Requester {
+	if c.whoCache == nil {
+		r := ClassifyChain(c.p.Ancestors())
+		c.whoCache = &r
+	}
+	return *c.whoCache
+}
 
 // requireIntent: an AI agent must give a reason for anything that asks for Windows Hello or reads a secret, so the
 // prompt always says why. Refused before any prompt: the agent reads the error and asks again with one.
@@ -754,28 +762,34 @@ func (c *cmd) importCmd(args []string) error {
 		return die(1, "touchenv: %s holds no secrets", path)
 	}
 	sealed := map[string][]byte{}
+	sizes := map[string]int{}
 	sshLines := map[string]string{} // SSH keys among them (touchenv ssh add on the other machine): their public line
-	var lines []string
-	stored := 0
+	var order []string
 	for _, secret := range in {
-		if s.Secrets[secret.name] != nil && !c.o.replace {
-			lines = append(lines, fmt.Sprintf("skipped %s: already here (touchenv import --replace to overwrite)", secret.name))
-			continue
-		}
 		box, err := SealSecret(s.storePublic, secret.name, secret.data)
+		if _, seen := sealed[secret.name]; !seen {
+			order = append(order, secret.name)
+		}
 		sshLines[secret.name] = sshLineOf(secret.name, secret.data)
+		sizes[secret.name] = len(secret.data)
 		wipe(secret.data)
 		if err != nil {
 			return die(1, "touchenv: %v", err)
 		}
 		sealed[secret.name] = box
-		stored++
-		lines = append(lines, fmt.Sprintf("stored %s (%d bytes)", secret.name, len(secret.data)))
 	}
-	// One import per receiving key, and the file has done its job.
+	// Which names are already here is decided under the store's lock, on the store as it is then: a secret saved
+	// while Windows Hello was asking is kept unless --replace. One import per receiving key, and the file has done
+	// its job.
+	var lines, storedNames []string
 	if err := c.modify(s.StoreKey, func(st *storeFile) error {
-		for name, box := range sealed {
-			st.Secrets[name] = box
+		lines, storedNames = nil, nil
+		for _, name := range order {
+			if st.Secrets[name] != nil && !c.o.replace {
+				lines = append(lines, fmt.Sprintf("skipped %s: already here (touchenv import --replace to overwrite)", name))
+				continue
+			}
+			st.Secrets[name] = sealed[name]
 			delete(st.SSHKeys, name)
 			if line := sshLines[name]; line != "" {
 				if st.SSHKeys == nil {
@@ -783,11 +797,23 @@ func (c *cmd) importCmd(args []string) error {
 				}
 				st.SSHKeys[name] = line
 			}
+			storedNames = append(storedNames, name)
+			lines = append(lines, fmt.Sprintf("stored %s (%d bytes)", name, sizes[name]))
 		}
 		st.Import = nil
 		return nil
 	}); err != nil {
 		return err
+	}
+	stored := len(storedNames)
+	// Each stored name's .pub follows what it is now: an SSH key's public line, or none for a plain secret (one that
+	// replaced an SSH key would otherwise leave its old .pub behind).
+	for _, name := range storedNames {
+		if sshLines[name] != "" {
+			c.writePub(name, sshLines[name])
+		} else if path, err := c.sshPubPath(name); err == nil {
+			os.Remove(path)
+		}
 	}
 	for _, line := range lines {
 		fmt.Fprintln(c.env.Stdout, line)

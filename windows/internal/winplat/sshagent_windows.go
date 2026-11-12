@@ -4,9 +4,12 @@ package winplat
 // running in your session (it has to: Windows Hello asks there, and only your account can open the store), started
 // at every logon by a value under HKCU\...\Run and at once by install. It serves the named pipe
 // \\.\pipe\touchenv-ssh-<your SID>, which only your account (and SYSTEM) may open, never from the network. Windows
-// OpenSSH finds it through IdentityAgent in .ssh\config. Uninstall signals a named event the agent waits on.
+// OpenSSH finds it through IdentityAgent in .ssh\config. Uninstall signals a named event the agent waits on. Each
+// signature is made by a short-lived "touchenv ssh agent sign" the agent starts (SignHelper).
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -59,44 +62,149 @@ func stopEventName() (string, error) {
 
 func (SSHHost) Procs() core.ProcTable { return processTable() }
 
-// pipeServer: the image name of the process serving pipe, "" if nobody answers.
-func pipeServer(pipe string) string {
-	h, err := windows.CreateFile(utf16z(pipe), windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil,
-		windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
-	if errors.Is(err, windows.ERROR_PIPE_BUSY) {
-		return "busy"
-	}
-	if err != nil {
-		return ""
-	}
-	defer windows.CloseHandle(h)
-	var pid uint32
-	if windows.GetNamedPipeServerProcessId(h, &pid) != nil {
-		return "unknown"
-	}
-	return processTable()[pid].Name
-}
-
-func (s SSHHost) AgentState() (atLogon, running bool) {
-	if k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE); err == nil {
-		_, _, err = k.GetStringValue(runValue)
-		atLogon = err == nil
-		k.Close()
-	}
-	if pipe, err := s.AgentPipe(); err == nil {
-		server := pipeServer(pipe)
-		running = server == "busy" || strings.EqualFold(server, "touchenv.exe")
-	}
-	return atLogon, running
-}
-
-func (s SSHHost) InstallAgent() error {
+// ownExe: this executable's full path, links resolved.
+func ownExe() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
+	}
+	return exe, nil
+}
+
+// runKeyExe: the program the Run value starts at logon, "" if there is none.
+func runKeyExe() string {
+	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue(runValue)
+	if err != nil || !strings.HasPrefix(v, `"`) {
+		return ""
+	}
+	exe, _, _ := strings.Cut(v[1:], `"`)
+	return exe
+}
+
+// pipeAnswer is what probePipe found on the agent's pipe.
+type pipeAnswer struct {
+	answered bool   // something serves it
+	ours     bool   // touchenv's agent, run as this user from this touchenv.exe or the one started at logon
+	other    string // otherwise, what serves it
+}
+
+// probePipe connects to the agent's pipe and checks who serves it: the server process's full image path and the
+// account it runs as, as Windows reports them (a program can name itself touchenv.exe, not be this file).
+func probePipe(pipe string) pipeAnswer {
+	name := utf16z(pipe)
+	var h windows.Handle
+	var err error
+	for attempt := 0; ; attempt++ {
+		h, err = windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil,
+			windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+		if !errors.Is(err, windows.ERROR_PIPE_BUSY) || attempt == 2 {
+			break
+		}
+		procWaitNamedPipe.Call(uintptr(unsafe.Pointer(name)), 500)
+	}
+	if errors.Is(err, windows.ERROR_PIPE_BUSY) {
+		return pipeAnswer{answered: true, other: "every instance of the pipe is busy, so touchenv couldn't check what serves it; try again"}
+	}
+	if err != nil {
+		return pipeAnswer{}
+	}
+	defer windows.CloseHandle(h)
+	var pid uint32
+	if err := windows.GetNamedPipeServerProcessId(h, &pid); err != nil {
+		return pipeAnswer{answered: true, other: fmt.Sprintf("a process touchenv can't identify (%v)", err)}
+	}
+	return pipeAnswer{answered: true}.checkServer(pid)
+}
+
+func (a pipeAnswer) checkServer(pid uint32) pipeAnswer {
+	p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		a.other = fmt.Sprintf("process %d, which touchenv can't open (%v)", pid, err)
+		return a
+	}
+	defer windows.CloseHandle(p)
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	size := uint32(len(buf))
+	image := fmt.Sprintf("process %d", pid)
+	if windows.QueryFullProcessImageName(p, 0, &buf[0], &size) == nil {
+		image = fmt.Sprintf("%s (pid %d)", windows.UTF16ToString(buf[:size]), pid)
+	}
+	var token windows.Token
+	if err := windows.OpenProcessToken(p, windows.TOKEN_QUERY, &token); err != nil {
+		a.other = image + ", running as another account"
+		return a
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	mine, err2 := userSID()
+	if err != nil || err2 != nil || user.User.Sid.String() != mine {
+		a.other = image + ", running as another account"
+		return a
+	}
+	path := windows.UTF16ToString(buf[:size])
+	for _, want := range []string{runKeyExe(), func() string { e, _ := ownExe(); return e }()} {
+		if want != "" && size > 0 && strings.EqualFold(filepath.Clean(path), filepath.Clean(want)) {
+			a.ours = true
+			return a
+		}
+	}
+	a.other = image
+	return a
+}
+
+func (s SSHHost) AgentState() core.AgentState {
+	var state core.AgentState
+	if k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE); err == nil {
+		_, _, err = k.GetStringValue(runValue)
+		state.AtLogon = err == nil
+		k.Close()
+	}
+	if pipe, err := s.AgentPipe(); err == nil {
+		answer := probePipe(pipe)
+		state.Running, state.Other = answer.ours, answer.other
+	}
+	return state
+}
+
+// signHelperTime: how long a signature may wait for Windows Hello before the helper is ended.
+const signHelperTime = 3 * time.Minute
+
+// SignHelper runs this touchenv.exe as "ssh agent sign", with no console window.
+func (SSHHost) SignHelper(request []byte) ([]byte, error) {
+	exe, err := ownExe()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), signHelperTime)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "ssh", "agent", "sign")
+	cmd.Stdin = bytes.NewReader(request)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW, HideWindow: true}
+	err = cmd.Run()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("Windows Hello wasn't answered within %v", signHelperTime)
+	}
+	var exit *exec.ExitError
+	if err != nil && !errors.As(err, &exit) {
+		return nil, fmt.Errorf("can't run touchenv ssh agent sign: %w", err)
+	}
+	return out.Bytes(), nil
+}
+
+func (s SSHHost) InstallAgent() error {
+	exe, err := ownExe()
+	if err != nil {
+		return err
 	}
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
 	if err != nil {
@@ -119,7 +227,7 @@ func (s SSHHost) InstallAgent() error {
 	}
 	cmd.Process.Release()
 	for i := 0; i < 30; i++ {
-		if _, running := s.AgentState(); running {
+		if s.AgentState().Running {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -142,6 +250,11 @@ func (s SSHHost) UninstallAgent() error {
 // HideConsole: started at logon from the Run key, a console program gets a console window of its own. The agent
 // hides it and lets it go (main calls this for "ssh agent serve" only). A console shared with others (serve typed in
 // a terminal) is left alone.
+//
+// The window still flashes for a moment at logon. Starting the agent as `conhost.exe --headless ...` would avoid
+// it, but --headless is conhost's private switch for ConPTY, not documented for starting programs, and security
+// tools flag that exact command line as a way malware hides windows. A console-allocation policy in the exe's
+// manifest (newer Windows 11 only) is the documented way; not done yet.
 func HideConsole() {
 	var pids [4]uint32
 	if n, _, _ := procConsoleList.Call(uintptr(unsafe.Pointer(&pids[0])), uintptr(len(pids))); n != 1 {
@@ -166,7 +279,7 @@ func (s SSHHost) stop() {
 	windows.SetEvent(ev)
 	windows.CloseHandle(ev)
 	pipe, _ := s.AgentPipe()
-	for i := 0; i < 30 && pipeServer(pipe) != ""; i++ {
+	for i := 0; i < 30 && probePipe(pipe).answered; i++ {
 		time.Sleep(100 * time.Millisecond)
 	}
 }

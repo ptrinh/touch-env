@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestSSHAgentPipe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pipeServer(pipe) != "" {
+	if probePipe(pipe).answered {
 		t.Skip("an SSH agent is already running for this user")
 	}
 	pids := make(chan uint32, 8) // pipeServer's probes connect too; every client here is this process
@@ -33,14 +34,25 @@ func TestSSHAgentPipe(t *testing.T) {
 			conn.Close()
 		})
 	}()
-	server := ""
-	for i := 0; i < 50 && server == ""; i++ {
-		if server = pipeServer(pipe); server == "" {
+	var answer pipeAnswer
+	for i := 0; i < 50 && !answer.answered; i++ {
+		if answer = probePipe(pipe); !answer.answered {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	if server == "" {
+	if !answer.answered {
 		t.Fatal("the agent didn't start serving")
+	}
+	// This test binary serves the pipe: it is "ours" (same file as os.Executable, same account).
+	if !answer.ours || answer.other != "" {
+		t.Fatalf("probe = %+v", answer)
+	}
+	if state := host.AgentState(); !state.Running || state.Other != "" {
+		t.Fatalf("AgentState = %+v", state)
+	}
+	// A process serving the pipe that isn't this file (cmd.exe stands in) is reported, not counted as running.
+	if other := (pipeAnswer{}).checkServer(cmdPID(t)); other.ours || !strings.Contains(strings.ToLower(other.other), "cmd.exe") {
+		t.Fatalf("another program: %+v", other)
 	}
 
 	// ssh opens the pipe for overlapped I/O. So does this client; Go's agent client reads in the background while

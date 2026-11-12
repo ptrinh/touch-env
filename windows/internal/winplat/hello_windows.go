@@ -147,6 +147,11 @@ func (h *Hello) Ready() error {
 	if windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session) == nil && session == 0 {
 		return errors.New("no desktop to show Windows Hello on (a service, or an SSH session): run touchenv in a window on the PC")
 	}
+	// On the lock screen nobody sees the prompt: it would wait behind it (holding up the SSH agent's queue), so refuse
+	// at once, as on a Mac. Applies to the command line too: a scheduled task can run it while the PC is locked.
+	if locked, _ := sessionLocked(session); locked {
+		return errors.New("the PC is locked, so nobody can answer Windows Hello: unlock it and try again")
+	}
 	if !windowStationVisible() {
 		return errors.New("no desktop to show Windows Hello on (a service, or an SSH session): run touchenv in a window on the PC")
 	}
