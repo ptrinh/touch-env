@@ -22,12 +22,16 @@ func main() {
 			os.Exit(winplat.Elevated(args[1:]))
 		}
 	}
+	if len(args) == 3 && args[0] == "ssh" && args[1] == "agent" && args[2] == "serve" {
+		winplat.HideConsole() // the SSH agent runs in the background, started at logon
+	}
 	if len(args) == 1 && args[0] == "tray" {
 		os.Exit(winplat.RunTray())
 	}
 	restore := winplat.UTF8Console()
 	code := core.Main(args, core.Env{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
-		Platform: winplat.New(), Hello: winplat.NewHello(), Service: winplat.NewService()})
+		Platform: winplat.New(), Hello: winplat.NewHello(), Service: winplat.NewService(),
+		SSH: winplat.NewSSHHost()})
 	restore()
 	os.Exit(code)
 }

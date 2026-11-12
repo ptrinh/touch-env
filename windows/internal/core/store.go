@@ -38,6 +38,7 @@ type storeFile struct {
 	Signature   []byte            `json:"store_key_sig"` // Hello key's signature over storeKeyDigest(StoreKey)
 	Wrapped     []byte            `json:"wrapped_store_key"`
 	Secrets     map[string][]byte `json:"secrets"`
+	SSHKeys     map[string]string `json:"ssh_keys,omitempty"` // secrets from touchenv ssh add: their public key line
 	Import      *pendingImport    `json:"pending_import,omitempty"`
 	path        string
 	helloKey    *rsa.PublicKey

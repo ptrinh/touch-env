@@ -6,7 +6,7 @@
 #
 # Format: exit code | stream:text the output must contain ("-" for none) | arguments, separated by spaces
 # A line starting "windows:" or "macos:" is checked against that build only (commands only one of them has:
-# Windows has service and status, macOS has ssh).
+# Windows has service and status, macOS has ssh load and the launchd agent).
 #
 # grant arrived in macOS touchenv 1.5.0: the grant cases fail against an older macOS build.
 2 | err:touchenv  |
@@ -110,31 +110,35 @@ windows: 2 | err:usage: touchenv status | status now
 windows: 0 | out:touchenv service install | help
 macos: 2 | err:touchenv: unknown command status | status
 macos: 2 | err:touchenv: unknown command service | service install
-macos: 2 | err:usage: touchenv ssh add | ssh
-macos: 2 | err:usage: touchenv ssh add | ssh frob
+2 | err:usage: touchenv ssh add | ssh
+2 | err:usage: touchenv ssh add | ssh frob
 macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add
 macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add A B C
 macos: 2 | err:usage: touchenv ssh add [--sync] [NAME] KEYFILE | ssh add --sync bad-name /x
-macos: 2 | err:touchenv: unknown option --local | ssh add --local /x
-macos: 2 | err:touchenv: unknown option --sync | ssh rm --sync A
-macos: 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add /nonexistent/touchenv-test-key
+2 | err:touchenv: unknown option --local | ssh add --local /x
+2 | err:touchenv: unknown option --sync | ssh rm --sync A
+1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add /nonexistent/touchenv-test-key
 macos: 1 | err:touchenv: can't read /nonexistent/touchenv-test-key | ssh add --sync MY_KEY /nonexistent/touchenv-test-key
-macos: 2 | err:usage: touchenv ssh ls | ssh ls A
-macos: 2 | err:usage: touchenv ssh rm NAME | ssh rm
-macos: 2 | err:usage: touchenv ssh rm NAME | ssh rm A B
-macos: 2 | err:usage: touchenv ssh rm NAME | ssh rm bad-name
+2 | err:usage: touchenv ssh ls | ssh ls A
+2 | err:usage: touchenv ssh rm NAME | ssh rm
+2 | err:usage: touchenv ssh rm NAME | ssh rm A B
+2 | err:usage: touchenv ssh rm NAME | ssh rm bad-name
 macos: 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load
 macos: 2 | err:usage: touchenv ssh load [--for 1h] NAME ... | ssh load --for 1h bad-name
 macos: 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for 25h A
 macos: 2 | err:touchenv: --for takes a length like 30m, 8h or 1h30m, 24h at most | ssh load --for soon A
 macos: 2 | err:touchenv: unknown option --for | ssh unload --for 1h A
 macos: 2 | err:usage: touchenv ssh unload NAME ... | ssh unload
-macos: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent
-macos: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent frob
-macos: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent install extra
-macos: 2 | err:touchenv: unknown option --bogus | ssh agent status --bogus
+2 | err:usage: touchenv ssh agent install [--config] | ssh agent
+2 | err:usage: touchenv ssh agent install [--config] | ssh agent frob
+2 | err:usage: touchenv ssh agent install [--config] | ssh agent install extra
+2 | err:touchenv: unknown option --bogus | ssh agent status --bogus
 macos: 1 | err:touchenv: ssh agent serve is started by launchd | ssh agent serve
 macos: 0 | out:touchenv ssh add [--sync] [NAME] KEYFILE | help
-windows: 2 | err:touchenv: ssh keys are macOS only | ssh
-windows: 2 | err:touchenv: ssh keys are macOS only | ssh add id_ed25519
-windows: 2 | err:touchenv: ssh keys are macOS only | ssh agent install
+windows: 2 | err:usage: touchenv ssh add [NAME] KEYFILE | ssh add
+windows: 2 | err:usage: touchenv ssh add [NAME] KEYFILE | ssh add A B C
+windows: 2 | err:touchenv: --sync isn't available on Windows | ssh add --sync MY_KEY /x
+windows: 2 | err:touchenv: ssh load is macOS only for now | ssh load A
+windows: 2 | err:touchenv: ssh load is macOS only for now | ssh load --for 1h A
+windows: 2 | err:touchenv: ssh unload is macOS only for now | ssh unload A
+windows: 0 | out:touchenv ssh add [NAME] KEYFILE | help

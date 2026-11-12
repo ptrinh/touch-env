@@ -115,3 +115,31 @@ identity in a test, but can't use Windows Hello, so nothing below has been seen 
 34. **Uninstall.** `touchenv service uninstall` (UAC): the service and `C:\Program Files\touchenv` are gone,
     `touchenv grant` says the service isn't installed, `touchenv lock` says nothing to lock, runs ask every time.
 35. **Arm64.** 20, 22 and 25 on an Arm PC with the arm64 build.
+
+## SSH keys
+
+Windows' own OpenSSH client (`ssh -V`: OpenSSH_for_Windows 8.9 or later sends the server to the agent). Stop the
+stock agent first if it runs (`Get-Service ssh-agent`), so it can't answer instead.
+
+36. **Add.** `ssh-keygen -t ed25519 -f $HOME\.ssh\tenv_test` with a passphrase. `touchenv ssh add
+    $HOME\.ssh\tenv_test`: asks the passphrase once (not shown), prints `stored SSH_TENV_TEST: ED25519 256 SHA256:…`,
+    the `.pub` path under `%LOCALAPPDATA%\touchenv\ssh` and the next steps; the key file is still there.
+    `touchenv ssh ls` lists it without a prompt. Try an RSA key from PuTTYgen's "Export OpenSSH key" too.
+37. **Install.** `touchenv ssh agent install --config`: `.ssh\config` gets the block at its end (and
+    `config.touchenv-backup` the old one); `touchenv ssh agent status` says running, starts at logon, config uses it.
+    **Check `IdentityAgent \\.\pipe\touchenv-ssh-<SID>` is accepted** (`ssh -G github.com | findstr identityagent`).
+    If this OpenSSH ignores it, try `$env:SSH_AUTH_SOCK = "\\.\pipe\touchenv-ssh-<SID>"` and report which works.
+38. **Sign in.** Add the `.pub` to a GitHub account (or a test server). `ssh -T git@github.com`: a Windows Hello
+    prompt naming PowerShell (or Windows Terminal) and ssh, the key, "log in as git" and "Server: github.com, its key
+    as in your known_hosts". Touch: GitHub greets you. Cancel: ssh says "agent refused operation" and
+    `touchenv ssh agent status` lists why under recent.
+39. **Through git and agents.** `git clone git@github.com:<you>/<repo>.git`: the prompt says "(through git, ssh)".
+    From Claude Code: the prompt names Claude Code. A server not in known_hosts: "Server: not in your known_hosts".
+    Commit signing (`git config gpg.format ssh`, `user.signingkey` = the `.pub`, `git commit -S`): "sign a git commit
+    or tag".
+40. **Nobody to ask.** Lock the screen and `ssh` from another PC into this one (or over Remote Desktop), then `ssh -T
+    git@github.com` there: refused at once, no prompt waiting for later.
+41. **Logon and console.** Sign out and in: the agent runs again (status). Note whether a console window flashes at
+    logon and for how long.
+42. **Remove.** `touchenv ssh agent uninstall --config`: stopped, not at logon, the block gone from `.ssh\config`
+    (backup kept). `touchenv ssh rm SSH_TENV_TEST`: one Hello prompt; the `.pub` is gone.

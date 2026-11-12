@@ -1,7 +1,7 @@
 # SSH keys
 
 How to keep SSH private keys behind Touch ID and sign with them for `ssh`, `git`, `scp` and `rsync`, without those
-tools ever seeing the key. macOS only.
+tools ever seeing the key. Windows has the agent too, with Windows Hello: see [On Windows](#on-windows) at the end.
 
 ## Adding a key
 
@@ -102,3 +102,43 @@ touchenv ssh unload SSH_ID_ED25519           # if you loaded it into ssh-agent
 (umask 077; touchenv get SSH_ID_ED25519 > ~/.ssh/id_ed25519)   # the key file back, if you deleted it
 touchenv ssh rm SSH_ID_ED25519
 ```
+
+## On Windows
+
+**Preview: built and tested with fakes and on CI, not yet tried with Windows Hello on a real PC.**
+
+```powershell
+touchenv ssh add $HOME\.ssh\id_ed25519       # stored as SSH_ID_ED25519, on this PC only
+touchenv ssh agent install --config         # the agent, now and at every logon, and the lines in .ssh\config
+ssh -T git@github.com                       # Windows Hello asks
+```
+
+- **The same as on a Mac:** which keys are accepted (a passphrase is asked once; touchenv keeps the key without one,
+  behind Windows Hello), names, `.pub` files (in `%LOCALAPPDATA%\touchenv\ssh`), the prompt (who, through which
+  tools, which key, the server checked against your `known_hosts`), refusing `ssh-rsa` (SHA-1), refusing at once when
+  nobody can answer Windows Hello (Remote Desktop, an SSH session into the PC), one prompt at a time, and touchenv
+  never deleting your key file.
+- **The agent** is `touchenv ssh agent serve`, started at logon by a value under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` and at once by `install`. It runs in your session and serves
+  `\\.\pipe\touchenv-ssh-<your SID>`, which only your account (and SYSTEM) can open, never over the network. A
+  console window may flash at logon while it starts. `--config` adds this to the end of `%USERPROFILE%\.ssh\config`,
+  after copying it to `config.touchenv-backup`:
+
+  ```
+  Host *
+      IdentityAgent \\.\pipe\touchenv-ssh-<your SID>
+  ```
+
+  Stop Windows' own `ssh-agent` service if you used it, and remove the keys you added to it (`ssh-add -D`): it keeps
+  them in the registry, where any program running as you can have them used.
+- **Every signature asks Windows Hello.** No grants or 5-minute approvals cover signatures on Windows, and there's no
+  `ssh load`.
+- **Weaker than on a Mac,** as everything on Windows is (see [windows.md](windows.md#weaker-than-on-a-mac)): any
+  program running as you can ask Windows Hello for a signature with its own prompt text, so only touch for a prompt
+  you expected. It never gets the key.
+- Refusals and signatures are logged to `%LOCALAPPDATA%\touchenv\ssh-agent.log`; `touchenv ssh agent status` shows
+  the latest.
+- An SSH key moved with `export`/`import` (either way between a Mac and a PC) is an SSH key again on Windows:
+  `touchenv ssh ls` lists it. (On a Mac it arrives as a plain secret: `touchenv get NAME` it into a file and
+  `touchenv ssh add` that.)
+- Undo: `touchenv ssh agent uninstall --config`, then `touchenv ssh rm NAME`.

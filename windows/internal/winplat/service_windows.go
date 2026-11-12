@@ -306,10 +306,10 @@ func createInstance(name *uint16, sa *windows.SecurityAttributes, first bool) (w
 		windows.PIPE_UNLIMITED_INSTANCES, 64<<10, 64<<10, 0, sa)
 }
 
-// servePipe accepts connections until stop is signalled; ready (if not nil) is called once the pipe exists. The
-// first instance is made with FILE_FLAG_FIRST_PIPE_INSTANCE: if anything else holds the name, the service doesn't
-// start (and clients check that the pipe's server is this service's process anyway).
-func servePipe(path, sddl string, h *core.Holder, stopEvent windows.Handle, done <-chan struct{}, ready func()) error {
+// servePipe accepts connections until stop is signalled, giving each to serve on its own goroutine; ready (if not
+// nil) is called once the pipe exists. The first instance is made with FILE_FLAG_FIRST_PIPE_INSTANCE: if anything
+// else holds the name, serving doesn't start (and the service's clients check that the pipe's server is its process).
+func servePipe(path, sddl string, serve func(p windows.Handle), stopEvent windows.Handle, done <-chan struct{}, ready func()) error {
 	sa, err := pipeAttributes(sddl)
 	if err != nil {
 		return err
@@ -333,7 +333,7 @@ func servePipe(path, sddl string, h *core.Holder, stopEvent windows.Handle, done
 		listeners.Add(1)
 		go func() {
 			defer listeners.Done()
-			listen(i, p, name, sa, h, stopEvent, done, slots, &handlers)
+			listen(i, p, name, sa, serve, stopEvent, done, slots, &handlers)
 		}()
 	}
 	listeners.Wait()
@@ -343,7 +343,7 @@ func servePipe(path, sddl string, h *core.Holder, stopEvent windows.Handle, done
 
 // listen keeps one instance waiting: wait for a client, hand it to a goroutine, make the next instance at once.
 // Serving never holds up the next instance.
-func listen(id int, p windows.Handle, name *uint16, sa *windows.SecurityAttributes, h *core.Holder, stopEvent windows.Handle,
+func listen(id int, p windows.Handle, name *uint16, sa *windows.SecurityAttributes, serve func(windows.Handle), stopEvent windows.Handle,
 	done <-chan struct{}, slots chan struct{}, handlers *sync.WaitGroup) {
 	defer func() {
 		if p != 0 {
@@ -390,7 +390,7 @@ func listen(id int, p windows.Handle, name *uint16, sa *windows.SecurityAttribut
 		go func() {
 			defer handlers.Done()
 			defer func() { <-slots }()
-			handleClient(h, conn, done)
+			serve(conn)
 		}()
 	}
 }
@@ -512,7 +512,7 @@ func (s *service) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 		return true, 1
 	}
 	go func() {
-		served <- servePipe(pipeName, pipeSDDL(self, "IU"), h, stopEvent, done, func() { close(listening) })
+		served <- servePipe(pipeName, pipeSDDL(self, "IU"), func(p windows.Handle) { handleClient(h, p, done) }, stopEvent, done, func() { close(listening) })
 	}()
 	// Running only once the pipe exists, so a client right after "touchenv service install" finds it.
 	select {

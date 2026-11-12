@@ -145,6 +145,7 @@ type machine struct {
 	now   time.Time
 	stdin string
 	svc   *fakeService // nil: no touchenv service
+	ssh   *fakeSSHHost // nil: no SSH agent support
 }
 
 func newMachine(t *testing.T, keyIndex int) *machine {
@@ -170,6 +171,9 @@ func (m *machine) run(args ...string) result {
 		Hello: m.h, Now: func() time.Time { return m.now }}
 	if m.svc != nil {
 		env.Service = m.svc
+	}
+	if m.ssh != nil {
+		env.SSH = m.ssh
 	}
 	code := Main(args, env)
 	m.stdin = ""

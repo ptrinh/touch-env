@@ -24,8 +24,11 @@ which keys, the intent and the command. Differences:
 - **No `--sync`.** Keys stay on the PC they were saved on.
 - **`ls` doesn't ask.** The names sit in the store file anyway.
 - **Not over Remote Desktop, SSH or from a service.** touchenv refuses rather than ask where you can't answer.
+- **SSH keys** (`touchenv ssh add`, `ls`, `rm`, `agent install`) work as on a Mac, with Windows Hello for every
+  signature: see [ssh.md](ssh.md#on-windows). No grants or 5-minute approvals for signatures, and no
+  `ssh load`/`unload`.
 - **macOS only for now:** standing grants (`grant --always`, `--list`, `--revoke`), the access log
-  (`touchenv log`), `--password` and SSH keys (`touchenv ssh`). They exit with a message saying so.
+  (`touchenv log`), `--password` and `touchenv ssh load`/`unload`. They exit with a message saying so.
 - **Moving keys** works the same way, and between a Mac and a PC in both directions (`import --begin` on the new
   one, `export --to` on the old one; see [new-mac.md](new-mac.md)).
 - AI agents are recognised by program name (`claude.exe`, `codex.exe`…); one that runs inside `node.exe` isn't, so

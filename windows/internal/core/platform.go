@@ -87,3 +87,21 @@ var (
 	// ErrNotService: something other than the touchenv service answers on its pipe.
 	ErrNotService = errors.New("something other than the touchenv service is answering on \\\\.\\pipe\\touchenv")
 )
+
+// SSHHost is what touchenv's SSH agent needs from Windows (internal/winplat); tests use a fake.
+type SSHHost interface {
+	// HomeDir is %USERPROFILE%, where .ssh\config and .ssh\known_hosts live.
+	HomeDir() (string, error)
+	// AgentPipe is the named pipe the agent serves, for IdentityAgent in .ssh\config.
+	AgentPipe() (string, error)
+	// InstallAgent makes the agent start at every logon, and starts it now. UninstallAgent stops it and undoes that.
+	InstallAgent() error
+	UninstallAgent() error
+	// AgentState says whether the agent starts at logon and whether it answers now.
+	AgentState() (atLogon, running bool)
+	// Serve answers connections on the pipe until the agent is told to stop (by UninstallAgent), each on its own
+	// goroutine, with the client's process id. It fails at once when the pipe is held by something else.
+	Serve(handle func(conn io.ReadWriteCloser, clientPID uint32)) error
+	// Procs lists the processes, to name who is asking for a signature.
+	Procs() ProcTable
+}

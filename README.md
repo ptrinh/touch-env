@@ -83,8 +83,8 @@ opens only on that Mac, once, within an hour. See [docs/new-mac.md](docs/new-mac
 ## Windows
 
 A preview: the same commands, with Windows Hello instead of Touch ID, and grants through a service. Weaker than on a
-Mac: any program running as you can ask Windows Hello, and can collect a grant while one is on. No standing grants,
-access log, `--password` or SSH keys yet. See [docs/windows.md](docs/windows.md).
+Mac: any program running as you can ask Windows Hello, and can collect a grant while one is on. SSH keys work, with
+Windows Hello for every signature. No standing grants, access log or `--password` yet. See [docs/windows.md](docs/windows.md).
 
 ## Good to know
 

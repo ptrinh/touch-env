@@ -41,6 +41,11 @@ func usage() string {
   touchenv lock                         end every approval now: 5-minute ones and grants
   touchenv status                       list grants and 5-minute approvals, and each use
 
+  SSH keys (see touchenv ssh for more):
+  touchenv ssh add [NAME] KEYFILE       store an SSH private key; ssh, git and scp sign through touchenv's agent
+  touchenv ssh ls · touchenv ssh rm NAME
+  touchenv ssh agent install [--config] touchenv as your SSH agent: every signature asks for Windows Hello
+
   Grants and 5-minute approvals need the touchenv service (once, as administrator):
   touchenv service install [--offer-5-minutes] · touchenv service uninstall
 
@@ -64,6 +69,7 @@ type Env struct {
 	Platform Platform
 	Hello    Hello
 	Service  Service // nil: no service on this system (grants and 5-minute approvals refused)
+	SSH      SSHHost // nil: no SSH agent on this system
 	Now      func() time.Time
 }
 
@@ -169,7 +175,7 @@ func run(args []string, env *Env) error {
 		}
 	}
 
-	c := &cmd{env: env, o: o, p: env.Platform, h: env.Hello, svc: env.Service}
+	c := &cmd{env: env, o: o, p: env.Platform, h: env.Hello, svc: env.Service, ssh: env.SSH}
 	switch command {
 	case "set":
 		return c.set(args)
@@ -197,8 +203,7 @@ func run(args []string, env *Env) error {
 		// The access log exists in the macOS build only (docs/access-log.md).
 		return die(2, "touchenv: the access log is macOS only for now")
 	case "ssh":
-		// The SSH agent and key commands exist in the macOS build only (docs/ssh.md).
-		return die(2, "touchenv: ssh keys are macOS only for now")
+		return c.sshCmd(args)
 	case "help", "-h", "--help":
 		fmt.Fprintln(env.Stdout, usage())
 		return nil
@@ -216,6 +221,7 @@ type cmd struct {
 	p   Platform
 	h   Hello
 	svc Service
+	ssh SSHHost
 }
 
 func (c *cmd) who() Requester { return ClassifyChain(c.p.Ancestors()) }
@@ -314,6 +320,9 @@ func (c *cmd) set(args []string) error {
 		return err
 	}
 	_, existed := s.Secrets[name]
+	if s.SSHKeys[name] != "" {
+		return die(1, "touchenv: %s is an SSH key: touchenv ssh rm %s, then touchenv ssh add %s KEYFILE", name, name, name)
+	}
 	if existed {
 		if err := c.requireIntent(fmt.Sprintf(`touchenv set --intent "<why>" %s`, name)); err != nil {
 			return err
@@ -327,6 +336,9 @@ func (c *cmd) set(args []string) error {
 		return die(1, "touchenv: %v", err)
 	}
 	if err := c.modify(s.StoreKey, func(st *storeFile) error {
+		if st.SSHKeys[name] != "" {
+			return die(1, "touchenv: %s is an SSH key: touchenv ssh rm %s, then touchenv ssh add %s KEYFILE", name, name, name)
+		}
 		if !existed && st.Secrets[name] != nil { // saved meanwhile by another touchenv: replacing it must ask
 			return die(1, "touchenv: %s was saved meanwhile by another touchenv; run this again to replace it", name)
 		}
@@ -391,8 +403,15 @@ func (c *cmd) rm(args []string) error {
 	if _, err := s.unlock(c.h, c.promptText(fmt.Sprintf("Allow %s to delete %s?", c.who().Name, args[0]), "")); err != nil {
 		return err
 	}
-	if err := c.modify(s.StoreKey, func(st *storeFile) error { delete(st.Secrets, args[0]); return nil }); err != nil {
+	if err := c.modify(s.StoreKey, func(st *storeFile) error {
+		delete(st.Secrets, args[0])
+		delete(st.SSHKeys, args[0])
+		return nil
+	}); err != nil {
 		return err
+	}
+	if path, err := c.sshPubPath(args[0]); err == nil {
+		os.Remove(path) // an SSH key's public half, if it was one
 	}
 	fmt.Fprintf(c.env.Stdout, "deleted %s\n", args[0])
 	return nil
@@ -735,6 +754,7 @@ func (c *cmd) importCmd(args []string) error {
 		return die(1, "touchenv: %s holds no secrets", path)
 	}
 	sealed := map[string][]byte{}
+	sshLines := map[string]string{} // SSH keys among them (touchenv ssh add on the other machine): their public line
 	var lines []string
 	stored := 0
 	for _, secret := range in {
@@ -743,6 +763,7 @@ func (c *cmd) importCmd(args []string) error {
 			continue
 		}
 		box, err := SealSecret(s.storePublic, secret.name, secret.data)
+		sshLines[secret.name] = sshLineOf(secret.name, secret.data)
 		wipe(secret.data)
 		if err != nil {
 			return die(1, "touchenv: %v", err)
@@ -755,6 +776,13 @@ func (c *cmd) importCmd(args []string) error {
 	if err := c.modify(s.StoreKey, func(st *storeFile) error {
 		for name, box := range sealed {
 			st.Secrets[name] = box
+			delete(st.SSHKeys, name)
+			if line := sshLines[name]; line != "" {
+				if st.SSHKeys == nil {
+					st.SSHKeys = map[string]string{}
+				}
+				st.SSHKeys[name] = line
+			}
 		}
 		st.Import = nil
 		return nil

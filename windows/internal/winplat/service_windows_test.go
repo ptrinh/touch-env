@@ -82,7 +82,7 @@ func testPipe(t *testing.T, h *core.Holder) string {
 	go func() {
 		// The service's DACL, with this test's account standing in for both the service and the interactive
 		// users (a CI runner's logon isn't interactive).
-		served <- servePipe(path, pipeSDDL(sid, sid), h, stop, done, func() { close(ready) })
+		served <- servePipe(path, pipeSDDL(sid, sid), func(p windows.Handle) { handleClient(h, p, done) }, stop, done, func() { close(ready) })
 	}()
 	select { // never os.Stat a pipe to wait for it: that opens it, and uses up an instance
 	case <-ready:
