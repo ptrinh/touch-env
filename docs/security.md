@@ -25,8 +25,14 @@ programs running as you can't read them.
 ## What a touch approves
 
 - **Read before you touch.** An approved command can do anything with the key, including sending it elsewhere. The
-  intent is written by whoever asks; check the command under **More detail**. The app named in the prompt, and its
-  icon, are read from the running processes: they tell you who asks, but a program could fake them.
+  intent is written by whoever asks; check the command: its first lines are always shown, all of it under **More
+  detail** (a very long one as its start and its end, with how many characters are left out between; control,
+  bidi and other invisible characters shown as �). The app named in the prompt, and its icon, are read from the
+  running processes: they tell you who asks, but a program could fake them. Inside tmux or screen the chain of
+  processes ends at its server, so that is who asks: an approval or a grant there covers every window in it.
+- **Switching sync.** `set NAME` on a synced secret, without `--sync`, takes it out of iCloud Keychain, and so off
+  your other Macs; `set --sync` on a local one puts it there. The prompt says so; the new copy is stored before the
+  old one is deleted.
 - **5-minute approvals and timed grants** hand the key to anything that app runs, without asking, until they end:
   including a command a booby-trapped web page talked an agent into. Each use flashes a notice. They are kept only
   in the memory of touchenv's background copy, which hands them out only to touchenv itself, signed like it, and

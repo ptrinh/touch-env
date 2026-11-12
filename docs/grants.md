@@ -32,7 +32,8 @@ One touch; the prompt spells out the keys and both limits (both are required). T
 Claude Code session, or everything in that terminal app) and the commands it starts get those keys from
 `touchenv run` without asking, **also while the Mac is locked**. It ends at the time (24 hours at most), after that
 many runs (500 at most), on `touchenv lock` or **Lock Now**, when that app quits, or when you log out. `get` still
-asks.
+asks. Inside tmux or screen, the app is the tmux (or screen) server: the grant, or a 5-minute approval, covers every
+window and pane in it.
 
 Until it ends, anything that app runs can take those keys, as with the 5-minute approval but for longer and with
 nobody watching. Grants also cover SSH signatures (see [ssh.md](ssh.md)).
@@ -59,7 +60,9 @@ has to give `--intent`, and every read is in the [access log](access-log.md).
 
 **What counts as that program** is checked on every read, against the process that ran touchenv:
 
-- **A shell script** (`#!/bin/sh`, bash, zsh, dash, ksh or csh, also through `#!/usr/bin/env`):
+- **A shell script** (`#!/bin/sh`, bash, zsh, dash, ksh or csh, also through `#!/usr/bin/env` when the first one on
+  your PATH is the Mac's own in `/bin`; a Homebrew bash first on PATH is refused at grant time, since the grant could
+  never match: write `#!/bin/bash`):
   - The process must be the Mac's own shell in `/bin`, its Apple signature checked, started on that file:
     `sh helper.sh`, `/full/path/helper.sh`, the script run directly, through a symbolic link, or with options like
     `-e`. Not `sh -c '…'`: those are someone else's commands.
@@ -72,7 +75,9 @@ has to give `--intent`, and every read is in the [access log](access-log.md).
     touchenv, start it by its full path.
 - **A signed program or app**: its code signature, checked by macOS on the running process. Team and identifier
   for a Developer ID program, so its updates keep the grant; the exact build for an ad hoc signed one. The process
-  must be the app's own executable, not a helper inside it.
+  must be the app's own executable, not a helper inside it. A program that runs whatever code it is given
+  (python, node, ruby, perl, osascript, a shell from Homebrew…) is accepted with a warning in the terminal and the
+  prompt: the grant then reaches every script it runs.
 
 A grant that expired or used up its uses is logged and then touchenv asks as usual.
 

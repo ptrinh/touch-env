@@ -60,6 +60,14 @@ if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--session" {
     exit(status)
 }
 
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--child", CommandLine.arguments[2] == "typed" {
+    // touchenv set at a terminal: what readHiddenLine gives back, on stdout.
+    let tty = open("/dev/tty", O_RDWR)
+    guard let data = readHiddenLine(tty, prompt: "Secret (not shown): ", limit: 4096) else { print("NO INPUT"); exit(3) }
+    FileHandle.standardOutput.write(data)
+    exit(0)
+}
+
 if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--child" {
     let env = ProcessInfo.processInfo.environment
     homePath = env["TEST_HOME"]!
@@ -333,6 +341,43 @@ do {
 }
 
 check(!logText().contains(goodPassword) && !logText().contains(secretValue), "no password or value in the log")
+
+// MARK: touchenv set typed at the terminal: no 128-character (getpass) or 1024-character (line buffer) cut
+
+do {
+    let alphabet = Array("abcdefghijklmnopqrstuvwxyz0123456789")
+    let long = String((0..<2000).map { alphabet[$0 % alphabet.count] })
+    let tty = Terminal()
+    let child = start("typed", names: "", terminal: tty)
+    check(tty.waitFor("(not shown): "), "the prompt is on the terminal")
+    check(!tty.echoOn, "echo is off while it waits")
+    for chunk in stride(from: 0, to: long.count, by: 500) {   // as a paste arrives
+        tty.type(String(long.dropFirst(chunk).prefix(500)))
+        usleep(20_000)
+    }
+    tty.type("\n")
+    let r = finish(child)
+    check(r.status == 0 && r.out == long, "all 2000 characters stored: got \(r.out.count)")
+    usleep(100_000)
+    check(!tty.text.contains("abcdefghij"), "not echoed")
+    check(r.err.contains("ECHO-AFTER: on"), "echo is back on")
+}
+do {
+    let tty = Terminal()
+    let child = start("typed", names: "", terminal: tty)
+    tty.waitFor("(not shown): ")
+    tty.type("wrong\u{15}sk-é\u{7f}e\u{7f}\u{7f}x-123\n")   // Ctrl-U clears, backspace takes a whole character
+    let r = finish(child)
+    check(r.out == "skx-123", "line editing: [\(r.out)]")
+}
+do {
+    let tty = Terminal()
+    let child = start("typed", names: "", terminal: tty)
+    tty.waitFor("(not shown): ")
+    tty.type("\u{4}")
+    let r = finish(child)
+    check(r.status == 3 && r.out.contains("NO INPUT"), "Ctrl-D on an empty line: no input")
+}
 
 print("\(passes) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

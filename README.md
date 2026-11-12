@@ -89,7 +89,8 @@ Windows Hello for every signature. No standing grants, access log or `--password
 ## Good to know
 
 - **Read before you touch.** An approved command can do anything with the key. The intent is written by whoever
-  asks; check the command under **More detail**.
+  asks; check the command: its first lines are always in the prompt, all of it under **More detail** (a very long
+  one as its start and its end, with how much is left out between).
 - **Local keys are locked by macOS.** A key saved without `--sync` stays on this Mac and the Keychain itself asks
   for Touch ID (or the Mac password) on every read: malware running as you can't read it without your finger.
 - **Synced keys (`--sync`) are guarded by touchenv, not by macOS.** iCloud Keychain won't take the Touch ID lock,

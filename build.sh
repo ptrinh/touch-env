@@ -25,8 +25,10 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 app="$work/touchenv.app"
 mkdir -p "$app/Contents/MacOS"
-swiftc -O -target arm64-apple-macos13 touchenv.swift -o "$work/touchenv-arm64"
-swiftc -O -target x86_64-apple-macos13 touchenv.swift -o "$work/touchenv-x86_64"
+# Optimized for size, local symbols stripped before signing (about a third smaller; nothing runs slower that matters).
+swiftc -Osize -target arm64-apple-macos13 touchenv.swift -o "$work/touchenv-arm64"
+swiftc -Osize -target x86_64-apple-macos13 touchenv.swift -o "$work/touchenv-x86_64"
+strip -x "$work/touchenv-arm64" "$work/touchenv-x86_64"
 lipo -create "$work/touchenv-arm64" "$work/touchenv-x86_64" -output "$app/Contents/MacOS/touchenv"
 cp "$TOUCHENV_PROFILE" "$app/Contents/embedded.provisionprofile"
 mkdir -p "$app/Contents/Resources"
