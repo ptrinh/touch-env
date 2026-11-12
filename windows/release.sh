@@ -123,7 +123,9 @@ for arch in amd64:x64 arm64:arm64; do
     echo "-- $name: signed, timestamped and verified ($TOUCHENV_EXPECTED_PUBLISHER)"
   fi
   cp "$ROOT/LICENSE" "$BUILD/$name/"
-  zip="touchenv-$VERSION-windows-$name$([ "$UNSIGNED" = 1 ] && echo -UNSIGNED).zip"
+  suffix=""
+  if [ "$UNSIGNED" = 1 ]; then suffix="-UNSIGNED"; fi # not $( [ … ] && … ): a false test would end the script (set -e)
+  zip="touchenv-$VERSION-windows-$name$suffix.zip"
   rm -f "$DIST/$zip" "$DIST/$zip.sha256"
   (cd "$BUILD/$name" && zip -q -X "$DIST/$zip" touchenv.exe LICENSE)
   unzip -p "$DIST/$zip" touchenv.exe | cmp -s - "$BUILD/$name/touchenv.exe" \
