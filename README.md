@@ -24,7 +24,7 @@ link `touchenv.app/Contents/MacOS/touchenv` into your `PATH`. Windows (preview):
 ```sh
 touchenv set OPENAI_API_KEY                  # save: paste it, it isn't shown
 touchenv set MY_KEY < AuthKey.p8             # save a key file
-touchenv set --sync OPENAI_API_KEY           # save and sync to your other Macs (weaker: see below)
+touchenv set --sync OPENAI_API_KEY           # save and sync to your other Macs (weaker: see the table below)
 touchenv run OPENAI_API_KEY -- python report.py      # the command gets it in $OPENAI_API_KEY
 touchenv run MY_KEY:file -- fastlane beta    # the command gets a private temp file's path, deleted afterwards
 touchenv get NAME                            # print it
@@ -44,6 +44,20 @@ optional; without it the prompt says **No reason given** and shows the command.
 > My secrets are in touchenv. Never read key files. Use `touchenv run --intent "<why>" NAME -- <command>`.
 
 Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
+
+## Local or synced?
+
+| | Local key, Touch ID required | Synced key (`--sync`) |
+|---|---|---|
+| **Use it for** | Production keys: SSH, signing, deployment, payments | Staging and dev keys, read-only keys, keys that aren't critical |
+| Saved with | `touchenv set NAME` | `touchenv set --sync NAME` |
+| Where it is | This Mac only | This Mac and every other Mac on your Apple Account, through iCloud Keychain |
+| Who checks each read | macOS and the Secure Enclave: without your finger the key isn't decrypted | touchenv's own code: it asks for Touch ID, then reads the key |
+| Malware running as you | Can't read it | Can't read it |
+| An attacker with admin rights who turns off SIP | Still needs your finger | Can read it |
+| Another Mac on your Apple Account is taken over | Nothing to take: the key isn't there | Exposed |
+| A new or lost Mac | `export` / `import` ([docs/new-mac.md](docs/new-mac.md)). A Mac lost before an export takes the key with it | Already on the new Mac |
+| Approving away from the Mac | No, except a grant made beforehand | `--password` over SSH |
 
 ## Not being asked every time
 
@@ -91,11 +105,9 @@ Windows Hello for every signature. No standing grants, access log or `--password
 - **Read before you touch.** An approved command can do anything with the key. The intent is written by whoever
   asks; check the command: its first lines are always in the prompt, all of it under **More detail** (a very long
   one as its start and its end, with how much is left out between).
-- **Local keys are locked by macOS.** A key saved without `--sync` stays on this Mac and the Keychain itself asks
-  for Touch ID (or the Mac password) on every read: malware running as you can't read it without your finger.
-- **Synced keys (`--sync`) are guarded by touchenv, not by macOS.** iCloud Keychain won't take the Touch ID lock,
-  so an attacker with admin rights who turns off SIP, a macOS bug, or another hacked Mac on your Apple Account can
-  read them. Keep signing keys and admin tokens local.
+- **Local keys are locked by macOS; synced keys (`--sync`) are guarded by touchenv.** iCloud Keychain won't take
+  the Touch ID lock, so a synced key is also open to a macOS bug or a bug in touchenv. Keep signing keys and admin
+  tokens local: see [Local or synced?](#local-or-synced).
 - **What Touch ID doesn't cover.** Once you approve, the command has the key. A 5-minute approval or a grant lets
   anything that app runs (or, for a standing grant, anything that can run that program) take those keys without
   asking. Grant the fewest keys, the shortest time and the fewest uses the task needs.
