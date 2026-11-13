@@ -120,9 +120,9 @@ Windows that is the agent for Windows' own OpenSSH. On a Mac it can also load th
 ## Moving to a new Mac or PC
 
 A backup or a migration tool doesn't give you working keys on another machine (a synced key on a Mac is the
-exception). `touchenv import --begin` on the new machine, `touchenv export --to tenv1:… > keys.tenv` on the old one, `touchenv import keys.tenv`
-on the new one: the file opens only on that machine, once, within an hour. It works between a Mac and a PC in both
-directions. See [docs/new-mac.md](docs/new-mac.md).
+exception). `touchenv import --begin` on the new machine, `touchenv export --to tenv1:… > keys.tenv` on the old
+one, `touchenv import keys.tenv` on the new one: the file opens only on that machine, once, within an hour. It
+works between a Mac and a PC in both directions. See [docs/new-mac.md](docs/new-mac.md).
 
 ## Good to know
 
