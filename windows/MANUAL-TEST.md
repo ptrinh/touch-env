@@ -57,8 +57,9 @@ TPM (`tpm.msc`).
 
 ## The touchenv service: grants and 5-minute approvals
 
-Never run on a real PC yet. CI installs, upgrades and removes the service, and checks the pipe and the caller's
-identity in a test, but can't use Windows Hello, so nothing below has been seen working end to end.
+Tried on a real PC (grants and 5-minute approvals work with Windows Hello), though not every step below was gone
+through one by one. CI installs, upgrades and removes the service, and checks the pipe and the caller's identity in a
+test, but can't use Windows Hello.
 
 20. **Install.** From a normal (not administrator) Windows Terminal: `touchenv service install`. A UAC prompt
     appears. Decline it: "not approved: Windows asked for administrator approval and it was declined", exit 1, and

@@ -2,8 +2,9 @@
 
 How to install and use the Windows build, how grants work there, and how it is weaker than on a Mac.
 
-**Preview.** It builds and passes its tests, but the Windows Hello part, and grants through the touchenv service,
-have not yet been tried on a real PC.
+**Preview.** Tried on a real PC with Windows Hello: saving and reading keys (`set`, `get`, `run`, `rm`), the
+touchenv service with grants and 5-minute approvals, and the SSH agent. Moving keys with `export` / `import` has
+only run in tests so far.
 
 ## Install
 
