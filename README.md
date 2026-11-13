@@ -60,13 +60,9 @@ On a Mac, Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
 | You approve with | Touch ID, or the Mac password in the system's window | Windows Hello: fingerprint, face or PIN |
 | Where keys are kept | The macOS Keychain, in a group only the signed touchenv can open | `%LOCALAPPDATA%\touchenv\store.json`, encrypted to a key Windows Hello holds (in the TPM when the PC has one) |
 | Who checks each read | macOS and the Secure Enclave, for local keys | Windows Hello, asked by touchenv |
-| Malware running as you | Can't read a key. What it asks for shows touchenv's own prompt, with the real command | Can't read a key, but **can ask Windows Hello with its own text**: only approve a prompt you expected |
 | Syncing keys to your other machines | `--sync`, through iCloud Keychain | No: keys stay on the PC |
 | 5-minute approvals and timed grants | Built in | After `touchenv service install`, once. While one is on, any program running as you can collect those keys |
 | Standing grants, the access log, `--password` | Yes | Not yet |
-| SSH keys | Agent, or `ssh load` into ssh-agent | Agent for Windows' own OpenSSH; no `ssh load` |
-| Moving keys | `export` / `import`, also between a Mac and a PC, both ways | The same |
-| Tried on real hardware | Yes | **Not yet with Windows Hello on a real PC**: it passes its tests and CI |
 
 All of the Windows side: [docs/windows.md](docs/windows.md).
 
