@@ -21,7 +21,7 @@ brew install --cask ptrinh/tap/touchenv
 Or unzip the app from [Releases](https://github.com/ptrinh/touch-env/releases/latest) into `~/Applications` and
 link `touchenv.app/Contents/MacOS/touchenv` into your `PATH`.
 
-**Windows** (10 or 11, x64 or Arm, with Windows Hello set up; a preview): download
+**Windows** (10 or 11, x64 or Arm, with Windows Hello set up; beta): download
 `touchenv-<version>-windows-x64.zip` (or `-arm64`) from
 [Releases](https://github.com/ptrinh/touch-env/releases/latest) and put `touchenv.exe` in a folder on your `PATH`.
 The exe is signed by SENPRINTS LLC. Checking the download, and the service that grants need:
@@ -55,7 +55,7 @@ On a Mac, Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
 
 ## Mac and Windows: what differs
 
-| | Mac | Windows (preview) |
+| | Mac | Windows (beta) |
 |---|---|---|
 | You approve with | Touch ID, or the Mac password in the system's window | Windows Hello: fingerprint, face or PIN |
 | Where keys are kept | The macOS Keychain, in a group only the signed touchenv can open | `%LOCALAPPDATA%\touchenv\store.json`, encrypted to a key Windows Hello holds (in the TPM when the PC has one) |

@@ -122,7 +122,7 @@ touchenv ssh rm SSH_ID_ED25519
 
 ## On Windows
 
-**Preview.** Tried on a real PC with Windows Hello, on top of the tests and CI.
+**Beta.** Tried on a real PC with Windows Hello, on top of the tests and CI.
 
 ```powershell
 touchenv ssh add $HOME\.ssh\id_ed25519       # stored as SSH_ID_ED25519, on this PC only
