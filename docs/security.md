@@ -12,8 +12,9 @@ and touchenv asks for Touch ID itself before every read: the gate is touchenv's 
 
 | If… | Local secret | Synced secret |
 |---|---|---|
-| Malware runs as you | Safe | Safe |
-| An attacker has admin and turns off SIP, or a macOS bug | Still needs your finger | **Readable** |
+| Malware runs as you, and you approve nothing | Safe | Safe |
+| Malware runs as you, and you approve a request or a grant is on | What you approved, for the command shown (see [the threat model](threat-model.md)) | Same |
+| An attacker has admin and turns off SIP, or a macOS bug | Still needs your finger, unless it is in a standing grant | **Readable** |
 | Another Mac on your Apple Account is hacked | Not there | **Exposed** |
 
 Keep signing keys and admin tokens local. For synced SSH keys, the Touch ID before each signature is touchenv's
@@ -68,7 +69,7 @@ secrets without asking, also while the Mac is locked, until you revoke it.
   standing grant for a helper that prints a token gives that token to anything that knows to run the helper. A
   program can also start the script's shell with exported shell functions (`BASH_FUNC_…`, which `/bin/sh` takes
   too) or `BASH_ENV`; its own code then runs inside that shell and gets the secret, even when the script never
-  prints it. macOS doesn't let touchenv see another process's environment to spot that. Between the shell reading
+  prints it. touchenv does not check another process's environment to spot that. Between the shell reading
   the script and touchenv checking its hash, a program running as you could swap the file and put it back. And the
   program is recognised as the process that ran touchenv, by its process id: a program can start a `touchenv get`
   that waits a moment, then replace itself with the granted script or program (same process id, same start time),

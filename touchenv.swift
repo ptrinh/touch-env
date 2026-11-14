@@ -85,7 +85,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.8.2"
+let version = "1.8.3"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -177,6 +177,23 @@ func executableName(_ pid: pid_t) -> String? {
     return URL(fileURLWithPath: String(cString: path)).lastPathComponent
 }
 
+/// The path of the executable a process runs (not what it calls itself), or nil.
+func executablePath(_ pid: pid_t) -> String? {
+    var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+    return String(cString: path)
+}
+
+/// Whether a process's argv[0] name may be believed: any process chooses its own argv[0], so a program started as
+/// "claude" would otherwise show as Claude Code. It must be the executable's own file name, or, for Claude Code, whose
+/// file is named after its version, a file in a claude/versions folder.
+func nameMatchesExecutable(_ name: String, path: String?) -> Bool {
+    guard let path else { return false }
+    let file = URL(fileURLWithPath: path).lastPathComponent
+    if file == name { return true }
+    return name == "claude" && path.contains("/claude/versions/")
+}
+
 func bsdInfo(_ pid: pid_t) -> proc_bsdinfo? {
     var info = proc_bsdinfo()
     let size = Int32(MemoryLayout<proc_bsdinfo>.size)
@@ -212,6 +229,14 @@ func requester(from first: pid_t = getppid(), through extra: Set<String> = []) -
         if let kind = multiplexerKind(bare) {
             if multiplexer == nil { multiplexer = (pid, kind) }
         } else if !passThrough.contains(bare) && !extra.contains(bare) {
+            let path = executablePath(pid)
+            guard nameMatchesExecutable(name, path: path) else {
+                // It calls itself something its executable is not: show what really runs, and that it says otherwise.
+                let file = path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "?"
+                return Requester(pid: pid, start: startTime(pid) ?? 0,
+                                 name: "\(visibleText(file, limit: 40)) (calling itself \(visibleText(name, limit: 40)))",
+                                 isAgent: agents.contains(file) || agents.contains(name), exec: file)
+            }
             return Requester(pid: pid, start: startTime(pid) ?? 0, name: known[name] ?? visibleText(name, limit: 60),
                              isAgent: agents.contains(name), exec: name)
         }
@@ -293,6 +318,44 @@ func commandText(_ argv: [String]) -> String {
 }
 
 func shortCommand(_ argv: [String]) -> String { elided(commandText(argv), limit: 160) }
+
+/// Environment variables that change which code a command runs (or loads into it), whatever its arguments say.
+let codeChangingVariables = ["BASH_ENV", "ENV", "ZDOTDIR", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONUSERBASE",
+                             "NODE_OPTIONS", "NODE_PATH", "PERL5LIB", "PERL5OPT", "PERLLIB", "RUBYOPT", "RUBYLIB",
+                             "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "LD_PRELOAD",
+                             "LD_LIBRARY_PATH", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+                             "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "PROMPT_COMMAND"]
+
+/// Where argv[0] resolves: the file that will run, as /usr/bin/env would find it on this PATH.
+func resolvedProgram(_ program: String, environment: [String: String]) -> String? {
+    if program.contains("/") { return URL(fileURLWithPath: program).standardizedFileURL.path }
+    for dir in (environment["PATH"] ?? "").split(separator: ":") where !dir.isEmpty {
+        let candidate = "\(dir)/\(program)"
+        if FileManager.default.isExecutableFile(atPath: candidate) { return URL(fileURLWithPath: candidate).standardizedFileURL.path }
+    }
+    return nil
+}
+
+/// Which file a command runs, for the line under it in run's prompt: a program earlier on PATH would otherwise pass
+/// for the one you know.
+func runsLine(_ argv: [String], environment: [String: String]) -> String? {
+    guard let program = argv.first else { return nil }
+    let path = resolvedProgram(program, environment: environment)
+    return "runs " + (path.map { visibleText($0, limit: 200) } ?? "\(visibleText(program, limit: 80)) (not found on PATH)")
+}
+
+/// What run's prompt warns of besides the command: environment variables that make it run other code, and
+/// --no-mask. Each line is safe to show.
+func runWarnings(environment: [String: String], noMask: Bool) -> [String] {
+    var warnings: [String] = []
+    let set = codeChangingVariables.filter { !(environment[$0] ?? "").isEmpty }
+    if !set.isEmpty {
+        warnings.append("Its environment sets what can make it run other code: "
+                        + set.map { "\($0)=\(visibleText(environment[$0]!, limit: 60))" }.joined(separator: ", "))
+    }
+    if noMask { warnings.append("--no-mask: the value will not be hidden in the command's output") }
+    return warnings
+}
 
 // MARK: - Masking secrets in a command's output
 
@@ -535,7 +598,7 @@ final class Prompt: NSObject, NSTextViewDelegate {
 
     /// `notes`: lines shown under the title (the SSH sign prompt: the server); `asker`: who asks, when it is not
     /// this process's parent (the SSH agent asks for the process at the other end of its socket).
-    init(title: String, intent: String?, detail: String?, offerSession: Bool, notes: [String] = [],
+    init(title: String, intent: String?, detail: String?, offerSession: Bool, notes: [String] = [], warnings: [String] = [],
          asker: Requester? = nil) {
         super.init()
         // Laid out like the macOS authentication dialog: icon top left, text left aligned, buttons stacked full width.
@@ -602,6 +665,9 @@ final class Prompt: NSObject, NSTextViewDelegate {
             let line = label("", .systemFont(ofSize: 12))
             line.attributedStringValue = titleText(note)
             views.append(line)
+        }
+        for warning in warnings {   // what the command line alone does not show; never folded away
+            views.append(label("⚠︎ " + warning, .systemFont(ofSize: 12), .systemOrange))
         }
         if let intent {
             let line = label("", .systemFont(ofSize: 13))
@@ -805,10 +871,11 @@ final class Prompt: NSObject, NSTextViewDelegate {
 /// Returns whether "Don't ask again for 5 minutes" was ticked (offered only with `offerSession`).
 @discardableResult
 func authenticate(_ title: String, intent: String?, detail: String? = nil, reason: String,
-                  offerSession: Bool = false, asker: Requester? = nil) -> Bool {
+                  offerSession: Bool = false, asker: Requester? = nil, warnings: [String] = []) -> Bool {
     var keep = false
     if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) {
-        let prompt = Prompt(title: title, intent: intent, detail: detail, offerSession: offerSession, asker: asker)
+        let prompt = Prompt(title: title, intent: intent, detail: detail, offerSession: offerSession, warnings: warnings,
+                            asker: asker)
         let outcome = prompt.run(reason: reason)
         keep = prompt.keepFor5Minutes
         switch outcome {
@@ -5075,14 +5142,21 @@ case "run":
         // No "Don't ask again for 5 minutes" from a password: each --password run asks; grant --password covers a while.
         var summary = ["touchenv: give \(who) \(names) from iCloud Keychain for the command: \(shortCommand(argv))?"]
         if let intent { summary.append("  Intent: \(intent)") }
+        let environment = ProcessInfo.processInfo.environment
+        summary += ([runsLine(argv, environment: environment)].compactMap { $0 }
+                    + runWarnings(environment: environment, noMask: noMask)).map { "  " + $0 }
         secrets = passwordRead(names: wanted, summary: summary, read: read)
     }
     if !wanted.allSatisfy({ secrets[$0] != nil }) {
         // The whole command, cleaned; a very long one keeps its head and its end (where a payload would be).
+        let environment = ProcessInfo.processInfo.environment
+        let warnings = runWarnings(environment: environment, noMask: noMask)
         let keep = authenticate("Allow \(who) to read \(strong(wanted)) from \(place(wanted, among: syncedNow))?", intent: intent,
-                                detail: elided(commandText(argv), limit: 4000),
-                                reason: "give \(who) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))",
-                                offerSession: true, asker: asker)
+                                detail: ([elided(commandText(argv), limit: 4000)] + [runsLine(argv, environment: environment)].compactMap { $0 })
+                                    .joined(separator: "\n"),
+                                reason: "give \(who) the secret\(specs.count > 1 ? "s" : "") \(names) for the command: \(shortCommand(argv))"
+                                    + (warnings.isEmpty ? "" : " (" + warnings.joined(separator: "; ") + ")"),
+                                offerSession: true, asker: asker, warnings: warnings)
         for name in wanted where secrets[name] == nil { secrets[name] = read(name) }
         logAttempt(ReadOutcome.touchID, note: keep ? "\"Don't ask again for 5 minutes\" ticked" : "")
         if keep {

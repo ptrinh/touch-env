@@ -91,7 +91,7 @@ security boundary. Grant the fewest keys, the shortest time and the fewest uses 
 | Malware runs as you | Can't use touchenv's key | **Can ask Windows Hello to use it**, with its own prompt text: you'd see a prompt you didn't expect. It can also delete keys or replace one with its own value |
 | Malware runs as admin | Still needs your finger | Not designed to stop it |
 | The PC has no TPM | — | Windows Hello keeps the key in software |
-| A grant is on and malware runs as you | Gets nothing: only touchenv, under the app you granted, collects it | **Gets those keys**, one use each time; each use is listed in `touchenv status` |
+| A grant is on and malware runs as you | Gets nothing unless it gets a process started under the app you granted (a new terminal tab, a tmux window), which then collects it | **Gets those keys**, one use each time; each use is listed in `touchenv status` |
 | A grant is on and malware runs as admin | Not designed to stop it | **Gets those keys** (reads the service's memory) |
 
 So on Windows, **only touch for a prompt you were expecting**, and read who's asking.

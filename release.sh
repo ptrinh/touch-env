@@ -5,8 +5,8 @@
 #                   NOTARY_ISSUER, or ASC_KEY_PATH / ASC_KEY_ID / ASC_ISSUER_ID, e.g. after touchenv grant --for 2h ASC_KEY_PATH:
 #     touchenv run --intent "release" ASC_KEY_PATH:file -- ./release.sh
 # Only the Mac files in dist/ are replaced: Windows zips made before by windows/release.sh stay.
-# Windows builds are not made here: publishing the GitHub release (tag v<version>) starts .github/workflows/windows.yml,
-# which tests them and attaches touchenv-<version>-windows-x64.zip and -arm64.zip (+ .sha256) to the same release.
+# Windows builds are not made here: windows/release.sh builds and signs them (Azure) into dist/ beforehand, and they
+# are attached to the release with the Mac files. .github/workflows/windows.yml only tests them; it attaches nothing.
 set -e
 cd "$(dirname "$0")"
 # notarize submits a zip and waits; it fails unless Apple accepted it. With

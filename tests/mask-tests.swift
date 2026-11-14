@@ -80,4 +80,27 @@ check(shouldMask(isTerminal: true, environment: ["CLAUDECODE": "1"]), "Claude Co
 check(shouldMask(isTerminal: true, environment: ["AI_AGENT": "x"]), "another assistant")
 check(shouldMask(isTerminal: true, environment: [:], agent: true), "an assistant told by its process")
 
+// Who asks: argv[0] is believed only when the executable agrees.
+check(nameMatchesExecutable("ghostty", path: "/Applications/Ghostty.app/Contents/MacOS/ghostty"), "the file's own name")
+check(nameMatchesExecutable("claude", path: "/Users/x/.local/share/claude/versions/2.1.310"), "Claude Code's versioned file")
+check(!nameMatchesExecutable("claude", path: "/tmp/evil"), "a program calling itself claude")
+check(!nameMatchesExecutable("Terminal", path: "/Users/x/Library/Terminal-helper"), "a near name")
+check(!nameMatchesExecutable("claude", path: nil), "no path")
+
+// run's prompt: the file that runs, and what in the environment can change it.
+let pathDir = FileManager.default.temporaryDirectory.appendingPathComponent("touchenv-path-\(getpid())")
+try? FileManager.default.createDirectory(at: pathDir, withIntermediateDirectories: true)
+let fake = pathDir.appendingPathComponent("git").path
+FileManager.default.createFile(atPath: fake, contents: Data("#!/bin/sh\n".utf8), attributes: [.posixPermissions: 0o755])
+check(resolvedProgram("git", environment: ["PATH": pathDir.path + ":/usr/bin"]) == URL(fileURLWithPath: fake).standardizedFileURL.path,
+      "an earlier git on PATH is the one shown")
+check(resolvedProgram("/bin/ls", environment: [:]) == "/bin/ls", "a path as given")
+check(resolvedProgram("no-such-program-x", environment: ["PATH": "/usr/bin"]) == nil, "not found")
+check(runsLine(["git", "push"], environment: ["PATH": pathDir.path])?.hasSuffix("/git") == true, "runs line")
+try? FileManager.default.removeItem(at: pathDir)
+let warned = runWarnings(environment: ["NODE_OPTIONS": "--require /tmp/x.js", "HOME": "/Users/x", "PYTHONPATH": ""], noMask: true)
+check(warned.count == 2 && warned[0].contains("NODE_OPTIONS=--require /tmp/x.js") && !warned[0].contains("PYTHONPATH")
+      && warned[1].contains("--no-mask"), "warnings: \(warned)")
+check(runWarnings(environment: ["HOME": "/Users/x", "PATH": "/usr/bin"], noMask: false).isEmpty, "nothing to warn of")
+
 if failures == 0 { print("ok: masking") } else { print("\(failures) failure(s)"); exit(1) }

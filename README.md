@@ -84,13 +84,14 @@ On Windows every key is local to the PC. On a Mac you choose per key:
 | Moved here with | `touchenv unsync NAME …` | `touchenv sync NAME …` |
 | Where it is | This Mac only | This Mac and every other Mac on your Apple Account, through iCloud Keychain |
 | Who checks each read | macOS and the Secure Enclave: without your finger the key isn't decrypted | touchenv's own code: it asks for Touch ID, then reads the key |
-| Malware running as you | Can't read it | Can't read it |
-| An attacker with admin rights who turns off SIP | Still needs your finger | Can read it |
-
-`touchenv sync` and `touchenv set --sync` say so on the terminal each time a key starts syncing.
+| Malware running as you | Can't read it until you approve a request (read the command in the prompt) | The same |
+| An attacker with admin rights who turns off SIP | Still needs your finger (not when it is in a standing grant) | Can read it |
 | Another Mac on your Apple Account is taken over | Nothing to take: the key isn't there | Exposed |
 | A new or lost Mac | `export` / `import` ([docs/new-mac.md](docs/new-mac.md)). A Mac lost before an export takes the key with it | Already on the new Mac |
 | Approving away from the Mac | No, except a grant made beforehand | `--password` over SSH |
+
+`touchenv sync` and `touchenv set --sync` say so on the terminal each time a key starts syncing. What each kind of
+attacker can and can't do: [docs/threat-model.md](docs/threat-model.md).
 
 ## Not being asked every time
 
