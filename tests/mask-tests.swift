@@ -69,6 +69,10 @@ check(text(secretOutput(Data("abc".utf8), terminal: true)) == "abc\n", "terminal
 check(text(secretOutput(Data("abc".utf8), terminal: false)) == "abc", "pipe")
 check(text(secretOutput(Data("abc\n".utf8), terminal: true)) == "abc\n", "already ends a line")
 
+// The note before a key starts syncing names the price and the way back.
+check(syncNote.contains("not by macOS's Touch ID lock") && syncNote.contains("touchenv unsync NAME") && !syncNote.contains("\\"),
+      "sync note: \(syncNote)")
+
 // When to mask: not a terminal, or an AI assistant runs it.
 check(shouldMask(isTerminal: false, environment: [:]), "a pipe")
 check(!shouldMask(isTerminal: true, environment: ["TERM_PROGRAM": "iTerm.app"]), "a person's terminal")

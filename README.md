@@ -86,6 +86,8 @@ On Windows every key is local to the PC. On a Mac you choose per key:
 | Who checks each read | macOS and the Secure Enclave: without your finger the key isn't decrypted | touchenv's own code: it asks for Touch ID, then reads the key |
 | Malware running as you | Can't read it | Can't read it |
 | An attacker with admin rights who turns off SIP | Still needs your finger | Can read it |
+
+`touchenv sync` and `touchenv set --sync` say so on the terminal each time a key starts syncing.
 | Another Mac on your Apple Account is taken over | Nothing to take: the key isn't there | Exposed |
 | A new or lost Mac | `export` / `import` ([docs/new-mac.md](docs/new-mac.md)). A Mac lost before an export takes the key with it | Already on the new Mac |
 | Approving away from the Mac | No, except a grant made beforehand | `--password` over SSH |

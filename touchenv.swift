@@ -85,7 +85,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.8.1"
+let version = "1.8.2"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -93,7 +93,8 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
 
   touchenv set NAME                     store a secret (typed with no echo, or piped: touchenv set NAME < file)
   touchenv set --sync NAME              the same, synced to your other Macs through iCloud Keychain
-  touchenv sync NAME ...                start syncing secrets kept on this Mac only (one Touch ID for all)
+  touchenv sync NAME ...                start syncing secrets kept on this Mac only (one Touch ID for all);
+                                        a synced key is guarded by touchenv, not by macOS's Touch ID lock
   touchenv unsync NAME ...              stop syncing: keep them on this Mac only, deleted from your other Macs
   touchenv get NAME                     print it
   touchenv run NAME[:file] ... -- CMD   run CMD with each secret in env var NAME; with :file, NAME holds
@@ -304,6 +305,16 @@ func writeSecretOut(_ value: Data) {
 func secretOutput(_ value: Data, terminal: Bool) -> Data {
     terminal && value.last != UInt8(ascii: "\n") ? value + Data("\n".utf8) : value
 }
+
+/// What `sync` and `set --sync` say before a key starts syncing: the price of it, which the name alone does not tell.
+let syncNote = """
+    touchenv: a synced key is guarded by touchenv's own code, not by macOS's Touch ID lock: on any of your Macs, \
+    malware with admin rights that turns off System Integrity Protection can read it without your finger. \
+    Keep production keys (SSH, signing, deployment, payments) on this Mac only (touchenv unsync NAME).
+    """
+
+/// Writes syncNote to stderr: on every run that starts syncing a key, terminal or not (a script's log keeps it too).
+func warnSync() { FileHandle.standardError.write(Data((syncNote + "\n").utf8)) }
 
 /// What a secret is replaced with in a command's output.
 let maskText = Data("***REDACTED***".utf8)
@@ -4877,6 +4888,7 @@ case "set":
     let data = readStdin()
     if data.isEmpty { die("touchenv: empty secret, nothing stored") }
     let asker = requester()
+    if sync && synced(name) != true { warnSync() } // starts syncing: a new synced key, or a local one moving to iCloud
     if let wasSynced = synced(name) {
         beginAttempt("set", [name], who: asker, intent: intent)
         requireIntent(intent, example: "touchenv set --intent \"<why>\" \(sync ? "--sync " : "")\(name)", who: asker)
@@ -4932,6 +4944,7 @@ case "sync", "unsync":
     let who = asker.name
     let list = moving.map(strong).joined(separator: ", ")
     let plural = moving.count > 1
+    if toSync { warnSync() }
     let (title, reason) = toSync
         ? ("Allow \(who) to start syncing \(list)? \(plural ? "They go" : "It goes") into iCloud Keychain, on your other "
            + "Macs too, guarded by touchenv instead of macOS's own lock.",
