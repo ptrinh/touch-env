@@ -89,6 +89,7 @@ let version = "1.7.5"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
+© Phil Trinh - SENPRINTS 2026
 
   touchenv set NAME                     store a secret (typed with no echo, or piped: touchenv set NAME < file)
   touchenv set --sync NAME              the same, synced to your other Macs through iCloud Keychain
@@ -138,8 +139,6 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         --local keeps none synced
 
   --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.
-
-(c) Phil Trinh 2026
 """
 var context = LAContext()
 

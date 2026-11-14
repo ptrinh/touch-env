@@ -27,6 +27,7 @@ const importLifetime = time.Hour
 
 func usage() string {
 	return "touchenv " + Version + ` — secrets on this PC, every read behind Windows Hello
+© Phil Trinh - SENPRINTS 2026
 
   touchenv set NAME                     store a secret (typed with no echo, or piped: touchenv set NAME < file)
   touchenv get NAME                     print it
@@ -56,9 +57,7 @@ func usage() string {
   touchenv import [--replace] keys.tenv
                                         (new machine) store them, then delete the file; --replace overwrites
 
-  --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.
-
-(c) Phil Trinh 2026`
+  --intent TEXT after the command (touchenv run --intent "why" NAME -- CMD) puts one line on why in the prompt.`
 }
 
 // Env is what a run of touchenv works with.
