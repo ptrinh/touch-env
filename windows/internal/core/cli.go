@@ -4,6 +4,7 @@ package core
 // (2 for usage, 1 for refusals and failures, the command's own code for run). Differences are listed in docs/windows.md.
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
@@ -402,6 +403,11 @@ func (c *cmd) get(args []string) error {
 		return die(1, "touchenv: %s can't be opened: the store was changed outside touchenv", args[0])
 	}
 	defer wipe(value)
+	// A line break for a console only (so the prompt starts on a line of its own); a pipe gets the value alone.
+	if c.p.StdoutIsTerminal() && !bytes.HasSuffix(value, []byte("\n")) {
+		_, err = c.env.Stdout.Write(append(slices.Clone(value), '\n'))
+		return err
+	}
 	_, err = c.env.Stdout.Write(value)
 	return err
 }

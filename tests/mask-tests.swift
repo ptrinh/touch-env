@@ -64,6 +64,11 @@ try! errSink.fileHandleForWriting.close()
 check(text(sink.fileHandleForReading.readDataToEndOfFile()) == "start ***REDACTED*** end\n", "stdout through the pipe")
 check(text(errSink.fileHandleForReading.readDataToEndOfFile()) == "to stderr ***REDACTED***\n", "stderr through the pipe")
 
+// get: a line break for a terminal only, and never a second one.
+check(text(secretOutput(Data("abc".utf8), terminal: true)) == "abc\n", "terminal")
+check(text(secretOutput(Data("abc".utf8), terminal: false)) == "abc", "pipe")
+check(text(secretOutput(Data("abc\n".utf8), terminal: true)) == "abc\n", "already ends a line")
+
 // When to mask: not a terminal, or an AI assistant runs it.
 check(shouldMask(isTerminal: false, environment: [:]), "a pipe")
 check(!shouldMask(isTerminal: true, environment: ["TERM_PROGRAM": "iTerm.app"]), "a person's terminal")

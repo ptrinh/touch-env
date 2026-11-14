@@ -85,7 +85,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.8.0"
+let version = "1.8.1"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -294,6 +294,16 @@ func commandText(_ argv: [String]) -> String {
 func shortCommand(_ argv: [String]) -> String { elided(commandText(argv), limit: 160) }
 
 // MARK: - Masking secrets in a command's output
+
+/// get's output: the value exactly as stored, plus a line break when it goes to a terminal (so the prompt starts on a
+/// line of its own, and zsh shows no "%" mark); a pipe or $(…) gets the value alone.
+func writeSecretOut(_ value: Data) {
+    FileHandle.standardOutput.write(secretOutput(value, terminal: isatty(1) != 0))
+}
+
+func secretOutput(_ value: Data, terminal: Bool) -> Data {
+    terminal && value.last != UInt8(ascii: "\n") ? value + Data("\n".utf8) : value
+}
 
 /// What a secret is replaced with in a command's output.
 let maskText = Data("***REDACTED***".utf8)
@@ -4954,7 +4964,7 @@ case "get":
     switch standingRead(names: [args[0]], caller: caller, who: who, intent: intent, stillThere: callerStillThere) {
     case .secrets(let found):
         currentAttempt = nil
-        FileHandle.standardOutput.write(found[args[0]]!)
+        writeSecretOut(found[args[0]]!)
         exit(0)
     case .refused(let reason):
         die("touchenv: refused: \(reason). To allow it again: touchenv grant --always --for-program PROGRAM \(args[0])")
@@ -4967,14 +4977,14 @@ case "get":
         // The prompt and everything else go to the terminal; stdout gets only the secret.
         var summary = ["touchenv: show \(who) \(args[0]) from iCloud Keychain in full?"]
         if let intent { summary.append("  Intent: \(intent)") }
-        FileHandle.standardOutput.write(passwordRead(names: [args[0]], summary: summary, read: read)[args[0]]!)
+        writeSecretOut(passwordRead(names: [args[0]], summary: summary, read: read)[args[0]]!)
         exit(0)
     }
     authenticate("Show \(who) \(strong(args[0])) from \(place([args[0]], among: syncedNow)) in full?", intent: intent,
                  reason: "show \(who) the secret \(args[0]) in full", asker: asker)
     let value = read(args[0])
     logAttempt(ReadOutcome.touchID)
-    FileHandle.standardOutput.write(value)
+    writeSecretOut(value)
 
 case "rm":
     guard args.count == 1 else { die("usage: touchenv rm NAME", 2) }

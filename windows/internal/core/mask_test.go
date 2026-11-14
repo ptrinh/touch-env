@@ -97,3 +97,15 @@ func TestRunMasksOutput(t *testing.T) {
 		t.Errorf("agent: %q", r.stdout)
 	}
 }
+
+func TestGetEndsALineOnlyOnAConsole(t *testing.T) {
+	m := newMachine(t, 0)
+	m.set("A", "value-1")
+	if got := m.must("get", "A").stdout; got != "value-1" {
+		t.Errorf("pipe: %q", got)
+	}
+	m.p.terminal = true
+	if got := m.must("get", "A").stdout; got != "value-1\n" {
+		t.Errorf("console: %q", got)
+	}
+}
