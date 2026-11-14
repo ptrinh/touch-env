@@ -33,6 +33,7 @@ The exe is signed by SENPRINTS LLC. Checking the download, and the service that 
 touchenv set OPENAI_API_KEY                  # save: paste it, it isn't shown
 touchenv set MY_KEY < AuthKey.p8             # save a key file
 touchenv set --sync OPENAI_API_KEY           # Mac only: save and sync to your other Macs (weaker: see below)
+touchenv sync NAME …  ·  touchenv unsync NAME …      # Mac only: move saved keys to or from iCloud Keychain
 touchenv run OPENAI_API_KEY -- python report.py      # the command gets it in the OPENAI_API_KEY variable
 touchenv run MY_KEY:file -- fastlane beta    # the command gets a private temp file's path, deleted afterwards
 touchenv get NAME                            # print it
@@ -74,6 +75,7 @@ On Windows every key is local to the PC. On a Mac you choose per key:
 |---|---|---|
 | **Use it for** | Production keys: SSH, signing, deployment, payments | Staging and dev keys, read-only keys, keys that aren't critical |
 | Saved with | `touchenv set NAME` | `touchenv set --sync NAME` |
+| Moved here with | `touchenv unsync NAME …` | `touchenv sync NAME …` |
 | Where it is | This Mac only | This Mac and every other Mac on your Apple Account, through iCloud Keychain |
 | Who checks each read | macOS and the Secure Enclave: without your finger the key isn't decrypted | touchenv's own code: it asks for Touch ID, then reads the key |
 | Malware running as you | Can't read it | Can't read it |

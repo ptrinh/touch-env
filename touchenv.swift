@@ -85,13 +85,15 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.7.4"
+let version = "1.7.5"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
 
   touchenv set NAME                     store a secret (typed with no echo, or piped: touchenv set NAME < file)
   touchenv set --sync NAME              the same, synced to your other Macs through iCloud Keychain
+  touchenv sync NAME ...                start syncing secrets kept on this Mac only (one Touch ID for all)
+  touchenv unsync NAME ...              stop syncing: keep them on this Mac only, deleted from your other Macs
   touchenv get NAME                     print it
   touchenv run NAME[:file] ... -- CMD   run CMD with each secret in env var NAME; with :file, NAME holds
                                         the path of a private temp file, removed when CMD ends
@@ -4775,6 +4777,51 @@ case "set":
                               program: callingProgram(asker)))
     }
     print("stored \(name) (\(data.count) bytes)\(sync ? ", synced through iCloud Keychain" : "")")
+
+case "sync", "unsync":
+    // Moves secrets between this Mac only (macOS's own Touch ID lock) and iCloud Keychain without the value ever
+    // leaving touchenv: no shell, file or pipe in between. Add first, then delete (replaceSecret).
+    let toSync = command == "sync"
+    guard !args.isEmpty, args.allSatisfy(validName) else { die("usage: touchenv \(command) NAME ...", 2) }
+    var names: [String] = []
+    for name in args where !names.contains(name) { names.append(name) }
+    let asker = requester()
+    beginAttempt(command, names, who: asker, intent: intent)
+    requireIntent(intent, example: "touchenv \(command) --intent \"<why>\" \(names.joined(separator: " "))", who: asker)
+    let syncedNow = syncedNames()
+    requireStored(names, among: syncedNow)
+    let moving = names.filter { synced($0, among: syncedNow) != toSync }
+    for name in names where !moving.contains(name) {
+        print("\(name) is already \(toSync ? "synced through iCloud Keychain" : "on this Mac only")")
+    }
+    if moving.isEmpty {
+        currentAttempt = nil
+        exit(0)
+    }
+    let who = asker.name
+    let list = moving.map(strong).joined(separator: ", ")
+    let plural = moving.count > 1
+    let (title, reason) = toSync
+        ? ("Allow \(who) to start syncing \(list)? \(plural ? "They go" : "It goes") into iCloud Keychain, on your other "
+           + "Macs too, guarded by touchenv instead of macOS's own lock.",
+           "let \(who) start syncing \(moving.joined(separator: ", ")) through iCloud Keychain")
+        : ("Allow \(who) to stop syncing \(list)? \(plural ? "They are" : "It is") deleted from iCloud Keychain, and so "
+           + "from your other Macs, and kept on this Mac only.",
+           "let \(who) stop syncing \(moving.joined(separator: ", ")): deleted from your other Macs")
+    authenticate(title, intent: intent, reason: reason, asker: asker)
+    var moved: [String] = []
+    for name in moving {
+        var value = read(name)
+        replaceSecret(name, value, sync: toSync, wasSynced: !toSync,
+                      keep: [kSecAttrDescription as String, kSecAttrComment as String])
+        value.resetBytes(in: 0..<value.count)
+        moved.append(name)
+        print(toSync ? "\(name): now synced through iCloud Keychain to your other Macs"
+                     : "\(name): on this Mac only, deleted from iCloud Keychain")
+    }
+    if let a = currentAttempt { currentAttempt = AccessAttempt(event: a.event, secrets: moved, who: a.who,
+                                                               program: a.program, intent: a.intent) }
+    logAttempt(toSync ? "now synced" : "no longer synced")
 
 case "get":
     guard args.count == 1 else { die("usage: touchenv get NAME", 2) }

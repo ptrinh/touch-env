@@ -195,6 +195,9 @@ func run(args []string, env *Env) error {
 		return c.status(args)
 	case "service":
 		return c.service(args)
+	case "sync", "unsync":
+		// Syncing through iCloud Keychain is the Mac's; on Windows every key stays on the PC it was saved on.
+		return die(2, "touchenv: %s isn't available on Windows: keys stay on this PC", command)
 	case "export":
 		return c.export(args)
 	case "import":

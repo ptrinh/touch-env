@@ -27,6 +27,14 @@
 2 | err:usage: touchenv get NAME | get A B
 2 | err:usage: touchenv rm NAME | rm
 2 | err:usage: touchenv rm NAME | rm A B
+macos: 2 | err:usage: touchenv sync NAME ... | sync
+macos: 2 | err:usage: touchenv sync NAME ... | sync bad-name
+macos: 2 | err:usage: touchenv unsync NAME ... | unsync
+macos: 2 | err:usage: touchenv unsync NAME ... | unsync A bad-name
+macos: 0 | out:touchenv sync NAME ... | help
+2 | err:touchenv: unknown option --sync | sync --sync A
+windows: 2 | err:touchenv: sync isn't available on Windows | sync A
+windows: 2 | err:touchenv: unsync isn't available on Windows | unsync A
 2 | err:usage: touchenv run NAME[:file] ... -- command args... | run
 2 | err:usage: touchenv run NAME[:file] ... -- command args... | run A
 2 | err:usage: touchenv run NAME[:file] ... -- command args... | run A --
