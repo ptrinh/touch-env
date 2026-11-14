@@ -18,6 +18,7 @@
 2 | err:touchenv: unknown option --to | export --to
 2 | err:touchenv: unknown option --begin | export --begin
 2 | err:touchenv: unknown option --replace | set --replace A
+2 | err:touchenv: unknown option --no-mask | get --no-mask A
 2 | err:usage: touchenv set | set
 2 | err:usage: touchenv set | set 1BAD
 2 | err:usage: touchenv set | set A B

@@ -267,6 +267,8 @@ func isMsysPty(f *os.File) bool {
 
 func (Platform) StdoutIsTerminal() bool { return isConsole(os.Stdout) || isMsysPty(os.Stdout) }
 
+func (Platform) StderrIsTerminal() bool { return isConsole(os.Stderr) || isMsysPty(os.Stderr) }
+
 // ReadSecret: from a console, one line with echo off; from a pipe or file, everything.
 func (Platform) ReadSecret(stdin io.Reader, stderr io.Writer) ([]byte, error) {
 	f, ok := stdin.(*os.File)
@@ -382,10 +384,19 @@ func (Platform) CommandLine(argv []string) (string, error) {
 	return windows.ComposeCommandLine(append([]string{path}, argv[1:]...)), nil
 }
 
-func (Platform) Run(argv []string, env []string) (int, error) {
+func (Platform) Run(argv []string, env []string, stdout, stderr io.Writer) (int, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if stdout != nil {
+		cmd.Stdout = stdout
+	}
+	if stderr != nil {
+		cmd.Stderr = stderr
+	}
+	// With a masking writer the output goes through a pipe: a program the command left running in the background
+	// that keeps it open must not hold touchenv.
+	cmd.WaitDelay = 5 * time.Second
 	// Ctrl-C reaches the command through the console; touchenv keeps waiting so it can still clean up.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)

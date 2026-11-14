@@ -41,6 +41,12 @@ touchenv ls                                  # names only; on a Mac "(iCloud)" m
 touchenv rm NAME
 ```
 
+When an AI assistant runs `touchenv run`, or the output goes to a program rather than a terminal, the secrets' values
+are replaced with `***REDACTED***` in what the command prints, so a command that echoes a key (`env`, `curl -v`, an
+error message) does not hand it to the assistant. Your own terminal gets the output as it is; `--no-mask` turns
+this off. Only the exact values are replaced (and each line of a long multi-line one), not a value the command
+changed (encoded, split).
+
 Delete the original files after saving. Old copies (backups, shell history) are still yours to delete.
 
 `--intent "why"` after the command puts a reason in the prompt: `touchenv run --intent "monthly report" KEY -- …`.

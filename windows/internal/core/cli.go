@@ -32,7 +32,10 @@ func usage() string {
   touchenv set NAME                     store a secret (typed with no echo, or piped: touchenv set NAME < file)
   touchenv get NAME                     print it
   touchenv run NAME[:file] ... -- CMD   run CMD with each secret in env var NAME; with :file, NAME holds
-                                        the path of a private temp file, removed when CMD ends
+                                        the path of a private temp file, removed when CMD ends. Output that
+                                        goes to a program (a pipe, a file) or comes from a command an AI
+                                        assistant runs has the secrets' values replaced with ***REDACTED***
+                                        (--no-mask: as it is)
   touchenv ls                           list names
   touchenv rm NAME                      delete
   touchenv grant --for 8h --uses 20 NAME ...
@@ -114,6 +117,7 @@ type options struct {
 	length    time.Duration // grant --for
 	lengthArg string
 	uses      int // grant --uses
+	noMask    bool
 }
 
 func run(args []string, env *Env) error {
@@ -162,6 +166,9 @@ func run(args []string, env *Env) error {
 			}
 			o.uses = n
 			args = args[2:]
+		case option == "--no-mask" && command == "run":
+			o.noMask = true
+			args = args[1:]
 		case option == "--intent" && len(args) > 1:
 			text := strings.ReplaceAll(strings.TrimSpace(args[1]), "\n", " ")
 			if utf8.RuneCountInString(text) > 200 {
@@ -557,7 +564,31 @@ func (c *cmd) run(args []string) error {
 		}
 		environ = setEnv(environ, sp.name, value)
 	}
-	code, runErr := c.p.Run(argv, environ)
+	// Output that goes to a program rather than a console (an AI assistant, a pipe, a file), or any output of a command
+	// an AI assistant runs, has the secrets' values replaced on the way (mask.go). A person's own console gets it as
+	// it is. --no-mask turns this off.
+	var stdout, stderr *maskWriter
+	if !c.o.noMask {
+		var values [][]byte
+		for _, sp := range specs {
+			values = append(values, secrets[sp.name])
+		}
+		if needles := maskNeedles(values); len(needles) > 0 {
+			agent := c.who().IsAgent
+			if shouldMask(c.p.StdoutIsTerminal(), agent, environ) {
+				stdout = newMaskWriter(c.env.Stdout, needles)
+			}
+			if shouldMask(c.p.StderrIsTerminal(), agent, environ) {
+				stderr = newMaskWriter(c.env.Stderr, needles)
+			}
+		}
+	}
+	code, runErr := c.p.Run(argv, environ, writerOrNil(stdout), writerOrNil(stderr))
+	for _, m := range []*maskWriter{stdout, stderr} {
+		if m != nil {
+			m.Close()
+		}
+	}
 	if cleanup != nil {
 		if err := cleanup(); err != nil {
 			fmt.Fprintf(c.env.Stderr, "touchenv: couldn't delete %s (%v): delete it yourself; the next run tries again\n", dir, err)
@@ -567,6 +598,14 @@ func (c *cmd) run(args []string) error {
 		return die(1, "touchenv: %v", runErr)
 	}
 	return exitCode(code)
+}
+
+// writerOrNil: a nil *maskWriter as a nil io.Writer (the command then writes to touchenv's own stream).
+func writerOrNil(m *maskWriter) io.Writer {
+	if m == nil {
+		return nil
+	}
+	return m
 }
 
 // setEnv replaces or adds NAME=value. Windows names are case-insensitive, so any spelling is replaced.

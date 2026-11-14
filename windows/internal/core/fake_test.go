@@ -86,9 +86,12 @@ type fakePlatform struct {
 	ancestors []Process
 	terminal  bool
 	exitCode  int
-	ran       []ranCommand
-	runDirs   []string
-	snapshots int // Ancestors calls
+	// What the command run prints: env:NAME stands for that variable's value.
+	printOut, printErr string
+	stdout, stderr     io.Writer // touchenv's own streams, where the command writes when not masked
+	ran                []ranCommand
+	runDirs            []string
+	snapshots          int // Ancestors calls
 }
 
 func (p *fakePlatform) Ancestors() []Process { p.snapshots++; return p.ancestors }
@@ -126,6 +129,7 @@ func (p *fakePlatform) ReadSecret(stdin io.Reader, _ io.Writer) ([]byte, error) 
 	return io.ReadAll(stdin)
 }
 func (p *fakePlatform) StdoutIsTerminal() bool { return p.terminal }
+func (p *fakePlatform) StderrIsTerminal() bool { return p.terminal }
 func (p *fakePlatform) Hostname() string       { return "test-pc" }
 func (p *fakePlatform) NewRunDir() (string, func() error, error) {
 	dir, err := os.MkdirTemp(p.t.TempDir(), "run-")
@@ -142,7 +146,33 @@ func (p *fakePlatform) CommandLine(argv []string) (string, error) {
 	}
 	return strings.Join(argv, " "), nil
 }
-func (p *fakePlatform) Run(argv []string, env []string) (int, error) {
+func (p *fakePlatform) Run(argv []string, env []string, stdout, stderr io.Writer) (int, error) {
+	expand := func(s string) string {
+		for _, kv := range env {
+			if i := strings.Index(kv, "="); i > 0 {
+				s = strings.ReplaceAll(s, "env:"+kv[:i], kv[i+1:])
+			}
+		}
+		return s
+	}
+	if stdout == nil {
+		stdout = p.stdout
+	}
+	if stderr == nil {
+		stderr = p.stderr
+	}
+	// Written in small pieces, so a secret is split across writes.
+	for _, w := range []struct {
+		to   io.Writer
+		text string
+	}{{stdout, p.printOut}, {stderr, p.printErr}} {
+		b := []byte(expand(w.text))
+		for len(b) > 0 && w.to != nil {
+			n := min(5, len(b))
+			w.to.Write(b[:n])
+			b = b[n:]
+		}
+	}
 	r := ranCommand{argv: argv, env: env, files: map[string][]byte{}}
 	for _, kv := range env {
 		if i := strings.Index(kv, "="); i > 0 {
@@ -200,6 +230,7 @@ func (m *machine) run(args ...string) result {
 	if m.ssh != nil {
 		env.SSH = m.ssh
 	}
+	m.p.stdout, m.p.stderr = &out, &errOut
 	code := Main(args, env)
 	m.stdin = ""
 	return result{code, out.String(), errOut.String(), out.Bytes()}

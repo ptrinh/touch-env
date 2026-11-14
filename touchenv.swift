@@ -85,7 +85,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.7.6"
+let version = "1.8.0"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -97,7 +97,10 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
   touchenv unsync NAME ...              stop syncing: keep them on this Mac only, deleted from your other Macs
   touchenv get NAME                     print it
   touchenv run NAME[:file] ... -- CMD   run CMD with each secret in env var NAME; with :file, NAME holds
-                                        the path of a private temp file, removed when CMD ends
+                                        the path of a private temp file, removed when CMD ends. Output that
+                                        goes to a program (a pipe, a file) or comes from a command an AI
+                                        assistant runs has the secrets' values replaced with ***REDACTED***
+                                        (--no-mask: as it is)
   touchenv ls                           list names; "(iCloud)" marks synced ones
   touchenv rm NAME                      delete
   touchenv grant --for 8h --uses 20 NAME ...
@@ -289,6 +292,121 @@ func commandText(_ argv: [String]) -> String {
 }
 
 func shortCommand(_ argv: [String]) -> String { elided(commandText(argv), limit: 160) }
+
+// MARK: - Masking secrets in a command's output
+
+/// What a secret is replaced with in a command's output.
+let maskText = Data("***REDACTED***".utf8)
+
+/// The shortest value masked: shorter ones (a PIN, "true") would mask ordinary output.
+let maskMinLength = 6
+
+/// The byte strings to hide for these secret values: each value whole and, for a value of several lines (a PEM key),
+/// each of its lines of 16 bytes or more, so a command that prints part of it is masked too.
+func maskNeedles(_ values: [Data]) -> [Data] {
+    var out: [Data] = []
+    for value in values where value.count >= maskMinLength {
+        out.append(value)
+        for line in value.split(separator: UInt8(ascii: "\n")) {
+            var l = Data(line)
+            if l.last == UInt8(ascii: "\r") { l.removeLast() }
+            if l.count >= 16 && l != value { out.append(l) }
+        }
+    }
+    // Longest first, so a whole value is replaced before one of its lines.
+    return Array(Set(out)).sorted { $0.count > $1.count }
+}
+
+/// Replaces the secrets in a stream of output as it passes, chunk by chunk. A secret split across two chunks is still
+/// found: the end of a chunk that could be the start of a secret is held back until the next chunk (or the end).
+/// Nothing else is held back, so output keeps flowing line by line.
+struct Masker {
+    let needles: [Data]
+    private var pending = Data()
+
+    init(_ needles: [Data]) { self.needles = needles }
+
+    /// The output that can be written now, secrets replaced.
+    mutating func feed(_ chunk: Data) -> Data {
+        pending.append(chunk)
+        let replaced = replaceAll(pending)
+        let hold = heldBack(replaced)
+        pending = replaced.suffix(hold)
+        return replaced.prefix(replaced.count - hold)
+    }
+
+    /// Whatever was held back, at the end of the output.
+    mutating func finish() -> Data {
+        defer { pending = Data() }
+        return replaceAll(pending)
+    }
+
+    private func replaceAll(_ data: Data) -> Data {
+        guard !needles.isEmpty else { return data }
+        var out = Data(capacity: data.count)
+        var at = data.startIndex
+        scan: while at < data.endIndex {
+            for needle in needles where data.endIndex - at >= needle.count
+                && data[at] == needle[needle.startIndex] && data[at..<at + needle.count].elementsEqual(needle) {
+                out.append(maskText)
+                at += needle.count
+                continue scan
+            }
+            out.append(data[at])
+            at += 1
+        }
+        return out
+    }
+
+    /// How many bytes at the end of data could be the start of a secret: only positions holding a secret's first
+    /// byte are tried.
+    private func heldBack(_ data: Data) -> Int {
+        var hold = 0
+        for needle in needles {
+            let first = needle[needle.startIndex]
+            let window = min(needle.count - 1, data.count)
+            var start = data.endIndex - window
+            while start < data.endIndex {
+                let n = data.endIndex - start
+                if n <= hold { break }
+                if data[start] == first && data[start...].elementsEqual(needle.prefix(n)) {
+                    hold = n
+                    break
+                }
+                start += 1
+            }
+        }
+        return hold
+    }
+}
+
+/// Environment variables that AI coding assistants set for the commands they run (Claude Code sets both).
+let agentVariables = ["CLAUDECODE", "AI_AGENT"]
+
+/// Whether touchenv run masks an output stream: when it does not go to a terminal (it goes to a program: an AI
+/// assistant, a pipe, a file), or when an AI assistant runs the command even in a terminal of its own (agent: the
+/// requester is one, as requester() tells; or one of agentVariables is set). "A terminal" is what the system says
+/// of the stream (isatty: a terminal device), the same in every terminal app.
+func shouldMask(isTerminal: Bool, environment: [String: String], agent: Bool = false) -> Bool {
+    !isTerminal || agent || agentVariables.contains { environment[$0] != nil }
+}
+
+/// Copies `from` to `to` through a Masker until the end of `from`, on its own thread; `done` is signalled at the end.
+func pumpMasked(from: FileHandle, to: FileHandle, needles: [Data], done: DispatchGroup) {
+    done.enter()
+    Thread {
+        var masker = Masker(needles)
+        while true {
+            let chunk = from.availableData
+            if chunk.isEmpty { break }
+            let out = masker.feed(chunk)
+            if !out.isEmpty { try? to.write(contentsOf: out) }
+        }
+        let rest = masker.finish()
+        if !rest.isEmpty { try? to.write(contentsOf: rest) }
+        done.leave()
+    }.start()
+}
 
 /// An AI agent must give a reason (--intent) for anything that asks for Touch ID or reads a secret, so the prompt
 /// always says why. Refused before any prompt: the agent reads the error and asks again with one.
@@ -4676,6 +4794,7 @@ var grantUsesText = ""
 var always = false, forProgram: String?, listGrants = false, revokeProgram: String?, revokeAll = false
 var lockAll = false
 var usePassword = false
+var noMask = false
 var logSince: TimeInterval?, logSummary = false
 while let option = args.first, option.hasPrefix("--"), option != "--" {
     if option == "--sync", command == "set" {
@@ -4704,6 +4823,9 @@ while let option = args.first, option.hasPrefix("--"), option != "--" {
         args.removeFirst(2)
     } else if option == "--password", ["get", "run", "grant"].contains(command) {
         usePassword = true
+        args.removeFirst()
+    } else if option == "--no-mask", command == "run" {
+        noMask = true
         args.removeFirst()
     } else if option == "--all", command == "lock" {
         lockAll = true
@@ -4986,6 +5108,21 @@ case "run":
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     process.arguments = argv
     process.environment = env
+    // Output that goes to a program rather than a terminal (an AI assistant running the command, a log, a pipe), or
+    // any output of a command an AI assistant runs, has the secrets' values replaced on the way (shouldMask), so a
+    // command that prints one does not hand it on. A person's own terminal gets the output as it is: the person
+    // reading it is the one who unlocked the secret. --no-mask turns this off.
+    let pumps = DispatchGroup()
+    if !noMask {
+        let needles = maskNeedles(specs.compactMap { secrets[$0.name] })
+        let mine = ProcessInfo.processInfo.environment
+        for (fd, handle) in [(Int32(1), FileHandle.standardOutput), (Int32(2), FileHandle.standardError)]
+            where shouldMask(isTerminal: isatty(fd) != 0, environment: mine, agent: asker.isAgent) && !needles.isEmpty {
+            let pipe = Pipe()
+            if fd == 1 { process.standardOutput = pipe } else { process.standardError = pipe }
+            pumpMasked(from: pipe.fileHandleForReading, to: handle, needles: needles, done: pumps)
+        }
+    }
     // Ctrl-C reaches the command through the terminal's process group; touchenv waits and still cleans up. A hang-up
     // (the terminal closed), TERM or QUIT sent to touchenv is passed on to the command (forwardOrCleanUp).
     signal(SIGINT, SIG_IGN)
@@ -5000,6 +5137,9 @@ case "run":
     if tempPendingSignal != 0 { kill(tempChild, tempPendingSignal) }
     process.waitUntilExit()
     tempChild = 0
+    // What the command wrote last, and anything a program it started in the background still writes, until the
+    // pipe closes; at most a few seconds, so a background program that keeps it open cannot hold touchenv.
+    _ = pumps.wait(timeout: .now() + 5)
     if let dir = tempDir { removeTempDir(dir) }
     exit(process.terminationReason == .uncaughtSignal ? 128 + process.terminationStatus : process.terminationStatus)
 

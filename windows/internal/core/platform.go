@@ -49,8 +49,10 @@ type Platform interface {
 	Lock(path string) (unlock func(), err error)
 	// ReadSecret reads a secret from stdin: one line with no echo from a console, else everything.
 	ReadSecret(stdin io.Reader, stderr io.Writer) ([]byte, error)
-	// StdoutIsTerminal: export refuses to print to a console.
+	// StdoutIsTerminal: export refuses to print to a console; run masks secrets in output that does not go to one.
 	StdoutIsTerminal() bool
+	// StderrIsTerminal, for run's masking.
+	StderrIsTerminal() bool
 	// Hostname names this machine in exports.
 	Hostname() string
 	// NewRunDir makes a private folder for :file secrets. cleanup removes it and says whether it could.
@@ -61,8 +63,9 @@ type Platform interface {
 	// It fails when the command can't be shown faithfully (a .bat or .cmd with characters cmd.exe interprets).
 	CommandLine(argv []string) (string, error)
 	// Run runs argv with env (KEY=VALUE pairs), waits, and returns its exit code. Ctrl-C reaches the command;
-	// touchenv keeps waiting so it can clean up.
-	Run(argv []string, env []string) (int, error)
+	// touchenv keeps waiting so it can clean up. stdout and stderr, when not nil, receive the command's output
+	// instead of touchenv's own streams (run's masking).
+	Run(argv []string, env []string, stdout, stderr io.Writer) (int, error)
 	// Environ is touchenv's own environment.
 	Environ() []string
 }

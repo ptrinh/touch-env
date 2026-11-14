@@ -112,7 +112,7 @@ func TestCommandLineAndRun(t *testing.T) {
 	if err != nil || !strings.HasSuffix(strings.ToLower(line), `cmd.exe /c "exit 3"`) {
 		t.Fatalf("%q %v", line, err)
 	}
-	code, err := p.Run([]string{"cmd", "/c", "exit 3"}, os.Environ())
+	code, err := p.Run([]string{"cmd", "/c", "exit 3"}, os.Environ(), nil, nil)
 	if err != nil || code != 3 {
 		t.Fatalf("exit %d %v", code, err)
 	}
@@ -131,7 +131,7 @@ func TestCommandLineAndRun(t *testing.T) {
 
 func TestEnvReachesCommand(t *testing.T) {
 	p := New()
-	code, err := p.Run([]string{"cmd", "/c", "exit", "%TOUCHENV_TEST%"}, append(os.Environ(), "TOUCHENV_TEST=4"))
+	code, err := p.Run([]string{"cmd", "/c", "exit", "%TOUCHENV_TEST%"}, append(os.Environ(), "TOUCHENV_TEST=4"), nil, nil)
 	if err != nil || code != 4 {
 		t.Fatalf("exit %d %v", code, err)
 	}
@@ -141,5 +141,14 @@ func TestAncestorsSeesParent(t *testing.T) {
 	chain := New().Ancestors()
 	if len(chain) == 0 || chain[0].Name == "" {
 		t.Fatalf("%v", chain)
+	}
+}
+
+func TestRunWritesToTheGivenWriters(t *testing.T) {
+	var p Platform
+	var out, errOut strings.Builder
+	code, err := p.Run([]string{"cmd", "/c", "echo to-out & echo to-err 1>&2"}, os.Environ(), &out, &errOut)
+	if err != nil || code != 0 || !strings.Contains(out.String(), "to-out") || !strings.Contains(errOut.String(), "to-err") {
+		t.Fatalf("%d %v %q %q", code, err, out.String(), errOut.String())
 	}
 }
