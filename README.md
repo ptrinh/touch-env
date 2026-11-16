@@ -27,6 +27,21 @@ link `touchenv.app/Contents/MacOS/touchenv` into your `PATH`.
 The exe is signed by SENPRINTS LLC. Checking the download, and the service that grants need:
 [docs/windows.md](docs/windows.md).
 
+### Updating
+
+`touchenv version` says which version you have; the newest is on
+[Releases](https://github.com/ptrinh/touch-env/releases/latest). Your keys, grants and settings stay as they are.
+
+- **Mac, installed with Homebrew:** `brew upgrade --cask touchenv` (run `brew update` first if it says there is
+  nothing to do).
+- **Mac, installed from the zip:** unzip the new `touchenv.app` over the old one in `~/Applications`. The link in
+  your `PATH` keeps working.
+- **Windows:** put the new `touchenv.exe` over the old one. If you use the touchenv service, run
+  `touchenv service install` again with the new exe (Windows asks for administrator approval): running grants and
+  5-minute approvals end, codes and the keys allowed from afar stay.
+
+A 5-minute approval or timed grant made before the update may ask again once; `touchenv lock` clears it.
+
 ## Everyday use
 
 ```sh
