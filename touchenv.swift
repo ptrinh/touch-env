@@ -10,6 +10,7 @@
 //                              the file is removed when the command ends (a hang-up, TERM or QUIT is passed on
 //                              to the command first); one left by a killed touchenv goes at the next run
 //   touchenv ls               list names, "(iCloud)" after synced ones (Touch ID: macOS guards even names; no values)
+//   touchenv ls --synced      the names of synced secrets only, without Touch ID (macOS doesn't guard those)
 //   touchenv rm NAME           delete
 //   touchenv grant --for 8h --uses 20 NAME [NAME2 ...]
 //                              one Touch ID now; then the app that asked, and what it runs, reads those secrets
@@ -106,7 +107,8 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         goes to a program (a pipe, a file) or comes from a command an AI
                                         assistant runs has the secrets' values replaced with ***REDACTED***
                                         (--no-mask: as it is)
-  touchenv ls                           list names; "(iCloud)" marks synced ones
+  touchenv ls                           list names; "(iCloud)" marks synced ones (--synced: only those,
+                                        without Touch ID)
   touchenv rm NAME                      delete
   touchenv grant --for 8h --uses 20 NAME ...
                                         one Touch ID now; then this app and what it runs read those secrets
@@ -5245,6 +5247,7 @@ guard let command = args.first else { die(usage, 2) }
 args.removeFirst()
 var intent: String?
 var sync = false
+var syncedOnly = false
 var recipientArgument: String?
 var begin = false, replace = false, localOnly = false
 var grantLength: TimeInterval?
@@ -5259,7 +5262,10 @@ var totpMaxLength: TimeInterval?, totpMaxUses: Int?
 var noMask = false
 var logSince: TimeInterval?, logSummary = false
 while let option = args.first, option.hasPrefix("--"), option != "--" {
-    if option == "--sync", command == "set" {
+    if option == "--synced", command == "ls" {
+        syncedOnly = true
+        args.removeFirst()
+    } else if option == "--sync", command == "set" {
         sync = true
         args.removeFirst()
     } else if option == "--to", command == "export", args.count > 1 {
@@ -5479,6 +5485,14 @@ case "rm":
     logAttempt("deleted")
     let copies = standingSecretChanged(args[0], to: nil, who: who)
     print("deleted \(args[0])" + (copies > 0 ? "; \(copies) standing grant\(copies == 1 ? "" : "s") no longer read\(copies == 1 ? "s" : "") it" : ""))
+
+case "ls" where syncedOnly:
+    // The names of synced secrets only, without Touch ID: macOS doesn't guard those names (iCloud Keychain items
+    // carry no lock), and touchenv already says whether a name is synced when it refuses --password or --totp.
+    // For tools that report which secrets rest on touchenv's own check (bordercheck). Never a value.
+    guard args.isEmpty else { die("usage: touchenv ls [--synced]", 2) }
+    requireIntent(intent, example: "touchenv ls --intent \"<why>\" --synced")
+    syncedNames().sorted().forEach { print($0) }
 
 case "ls":
     requireIntent(intent, example: "touchenv ls --intent \"<why>\"")

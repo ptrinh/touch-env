@@ -178,3 +178,5 @@ windows: 2 | err:usage: touchenv totp setup | totp deny bad-name
 windows: 2 | err:usage: touchenv totp setup | totp status A
 0 | out:Full instructions and updates: https://github.com/ptrinh/touch-env | help
 2 | err:Full instructions and updates: https://github.com/ptrinh/touch-env |
+macos: 2 | err:touchenv: unknown option --synced | get --synced A
+windows: 2 | err:touchenv: unknown option --synced | ls --synced

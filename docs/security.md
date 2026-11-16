@@ -17,6 +17,10 @@ and touchenv asks for Touch ID itself before every read: the gate is touchenv's 
 | An attacker has admin and turns off SIP, or a macOS bug | Still needs your finger, unless it is in a standing grant | **Readable** |
 | Another Mac on your Apple Account is hacked | Not there | **Exposed** |
 
+The names of synced secrets are not guarded either: `touchenv ls --synced` prints them without Touch ID (a tool
+such as [bordercheck](https://github.com/ptrinh/bordercheck) uses it to tell you which keys rest on touchenv's own
+check), while `touchenv ls`, which also names local ones, asks.
+
 Keep signing keys and admin tokens local. For synced SSH keys, the Touch ID before each signature is touchenv's
 prompt, not macOS's lock, so the last two rows apply.
 
