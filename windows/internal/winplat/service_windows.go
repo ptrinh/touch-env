@@ -506,7 +506,8 @@ func sessionOf(eventData uintptr) (uint32, bool) {
 
 func (s *service) Execute(_ []string, requests <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	status <- svc.Status{State: svc.StartPending}
-	h := &core.Holder{Now: time.Now, Procs: processTable, Alloc: lockedAlloc, Free: lockedFree, OfferKeep: s.offerKeep}
+	h := &core.Holder{Now: time.Now, Procs: processTable, Alloc: lockedAlloc, Free: lockedFree, OfferKeep: s.offerKeep,
+		Vault: serviceVault()}
 	stopEvent, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
 		return true, 1

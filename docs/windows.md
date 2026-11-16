@@ -38,6 +38,8 @@ which keys, the intent and the command. Differences:
 - **SSH keys** (`touchenv ssh add`, `ls`, `rm`, `agent install`) work as on a Mac, with Windows Hello for every
   signature: see [ssh.md](ssh.md#on-windows). No grants or 5-minute approvals for signatures, and no
   `ssh load`/`unload`.
+- **Grants from afar with a code from your phone** (`grant --totp`) work, with one more step than on a Mac: you
+  choose which keys a code may grant ([below](#grants-from-afar-with-a-code-from-your-phone)).
 - **macOS only for now:** standing grants (`grant --always`, `--list`, `--revoke`), the access log
   (`touchenv log`), `--password` and `touchenv ssh load`/`unload`. They exit with a message saying so.
 - **Moving keys** works the same way, and between a Mac and a PC in both directions (`import --begin` on the new
@@ -84,6 +86,61 @@ It doesn't stand up to malware running as administrator (that can read the servi
 that is an administrator, malware running as you can usually get there: Microsoft doesn't count the UAC prompt as a
 security boundary. Grant the fewest keys, the shortest time and the fewest uses the task needs.
 
+## Grants from afar with a code from your phone
+
+A grant lasts a day at most, and Windows Hello can't be answered over Remote Desktop, SSH or with the PC locked.
+Away for longer, driving an agent from your phone, you can approve the next grant with a six-digit code from an
+authenticator app. Not yet tried on a real PC ([`windows/MANUAL-TEST.md`](../windows/MANUAL-TEST.md), steps 50 to
+58).
+
+Once, at the PC, yourself, in a terminal (the service must be installed):
+
+```sh
+touchenv totp setup --max-for 8h --max-uses 20   # the most one code may approve; 12 hours and 100 uses if left out
+touchenv totp allow MY_KEY OTHER_KEY             # which keys a code may grant
+```
+
+`setup` shows a key in a window: add it to the app by typing it (time-based, 6 digits), type the code the app shows,
+then approve with Windows Hello. The key is never printed in the terminal, and an AI assistant can't run `setup`: one
+that saw the key could make its own codes for good. `allow` asks Windows Hello and hands the service a copy of those
+keys.
+
+Then, from afar, read the code to the agent, which runs:
+
+```sh
+touchenv grant --intent "deploy" --totp 123456 --for 8h --uses 20 MY_KEY
+```
+
+No Windows Hello is asked. The grant is the ordinary one (`touchenv status`, `touchenv lock`).
+
+- **Only the keys you allowed**, and within the limits of setup. A refusal for either doesn't use the code up.
+- **A code works once**, for the 30 seconds the app shows it and the 30 after. Keep the PC's clock set automatically.
+- **Wrong codes** make the next try wait (2 s, 3 s, 5 s, 9 s); the fifth in a row locks codes until
+  `touchenv totp unlock`, with Windows Hello at the PC.
+- `touchenv totp status` shows the limits, the keys allowed, the last use and the wrong tries.
+  `touchenv totp deny NAME` deletes one copy and `touchenv totp off` deletes the key and every copy; neither asks.
+  `touchenv set` of an allowed key updates its copy and `touchenv rm` deletes it.
+
+**What this gives up.** On Windows every key is sealed to Windows Hello. An allowed key also has a copy that isn't:
+
+- **Where the copy is.** With the key behind the codes, in one file in the service account's own profile
+  (`C:\Windows\ServiceProfiles\touchenv\AppData\Local\touchenv\codes.bin`), in a folder only that account,
+  SYSTEM and administrators can open, encrypted to that account. It is still there after a restart;
+  `touchenv service uninstall` removes it. Programs running as you can't read it. **Malware running as
+  administrator can**, without Windows Hello and whether a grant is on or not. Allow only keys you would grant from
+  afar anyway.
+- **A code doesn't say what it approves.** You read six digits; the agent chooses the keys, the time and the uses,
+  among the keys allowed and up to the limits of setup. An agent that a web page talked into something can ask you
+  for a code and spend it on a wider grant than you meant. Keep the limits and the list of allowed keys short.
+- **A code can be taken on the way.** It is in the agent's conversation and on the command line; a program running
+  as you can try to spend it first. A code works once, so yours then fails with "already used": treat that as an
+  alarm (`touchenv lock`, `touchenv status`).
+- **What a program running as you can't do**, because the service checks it: read the key or the copies; make
+  codes; put a key of its own behind the codes (setup and unlock must be signed by your Windows Hello key, which
+  asks every time, and the first setup fixes which key that is); undo the count of wrong codes or use a code twice.
+  It can lock codes on purpose with five wrong tries, which opens nothing.
+- **A PC several people use.** Each Windows account has its own codes and its own allowed keys.
+
 ## Weaker than on a Mac
 
 | If… | Mac | Windows |
@@ -93,6 +150,7 @@ security boundary. Grant the fewest keys, the shortest time and the fewest uses 
 | The PC has no TPM | — | Windows Hello keeps the key in software |
 | A grant is on and malware runs as you | Gets nothing unless it gets a process started under the app you granted (a new terminal tab, a tmux window), which then collects it | **Gets those keys**, one use each time; each use is listed in `touchenv status` |
 | A grant is on and malware runs as admin | Not designed to stop it | **Gets those keys** (reads the service's memory) |
+| Keys can be granted with a code from afar | Synced keys only; an admin who turns off SIP reads those anyway | The keys you allowed: **malware running as admin reads their copies at any time** |
 
 So on Windows, **only touch for a prompt you were expecting**, and read who's asking.
 

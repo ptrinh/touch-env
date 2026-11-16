@@ -18,6 +18,10 @@
 //                              a standing grant: one Touch ID now; then that one program reads those secrets with
 //                              get or run without asking, until revoked (see "Standing grants" below)
 //   touchenv grant --list · --revoke PROGRAM · --revoke-all
+//   touchenv totp setup [--max-for 12h] [--max-uses 100] · status · off · unlock
+//   touchenv grant --totp CODE --for 8h --uses 20 NAME [NAME2 ...]
+//                              a code from an authenticator app approves a timed grant of synced secrets instead of
+//                              Touch ID, from afar (see "A code from an authenticator app" below)
 //   touchenv lock [--all]      end every approval now (5-minute ones and timed grants; --all: standing ones too)
 //   touchenv log [--since 7d] [--summary] [NAME ...]
 //                              the access log: every read, who asked, the outcome; never a value; kept two years
@@ -85,7 +89,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.8.3"
+let version = "1.9.0"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -120,6 +124,10 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
                                         end standing grants (no Touch ID)
   --password (get, run, grant)          for secrets synced through iCloud only: type your Mac password at
                                         a hidden prompt in the terminal instead of Touch ID
+  touchenv totp setup · status · off · unlock
+                                        approve timed grants from afar with a code from an authenticator app:
+                                        touchenv grant --totp CODE --for 8h --uses 20 NAME ... (synced
+                                        secrets only; see docs/grants.md)
   touchenv lock [--all]                 end every 5-minute approval and timed grant now; --all ends
                                         standing grants too
   touchenv log [--since 7d] [--summary] [NAME ...]
@@ -2961,6 +2969,359 @@ func passwordRead(names: [String], summary: [String], read: (String) -> Data) ->
     return out
 }
 
+// MARK: A code from an authenticator app (grant --totp; iCloud-synced secrets only)
+
+// touchenv grant --totp CODE: a six-digit code from an authenticator app (RFC 6238: HMAC-SHA1, 30 seconds) approves
+// a timed grant instead of Touch ID, for someone driving an agent from afar with no sensor and no terminal to type a
+// password in. Only for secrets synced through iCloud Keychain, for the reason --password is: touchenv's own check is
+// their gate either way, while local secrets carry userPresence, which no code can satisfy. Only timed grants, and
+// within the limits chosen at setup (never more than a timed grant's own).
+// The key: 20 random bytes made by touchenv totp setup, after Touch ID, shown once as a QR code in a window of
+// touchenv's own (never on the terminal, where an agent would read it and make its own codes), and stored with the
+// limits and the counts in one Keychain item in touchenv's access group (this device only, not synced, no
+// userPresence: it must be readable with nobody there). An AI agent can't run setup at all.
+// A code: accepted for the 30 seconds it is shown and the 30 before, once (the step of the last accepted code is
+// kept, and nothing at or before it passes again). Wrong codes double the wait before the next try, and the fifth
+// in a row locks codes until touchenv totp unlock, with Touch ID. A code says nothing about what it approves: whoever
+// is handed one decides the secrets and the limits, within those of setup. See docs/security.md.
+
+let totpPeriod: Int64 = 30
+let totpDigits = 6
+let totpTries = 5
+let totpDefaultLength: TimeInterval = 12 * 60 * 60
+let totpDefaultUses = 100
+
+let base32Alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+
+/// RFC 4648 base32 without padding, as authenticator apps take it.
+func base32Encode(_ data: Data) -> String {
+    var out = "", buffer: UInt32 = 0, bits: UInt32 = 0
+    for byte in data {
+        buffer = (buffer << 8) | UInt32(byte)
+        bits += 8
+        while bits >= 5 {
+            out.append(base32Alphabet[Int((buffer >> (bits - 5)) & 31)])
+            bits -= 5
+        }
+    }
+    if bits > 0 { out.append(base32Alphabet[Int((buffer << (5 - bits)) & 31)]) }
+    return out
+}
+
+/// The code for one 30-second step (RFC 4226 truncation of HMAC-SHA1 over the step, big-endian).
+func totpCode(secret: Data, step: Int64, digits: Int = totpDigits) -> String {
+    var counter = UInt64(bitPattern: step).bigEndian
+    let message = withUnsafeBytes(of: &counter) { Data($0) }
+    let mac = Array(HMAC<Insecure.SHA1>.authenticationCode(for: message, using: SymmetricKey(data: secret)))
+    let offset = Int(mac[mac.count - 1] & 0x0f)
+    let number = (UInt32(mac[offset] & 0x7f) << 24) | (UInt32(mac[offset + 1]) << 16)
+        | (UInt32(mac[offset + 2]) << 8) | UInt32(mac[offset + 3])
+    let text = String(number % UInt32(pow(10, Double(digits))))
+    return String(repeating: "0", count: max(0, digits - text.count)) + text
+}
+
+func totpStep(_ date: Date) -> Int64 { Int64(date.timeIntervalSince1970.rounded(.down)) / totpPeriod }
+
+/// What an authenticator app scans.
+func totpURI(secret: Data, account: String) -> String {
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "-._~@")
+    let label = "touchenv:\(account)".addingPercentEncoding(withAllowedCharacters: allowed) ?? "touchenv"
+    return "otpauth://totp/\(label)?secret=\(base32Encode(secret))&issuer=touchenv&algorithm=SHA1&digits=\(totpDigits)&period=\(totpPeriod)"
+}
+
+struct TOTPState: Codable, Equatable {
+    var secret: Data
+    var created: Date
+    var maxSeconds: TimeInterval          // the longest grant a code may approve
+    var maxUses: Int                      // and the most uses
+    var lastStep: Int64 = 0               // the step of the last code accepted: nothing at or before it passes again
+    var failures = 0                      // wrong codes in a row
+    var notBefore = Date.distantPast
+    var lastUsed: Date?
+    var locked: Bool { failures >= totpTries }
+}
+
+enum TOTPLoad: Equatable { case none, state(TOTPState), unreadable }
+
+protocol TOTPStore: AnyObject {
+    func load() -> TOTPLoad
+    func save(_ state: TOTPState) -> Bool
+    func remove() -> Bool
+}
+
+final class KeychainTOTPStore: TOTPStore {
+    let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                               kSecAttrService as String: "touchenv-totp",
+                               kSecAttrAccount as String: "authenticator",
+                               kSecUseDataProtectionKeychain as String: true, kSecAttrSynchronizable as String: false]
+    func load() -> TOTPLoad {
+        var q = base
+        q[kSecReturnData as String] = true
+        q[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status == errSecItemNotFound { return .none }
+        guard status == errSecSuccess, let data = out as? Data else { return .unreadable }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        guard let state = try? decoder.decode(TOTPState.self, from: data) else { return .unreadable }
+        return .state(state)
+    }
+    func save(_ state: TOTPState) -> Bool {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        let data = try! encoder.encode(state)
+        let status = SecItemUpdate(base as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var q = base
+            q[kSecValueData as String] = data
+            q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            q[kSecAttrLabel as String] = "touchenv: authenticator app key for grant --totp"
+            return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
+        }
+        return status == errSecSuccess
+    }
+    func remove() -> Bool {
+        let status = SecItemDelete(base as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
+    }
+}
+
+var totpStore: TOTPStore = KeychainTOTPStore()
+
+enum TOTPCheck: Equatable { case ok, wrong, used, locked, wait(Int), malformed }
+
+/// Whether two strings of digits are the same, in time that doesn't depend on where they differ.
+func sameDigits(_ a: String, _ b: String) -> Bool {
+    let x = Array(a.utf8), y = Array(b.utf8)
+    guard x.count == y.count else { return false }
+    var difference: UInt8 = 0
+    for i in 0..<x.count { difference |= x[i] ^ y[i] }
+    return difference == 0
+}
+
+/// Checks `code` against the step `now` is in and the one before, and records the outcome in `state` (to be saved
+/// by the caller before anything is allowed). A code that isn't six digits isn't counted as a wrong one.
+func checkTOTP(_ code: String, state: inout TOTPState, now: Date) -> TOTPCheck {
+    guard code.utf8.count == totpDigits, code.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return .malformed }
+    if state.locked { return .locked }
+    let wait = state.notBefore.timeIntervalSince(now)
+    if wait > 0 { return .wait(Int(wait.rounded(.up))) }
+    let current = totpStep(now)
+    var matched: Int64?
+    for step in [current - 1, current] where sameDigits(totpCode(secret: state.secret, step: step), code) { matched = step }
+    guard let step = matched else {
+        state.failures += 1
+        state.notBefore = now.addingTimeInterval(throttleDelay(state.failures))
+        return state.locked ? .locked : .wrong
+    }
+    if step <= state.lastStep { return .used }
+    state.lastStep = step
+    state.failures = 0
+    state.notBefore = .distantPast
+    state.lastUsed = now
+    return .ok
+}
+
+func withTOTPLock<T>(_ body: () -> T) -> T {
+    guard ensurePrivateDir(supportDir()),
+          case let fd = open(supportDir() + "/totp.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600), fd >= 0 else {
+        return body()
+    }
+    defer { close(fd) }
+    flock(fd, LOCK_EX)
+    return body()
+}
+
+/// Approves the timed grant under way (currentAttempt) with a code from the authenticator app, or ends touchenv
+/// with the reason, logged. Refused before the code is looked at when a secret isn't synced, when codes aren't set
+/// up, or when the grant asks for more than setup allows: a refusal of that kind doesn't use the code up.
+func approveWithTOTP(names: [String], code: String, seconds: TimeInterval, uses: Int, now: Date = Date()) {
+    func refuse(_ note: String, _ message: String, _ outcome: String = ReadOutcome.refused) -> Never {
+        endAttempt(outcome, note: note, message: message)
+    }
+    var missing: [String] = [], local: [String] = []
+    for name in names {
+        switch syncedLookup(name) {
+        case nil: missing.append(name)
+        case false?: local.append(name)
+        case true?: break
+        }
+    }
+    if let name = missing.first { refuse("no secret named \(name)", "touchenv: no secret named \(name)") }
+    if !local.isEmpty {
+        let list = local.joined(separator: ", ")
+        refuse("local secret: \(list)",
+               "touchenv: --totp is for secrets synced through iCloud Keychain only. \(list) \(local.count == 1 ? "is" : "are") "
+               + "kept on this Mac behind Touch ID, which a code can't open: that grant needs Touch ID at the Mac.")
+    }
+    let result: (TOTPCheck?, String) = withTOTPLock {
+        var state: TOTPState
+        switch totpStore.load() {
+        case .none: return (nil, "touchenv: codes aren't set up on this Mac. At the Mac, in a terminal: touchenv totp setup")
+        case .unreadable: return (nil, "")
+        case .state(let found): state = found
+        }
+        if seconds > state.maxSeconds || uses > state.maxUses {
+            return (nil, "touchenv: a code approves at most \(spokenLength(state.maxSeconds)) and \(times(state.maxUses)) "
+                    + "(chosen at touchenv totp setup); ask for less, or use Touch ID at the Mac")
+        }
+        let before = state
+        let check = checkTOTP(code, state: &state, now: now)
+        // Saved before anything is allowed: a code that can't be marked used approves nothing.
+        if state != before && !totpStore.save(state) { return (nil, "") }
+        return (check, "")
+    }
+    switch result {
+    case (nil, let message) where message.isEmpty:
+        refuse("can't read or save the authenticator key", "touchenv: can't read or save the authenticator key; nothing approved",
+               ReadOutcome.failed)
+    case (nil, let message):
+        refuse(message.hasPrefix("touchenv: codes aren't") ? "codes not set up" : "more than a code may approve", message)
+    case (.ok?, _):
+        return
+    case (.malformed?, _):
+        refuse("not a six-digit code", "touchenv: --totp takes the six digits your authenticator app shows")
+    case (.wrong?, _):
+        refuse("wrong code", "touchenv: wrong code; not approved. Ask for the code the app shows now (check this Mac's clock too)")
+    case (.used?, _):
+        refuse("code already used", "touchenv: that code was already used; wait for the app to show the next one")
+    case (.wait(let seconds)?, _):
+        refuse("too many wrong codes", "touchenv: too many wrong codes; try again in \(seconds) s")
+    case (.locked?, _):
+        refuse("codes locked after \(totpTries) wrong ones", "touchenv: codes are locked after \(totpTries) wrong ones in a row. "
+               + "At the Mac: touchenv totp unlock (Touch ID)")
+    }
+}
+
+/// The QR code of `text`, scaled up without blur.
+func qrImage(_ text: String, side: CGFloat) -> NSImage? {
+    guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+    filter.setValue(Data(text.utf8), forKey: "inputMessage")
+    filter.setValue("M", forKey: "inputCorrectionLevel")
+    guard let output = filter.outputImage, output.extent.width > 0 else { return nil }
+    let scale = (side / output.extent.width).rounded(.down)
+    let scaled = output.transformed(by: CGAffineTransform(scaleX: max(scale, 1), y: max(scale, 1)))
+    let rep = NSCIImageRep(ciImage: scaled)
+    let image = NSImage(size: rep.size)
+    image.addRepresentation(rep)
+    return image
+}
+
+/// touchenv totp setup's window: the QR code, the key in letters for typing, and a field for the first code. The key
+/// is only ever on this window, which asks macOS to leave it out of screenshots and recordings.
+final class TOTPSetupWindow: NSObject {
+    let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+    let field = NSTextField(string: "")
+    let status = NSTextField(labelWithString: " ")
+    let secret: Data
+    var acceptedStep: Int64?
+
+    init(secret: Data, account: String, limits: String) {
+        self.secret = secret
+        super.init()
+        let width: CGFloat = 260
+        func label(_ text: String, _ font: NSFont, _ color: NSColor = .labelColor) -> NSTextField {
+            let l = NSTextField(wrappingLabelWithString: text)
+            l.font = font
+            l.textColor = color
+            l.preferredMaxLayoutWidth = width
+            l.widthAnchor.constraint(equalToConstant: width).isActive = true
+            return l
+        }
+        let code = NSImageView(image: qrImage(totpURI(secret: secret, account: account), side: 220) ?? NSImage())
+        code.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        code.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        let key = base32Encode(secret)
+        let grouped = stride(from: 0, to: key.count, by: 4).map { String(key.dropFirst($0).prefix(4)) }.joined(separator: " ")
+        let keyLabel = label(grouped, .monospacedSystemFont(ofSize: 11, weight: .regular), .secondaryLabelColor)
+        keyLabel.isSelectable = true
+        field.placeholderString = "Six-digit code"
+        field.font = .monospacedDigitSystemFont(ofSize: 18, weight: .regular)
+        field.alignment = .center
+        field.widthAnchor.constraint(equalToConstant: width).isActive = true
+        field.target = self
+        field.action = #selector(confirm)
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .systemRed
+        let on = NSButton(title: "Turn On", target: self, action: #selector(confirm))
+        on.keyEquivalent = "\r"
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelSetup))
+        cancel.keyEquivalent = "\u{1b}"
+        for button in [on, cancel] {
+            button.controlSize = .large
+            button.widthAnchor.constraint(equalToConstant: width).isActive = true
+        }
+        let stack = NSStackView(views: [
+            label("Approve timed grants with a code", .boldSystemFont(ofSize: 14)),
+            label("Scan this with an authenticator app on your phone, then type the code it shows. A code will approve "
+                  + "a timed grant of secrets synced through iCloud, \(limits), with nobody at this Mac.",
+                  .systemFont(ofSize: 12)),
+            code,
+            label("Or type this key into the app (time-based, SHA-1, 6 digits, 30 seconds):", .systemFont(ofSize: 11), .secondaryLabelColor),
+            keyLabel,
+            label("Whoever has this key can make codes: show it to no one, and to no AI assistant.", .systemFont(ofSize: 11),
+                  .systemOrange),
+            field, status, on, cancel])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 16, bottom: 16, right: 16)
+        panel.contentView = stack
+        panel.titlebarAppearsTransparent = true
+        panel.titleVisibility = .hidden
+        panel.isMovableByWindowBackground = true
+        panel.level = .modalPanel
+        panel.hidesOnDeactivate = false
+        panel.sharingType = .none   // not in screenshots, recordings or screen sharing, as far as macOS honours it
+        panel.setContentSize(stack.fittingSize)
+    }
+
+    @objc func confirm() {
+        let typed = field.stringValue.filter { !$0.isWhitespace }
+        let now = totpStep(Date())
+        // The phone's clock may be a little off at setup: one step either side.
+        if let step = [now - 1, now, now + 1].last(where: { sameDigits(totpCode(secret: secret, step: $0), typed) }) {
+            acceptedStep = step
+            NSApplication.shared.stopModal()
+        } else {
+            status.stringValue = "That isn't the code for this key. Type the one the app shows now."
+            field.stringValue = ""
+        }
+    }
+    @objc func cancelSetup() { NSApplication.shared.stopModal() }
+
+    /// Shows the window and waits. The step of the code typed, or nil when cancelled.
+    func run() -> Int64? {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        panel.center()
+        app.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(field)
+        app.runModal(for: panel)
+        panel.orderOut(nil)
+        return acceptedStep
+    }
+}
+
+func describeTOTP(_ state: TOTPState, now: Date = Date()) -> [String] {
+    let day = DateFormatter()
+    day.dateStyle = .medium
+    day.timeStyle = .short
+    var lines = ["codes: on since \(day.string(from: state.created))",
+                 "a code approves: a timed grant of synced secrets, at most \(spokenLength(state.maxSeconds)) and \(times(state.maxUses))",
+                 "last used: " + (state.lastUsed.map { day.string(from: $0) } ?? "never")]
+    if state.locked {
+        lines.append("LOCKED after \(totpTries) wrong codes in a row: touchenv totp unlock (Touch ID)")
+    } else if state.failures > 0 {
+        let wait = Int(state.notBefore.timeIntervalSince(now).rounded(.up))
+        lines.append("wrong codes in a row: \(state.failures) of \(totpTries)" + (wait > 0 ? "; next try in \(wait) s" : ""))
+    }
+    return lines
+}
+
 // MARK: Moving to another Mac
 
 let importService = "touchenv-import"
@@ -4602,6 +4963,15 @@ usage: touchenv grant --for 8h --uses 20 NAME ...         a timed grant to this 
                                                           a standing grant to one program
        touchenv grant --list · --revoke PROGRAM · --revoke-all
        --password before the limits: type your Mac password in the terminal instead of Touch ID (synced secrets only)
+       --totp CODE before the limits: a code from your authenticator app instead of Touch ID, for a timed grant of
+                                      synced secrets (touchenv totp setup first, at the Mac)
+"""
+
+let totpUsage = """
+usage: touchenv totp setup [--max-for 12h] [--max-uses 100]   turn on approving timed grants with a code from an
+                                                              authenticator app (Touch ID; --max-…: the most one
+                                                              code may approve, before setup)
+       touchenv totp status · touchenv totp off · touchenv totp unlock
 """
 
 let sshUsage = """
@@ -4882,6 +5252,8 @@ var grantUsesText = ""
 var always = false, forProgram: String?, listGrants = false, revokeProgram: String?, revokeAll = false
 var lockAll = false
 var usePassword = false
+var grantCode: String?
+var totpMaxLength: TimeInterval?, totpMaxUses: Int?
 var noMask = false
 var logSince: TimeInterval?, logSummary = false
 while let option = args.first, option.hasPrefix("--"), option != "--" {
@@ -4912,6 +5284,21 @@ while let option = args.first, option.hasPrefix("--"), option != "--" {
     } else if option == "--password", ["get", "run", "grant"].contains(command) {
         usePassword = true
         args.removeFirst()
+    } else if option == "--totp", command == "grant", args.count > 1 {
+        grantCode = args[1]
+        args.removeFirst(2)
+    } else if option == "--max-for", command == "totp", args.count > 1 {
+        guard let length = parseLength(args[1]), length <= maxGrantLength else {
+            die("touchenv: --max-for takes a length like 30m, 8h or 1h30m, 24h at most", 2)
+        }
+        totpMaxLength = length
+        args.removeFirst(2)
+    } else if option == "--max-uses", command == "totp", args.count > 1 {
+        guard let uses = Int(args[1]), (1...maxGrantUses).contains(uses) else {
+            die("touchenv: --max-uses takes a number from 1 to \(maxGrantUses)", 2)
+        }
+        totpMaxUses = uses
+        args.removeFirst(2)
     } else if option == "--no-mask", command == "run" {
         noMask = true
         args.removeFirst()
@@ -4945,6 +5332,12 @@ if command == "grant" {
     }
     if let uses = grantUses, !(1...maxUses).contains(uses) {
         die("touchenv: --uses takes a number from 1 to \(maxUses)", 2)
+    }
+    if grantCode != nil {
+        if usePassword { die("touchenv: --totp or --password, not both", 2) }
+        if standing || listGrants || revokeProgram != nil || revokeAll {
+            die("touchenv: --totp approves a timed grant only (touchenv grant --totp CODE --for 8h --uses 20 NAME ...)", 2)
+        }
     }
 }
 
@@ -5359,7 +5752,9 @@ case "grant":
     guard who.pid > 1 else { die("touchenv: can't tell which app is asking, so there is nothing to grant to") }
     for name in wanted where synced(name) == nil { endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)") }
     let limits = "for \(spokenLength(length)), up to \(times(uses))"
-    if usePassword {
+    if let code = grantCode {
+        approveWithTOTP(names: wanted, code: code, seconds: length, uses: uses)
+    } else if usePassword {
         var summary = ["touchenv: allow \(who.name) and what it runs to read \(list) from iCloud Keychain without asking, "
                        + "\(limits)? It stays on while the Mac is locked."]
         if let intent { summary.append("  Intent: \(intent)") }
@@ -5376,10 +5771,84 @@ case "grant":
           reply["ok"] as? Bool == true else {
         endAttempt(ReadOutcome.failed, note: "couldn't start the grant", message: "touchenv: couldn't start the grant; nothing was allowed")
     }
-    logAttempt("timed", note: "\(limits)" + (usePassword ? "; approved with the Mac password typed in the terminal" : ""))
+    logAttempt("timed", note: "\(limits)" + (usePassword ? "; approved with the Mac password typed in the terminal" : "")
+               + (grantCode != nil ? "; approved with a code from the authenticator app" : ""))
     let until = DateFormatter.localizedString(from: Date().addingTimeInterval(length), dateStyle: .none, timeStyle: .short)
     print("\(reply["who"] as? String ?? who.name) and what it runs can read \(list) with touchenv run without asking: "
           + "\(times(uses)), until \(until), also while the Mac is locked. touchenv lock ends it.")
+
+case "totp":
+    guard args.count == 1, ["setup", "status", "off", "unlock"].contains(args[0]),
+          args[0] == "setup" || (totpMaxLength == nil && totpMaxUses == nil) else { die(totpUsage, 2) }
+    let asker = requester()
+    func logTOTP(_ outcome: String, _ note: String = "") {
+        logAccess(AccessEntry(event: "totp", outcome: outcome, who: asker.name, program: callingProgram(asker),
+                              intent: intent ?? "", note: note))
+    }
+    switch args[0] {
+    case "status":
+        switch totpStore.load() {
+        case .none: print("codes: off (touchenv totp setup turns them on: see docs/grants.md)")
+        case .unreadable: die("touchenv: can't read the authenticator key")
+        case .state(let state): describeTOTP(state).forEach { print($0) }
+        }
+    case "off":
+        // No Touch ID: it only takes a way in away, like ending a grant.
+        let was = totpStore.load()
+        guard withTOTPLock({ totpStore.remove() }) else { die("touchenv: keychain error; codes are still on") }
+        if was == .none { print("codes were already off") } else {
+            logTOTP("off")
+            print("codes are off: the key is deleted from this Mac. Remove touchenv from your authenticator app too.")
+        }
+    case "unlock":
+        guard case .state(let state) = totpStore.load() else { die("touchenv: codes aren't set up (touchenv totp setup)") }
+        guard state.failures > 0 else { print("codes aren't locked"); break }
+        requireIntent(intent, example: "touchenv totp --intent \"<why>\" unlock", who: asker)
+        authenticate("Allow \(asker.name) to take codes from the authenticator app again? \(state.failures) wrong "
+                     + "\(state.failures == 1 ? "code was" : "codes were") tried in a row.", intent: intent,
+                     reason: "let \(asker.name) take codes from the authenticator app again", asker: asker)
+        let saved: Bool = withTOTPLock {
+            guard case .state(var now) = totpStore.load() else { return false }
+            now.failures = 0
+            now.notBefore = .distantPast
+            return totpStore.save(now)
+        }
+        guard saved else { die("touchenv: keychain error; codes are still locked") }
+        logTOTP("unlock", "after \(state.failures) wrong codes")
+        print("codes are taken again")
+    default:   // setup
+        // The key must never pass through an AI assistant: it could then make codes of its own for good.
+        if asker.isAgent {
+            logTOTP(ReadOutcome.refused, "setup asked by an AI assistant")
+            die("touchenv: \(asker.name) can't set codes up: the key would pass through it. Run touchenv totp setup "
+                + "yourself, in a terminal at the Mac.")
+        }
+        let maxSeconds = totpMaxLength ?? totpDefaultLength, maxUses = totpMaxUses ?? totpDefaultUses
+        let limits = "at most \(spokenLength(maxSeconds)) and \(times(maxUses))"
+        let replacing = totpStore.load() != .none
+        authenticate("Allow \(asker.name) to turn on approving timed grants with a code from an authenticator app? A code "
+                     + "then approves a grant of secrets synced through iCloud, \(limits), with nobody at this Mac."
+                     + (replacing ? " The key set up before stops working." : ""),
+                     intent: intent, reason: "turn on approving timed grants with a code from an authenticator app, \(limits)",
+                     asker: asker)
+        var bytes = [UInt8](repeating: 0, count: 20)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { die("touchenv: no random bytes") }
+        let secret = Data(bytes)
+        let account = (currentUserName() ?? "me") + "@" + (Host.current().localizedName ?? "Mac")
+        guard let step = TOTPSetupWindow(secret: secret, account: account, limits: limits).run() else {
+            logTOTP(ReadOutcome.cancelled, "setup")
+            die("touchenv: cancelled; " + (replacing ? "the key set up before still works" : "codes stay off"))
+        }
+        // The code typed to confirm is used up: it approves nothing more.
+        let state = TOTPState(secret: secret, created: Date(), maxSeconds: maxSeconds, maxUses: maxUses, lastStep: step)
+        guard withTOTPLock({ totpStore.save(state) }) else { die("touchenv: keychain error; codes are not set up") }
+        logTOTP("setup", limits + (replacing ? "; replaces the key set up before" : ""))
+        print("""
+            codes are on. From afar: touchenv grant --totp CODE --for 8h --uses 20 NAME ...
+            for secrets synced through iCloud (touchenv ls marks them), \(limits) a grant.
+            touchenv totp status shows it; touchenv totp off ends it.
+            """)
+    }
 
 case "lock":
     guard args.isEmpty else { die("usage: touchenv lock [--all]", 2) }

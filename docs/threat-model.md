@@ -144,6 +144,9 @@ pipe DACL in `pipeSDDL`, caller from the pipe token). [windows.md](windows.md) c
   sources an edited `~/.zshrc`, a hook in an AI agent's settings, AppleScript `do script` (subject to the
   Automation consent prompt). The only signal is the notice `showNotice` flashes and the log line. Standing
   grants are reachable by simply running the granted program (documented).
+- **Can**, when codes are on (`touchenv totp setup`), read a code the user gives an agent (the transcript file,
+  the process list) and try to spend it first on a timed grant of synced secrets for itself, within the limits of
+  setup; or lock codes with five wrong tries. It cannot read the key behind the codes.
 - **Can** read a secret while it is in use: the `0600` temp file is the same uid; the child's environment is
   likely readable through `KERN_PROCARGS2`/`ps -E` for same-user processes (unverified here; see section 6).
 - **Can** draw its own window above touchenv's `.modalPanel` prompt to change what the text appears to say, while
@@ -165,7 +168,8 @@ without the team's signing identity. On Windows, admin is out of scope: it can r
 
 Can run code with a forged entitlement or debug touchenv, so it reads **every synced item**, every **standing-grant
 copy** (including copies of local secrets), the agent's in-memory grants, and the sealing key. Local items still
-need the user's presence, per Apple's design. This is the documented price of `--sync`;
+need the user's presence, per Apple's design. It also reads the authenticator key of `grant --totp`, which opens
+nothing it could not already read. This is the documented price of `--sync`;
 [security.md](security.md#local-and-synced-secrets) does not mention that standing grants carry the same exposure.
 
 ### (e) A prompt-injected AI agent
@@ -179,6 +183,9 @@ need the user's presence, per Apple's design. This is the documented price of `-
 - **Can:** ask `touchenv get` — an approved value goes straight into the transcript; masking applies to `run` only.
 - **Can:** add `--no-mask` and run a benign-looking `env` or `curl -v`; the prompt does not show the flag.
 - **Can:** use an open timed grant or 5-minute approval freely until it ends (documented).
+- **Can:** when codes are on, ask the user for a code under a pretext and spend it on any timed grant of synced
+  secrets up to the limits of setup: the code is not bound to what it approves. **Cannot** run `totp setup`
+  (refused for a recognised agent, and Touch ID) or see the key, so it cannot make codes.
 - Agents not recognised by argv[0] (e.g. one running as `node`) are not forced to give an intent; output masking
   still applies when output is a pipe or `CLAUDECODE`/`AI_AGENT` is set.
 
@@ -238,6 +245,9 @@ standing grants are not synced. Windows has no sync.
 3. **Synced secrets and standing-grant copies rest on touchenv's code and SIP**, and synced ones on every device in
    your iCloud Keychain. *Users:* keep production, signing, payment and SSH keys local; do not make standing grants
    for those; protect the Apple Account and every Mac in it.
+   With `grant --totp` on, a code read to an agent approves whatever grant the agent asks for, within the limits of
+   setup. *Users:* low `--max-for` and `--max-uses`; sync only what may be granted from afar; "code already used"
+   on a first try is an alarm. *Project:* an approval bound to the request (a passkey signature over it).
 4. **Secrets in use are readable by same-user code** (temp file, likely environment). *Users:* prefer short-lived
    commands; do not put `$TMPDIR` in a synced folder.
 5. **Windows: one Hello approval exposes the whole store**, and any program can write the prompt text. *Users:* only

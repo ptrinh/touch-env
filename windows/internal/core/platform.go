@@ -79,6 +79,9 @@ type Service interface {
 	// AskKeep shows the "Don't ask again for 5 minutes?" question (before Windows Hello): proceed false means the
 	// person cancelled; keep true means they chose 5 minutes.
 	AskKeep(text string) (proceed, keep bool, err error)
+	// ShowKey shows the key behind the codes (touchenv totp setup) in a window of its own, never on the terminal:
+	// ok false means the person cancelled.
+	ShowKey(text string) (ok bool, err error)
 	// StartTray starts the notification-area icon that shows each use and offers Lock Now, unless one runs already.
 	StartTray()
 	// Install installs or updates the service (asking for administrator approval when needed); Uninstall removes

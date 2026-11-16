@@ -1,7 +1,8 @@
-# Not being asked every time: approvals, grants, lock and --password
+# Not being asked every time: approvals, grants, lock, --password and --totp
 
 How to let reads through without a touch each time, for 5 minutes, for a while, or for one program, how to end
-that, and how to approve with your Mac password in the terminal. macOS only, except where it says Windows.
+that, and how to approve with your Mac password in the terminal or, from afar, with a code from your phone. macOS
+only, except where it says Windows.
 
 | | Covers | Ends | Works with |
 |---|---|---|---|
@@ -145,3 +146,50 @@ touchenv grant --password --for 8h --uses 20 API_KEY          # timed or standin
 - An AI agent still has to give `--intent`.
 
 How the password is checked and what it doesn't protect against: [security.md](security.md#typing-the-mac-password).
+
+## From afar, with a code from your phone (synced secrets only)
+
+A timed grant lasts a day at most. Away from the Mac for longer, driving an agent from your phone with no way to
+touch the sensor or type a password, you can approve the next grant with a six-digit code from an authenticator app
+(Google Authenticator, 1Password, Apple Passwords, any app that does time-based codes).
+
+On Windows it works the same from afar, after one more step at the PC (`touchenv totp allow NAME …`, since nothing is
+synced there): [windows.md](windows.md#grants-from-afar-with-a-code-from-your-phone).
+
+Once, at the Mac, yourself, in a terminal:
+
+```sh
+touchenv totp setup                               # a code approves at most 12 hours and 100 uses
+touchenv totp setup --max-for 8h --max-uses 20    # or choose the most a code may approve
+```
+
+Touch ID, then a window shows a QR code: scan it with the app and type the code the app shows. The key behind the
+codes is shown in that window only, never in the terminal, and an AI assistant can't run `totp setup`: one that saw
+the key could make its own codes for good.
+
+Then, from afar, read the code to the agent, which runs:
+
+```sh
+touchenv grant --intent "deploy" --totp 123456 --for 8h --uses 20 API_KEY
+```
+
+- **Synced secrets only**, as with `--password` and for the same reason: a secret kept on this Mac only is locked by
+  macOS behind Touch ID, and no code opens it. Naming one refuses the whole request. `touchenv ls` marks the synced
+  ones; `touchenv sync NAME` makes a secret one (read [what that gives up](security.md#local-and-synced-secrets)
+  first).
+- **Timed grants only**: not `get`, `run`, a standing grant, `set` or `export`. The grant is the ordinary timed one:
+  for the app that asked and what it runs, ended by `touchenv lock`.
+- **Within the limits of setup.** A grant longer or with more uses than `--max-for` and `--max-uses` allowed is
+  refused, and the code isn't used up.
+- **A code works once**, for the 30 seconds the app shows it and the 30 after. Keep this Mac's clock set
+  automatically.
+- **Wrong codes** double the wait before the next try (1 s, 2 s, 4 s, 8 s); the fifth in a row locks codes until
+  `touchenv totp unlock`, with Touch ID at the Mac.
+- `touchenv totp status` shows whether codes are on, the limits, the last use and the wrong tries.
+  `touchenv totp off` deletes the key (no Touch ID); `touchenv totp setup` again replaces it.
+
+**A code doesn't say what it approves.** You read six digits; the agent chooses the secrets, the time and the uses,
+up to the limits of setup and among all your synced secrets. An agent that a web page talked into something can ask
+you for a code and spend it on a wider grant than you meant. So: set `--max-for` and `--max-uses` as low as your
+work needs, sync only what you are willing to grant from afar, and look at `touchenv grant --list` or the access
+log when something seems off. More: [security.md](security.md#codes-from-an-authenticator-app).

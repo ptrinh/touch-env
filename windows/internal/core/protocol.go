@@ -25,7 +25,8 @@ const (
 	maxNames        = 64
 )
 
-// Request is what the client asks. Ops: get, approve, allow, lock, status, watch.
+// Request is what the client asks. Ops: get, approve, allow, lock, status, watch, and for codes from an
+// authenticator app (totp.go): totp-setup, totp-unlock, totp-allow, totp-deny, totp-off, totp-status, totp-grant.
 type Request struct {
 	V       int               `json:"v"`
 	Op      string            `json:"op"`
@@ -33,6 +34,11 @@ type Request struct {
 	Seconds int               `json:"seconds,omitempty"`
 	Uses    int               `json:"uses,omitempty"`
 	Intent  string            `json:"intent,omitempty"`
+	Code    string            `json:"code,omitempty"`   // totp-grant: the six digits
+	Update  bool              `json:"update,omitempty"` // totp-allow: only replace copies already kept
+	At      int64             `json:"at,omitempty"`     // totp-setup, totp-unlock: when it was signed (Unix seconds)
+	Pub     []byte            `json:"pub,omitempty"`    // totp-setup: the Windows Hello public key (PKCS #1)
+	Sig     []byte            `json:"sig,omitempty"`    // totp-setup, totp-unlock: that key's signature
 	Secrets map[string][]byte `json:"-"`
 }
 
@@ -47,6 +53,7 @@ type Reply struct {
 	Ended     int               `json:"ended,omitempty"`
 	Items     []Item            `json:"items,omitempty"`
 	Event     *Event            `json:"event,omitempty"`
+	TOTP      *TOTPStatus       `json:"totp,omitempty"`
 	Secrets   map[string][]byte `json:"-"`
 }
 
@@ -168,8 +175,24 @@ func (req *Request) validate() error {
 		if len(req.Secrets) == 0 || len(req.Names) != 0 {
 			return errFrame
 		}
-	case "lock", "status", "watch":
+	case "lock", "status", "watch", "totp-off", "totp-status", "totp-unlock":
 		if len(req.Secrets) != 0 || len(req.Names) != 0 {
+			return errFrame
+		}
+	case "totp-setup":
+		if len(req.Secrets) != 1 || len(req.Names) != 0 {
+			return errFrame
+		}
+	case "totp-allow":
+		if len(req.Secrets) == 0 || len(req.Names) != 0 {
+			return errFrame
+		}
+	case "totp-deny":
+		if len(req.Names) == 0 || len(req.Secrets) != 0 {
+			return errFrame
+		}
+	case "totp-grant":
+		if len(req.Names) == 0 || len(req.Secrets) != 0 || len(req.Code) == 0 || len(req.Code) > 16 {
 			return errFrame
 		}
 	default:
@@ -222,6 +245,31 @@ func (h *Holder) Serve(conn io.ReadWriter, identify func() (Caller, error), vers
 		reply.OK = true
 	case "watch":
 		return h.serveWatch(conn, c, reply, done)
+	case "totp-setup":
+		err = h.TOTPSetup(c, &req)
+		reply.OK = err == nil
+	case "totp-unlock":
+		err = h.TOTPUnlock(c, &req)
+		reply.OK = err == nil
+	case "totp-allow":
+		reply.Ended, err = h.TOTPAllow(c, secrets, req.Update)
+		reply.OK = err == nil
+	case "totp-deny":
+		reply.Ended, err = h.TOTPDeny(c, req.Names)
+		reply.OK = err == nil
+	case "totp-off":
+		var was bool
+		was, err = h.TOTPOff(c)
+		if was {
+			reply.Ended = 1
+		}
+		reply.OK = err == nil
+	case "totp-status":
+		reply.TOTP, err = h.TOTPState(c)
+		reply.OK = err == nil
+	case "totp-grant":
+		reply.Who, err = h.TOTPGrant(c, req.Names, time.Duration(req.Seconds)*time.Second, req.Uses, req.Code)
+		reply.OK = err == nil
 	}
 	defer wipeAll(out)
 	if err != nil {

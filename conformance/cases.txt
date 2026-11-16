@@ -155,3 +155,24 @@ windows: 2 | err:touchenv: ssh unload is macOS only for now | ssh unload A
 windows: 0 | out:touchenv ssh add [NAME] KEYFILE | help
 windows: 1 | err:touchenv: ssh agent sign is started by touchenv's SSH agent | ssh agent sign
 windows: 2 | err:usage: touchenv ssh agent install [--config] | ssh agent sign --config
+# Codes from an authenticator app (grant --totp, touchenv totp) arrived in touchenv 1.9.0; Windows has allow and deny too.
+2 | err:touchenv: unknown option --totp | grant --totp
+2 | err:touchenv: unknown option --totp | get --totp 123456 A
+2 | err:touchenv: unknown option --totp | run --totp 123456 A -- true
+macos: 2 | err:touchenv: --totp or --password, not both | grant --totp 123456 --password --for 8h --uses 1 A
+macos: 2 | err:touchenv: --totp approves a timed grant only | grant --totp 123456 --always --for-program /bin/ls A
+macos: 2 | err:touchenv: --totp approves a timed grant only | grant --totp 123456 --list
+macos: 2 | err:touchenv: --totp approves a timed grant only | grant --totp 123456 --revoke-all
+2 | err:usage: touchenv grant --for 8h --uses 20 NAME | grant --totp 123456 A
+2 | err:usage: touchenv totp setup | totp
+2 | err:usage: touchenv totp setup | totp bogus
+2 | err:usage: touchenv totp setup | totp setup extra
+2 | err:usage: touchenv totp setup | totp --max-for 1h status
+2 | err:usage: touchenv totp setup | totp --max-uses 5 off
+2 | err:touchenv: --max-for takes a length like 30m, 8h or 1h30m, 24h at most | totp --max-for 25h setup
+2 | err:touchenv: --max-uses takes a number from 1 to 500 | totp --max-uses 501 setup
+2 | err:touchenv: unknown option --max-for | grant --max-for 1h A
+0 | out:touchenv totp setup | help
+windows: 2 | err:usage: touchenv totp setup | totp allow
+windows: 2 | err:usage: touchenv totp setup | totp deny bad-name
+windows: 2 | err:usage: touchenv totp setup | totp status A

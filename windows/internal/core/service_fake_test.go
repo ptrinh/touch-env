@@ -10,16 +10,20 @@ import (
 // fakeService runs a real Holder behind an in-memory pipe, and tells it who the caller is the way the Windows
 // service would (from the "kernel": here, the machine's ancestor chain turned into a process table).
 type fakeService struct {
-	m        *machine
-	holder   *Holder
-	user     string
-	session  uint32
-	down     bool
-	impostor bool
-	keep     struct{ proceed, keep bool }
-	asked    []string
-	trays    int
-	installs []bool
+	m         *machine
+	holder    *Holder
+	user      string
+	session   uint32
+	down      bool
+	impostor  bool
+	keep      struct{ proceed, keep bool }
+	asked     []string
+	shown     []string // ShowKey texts
+	cancelKey bool
+	onShow    func(text string)
+	vault     *fakeVault
+	trays     int
+	installs  []bool
 
 	pids  map[string]uint32 // process name -> pid, so the same app keeps its pid across runs
 	start map[uint32]uint64
@@ -32,7 +36,8 @@ const touchenvPID = 5000
 func (m *machine) withService(offerKeep bool) *fakeService {
 	f := &fakeService{m: m, user: "S-1-5-21-1-1001", session: 1, pids: map[string]uint32{}, start: map[uint32]uint64{}, next: 100}
 	f.keep.proceed = true
-	f.holder = &Holder{Now: func() time.Time { return m.now }, Procs: f.procs, OfferKeep: offerKeep}
+	f.vault = &fakeVault{}
+	f.holder = &Holder{Now: func() time.Time { return m.now }, Procs: f.procs, OfferKeep: offerKeep, Vault: f.vault}
 	m.svc = f
 	return f
 }
@@ -95,7 +100,37 @@ func (f *fakeService) AskKeep(text string) (bool, bool, error) {
 	return f.keep.proceed, f.keep.keep, nil
 }
 
+func (f *fakeService) ShowKey(text string) (bool, error) {
+	f.shown = append(f.shown, text)
+	if f.onShow != nil {
+		f.onShow(text)
+	}
+	return !f.cancelKey, nil
+}
+
 func (f *fakeService) StartTray() { f.trays++ }
+
+// fakeVault is the service's codes file, in memory.
+type fakeVault struct {
+	data  []byte
+	fail  bool
+	saves int
+}
+
+func (v *fakeVault) Load() ([]byte, error) { return append([]byte(nil), v.data...), nil }
+func (v *fakeVault) Save(data []byte) error {
+	if v.fail {
+		return io.ErrClosedPipe
+	}
+	v.data = append([]byte(nil), data...)
+	v.saves++
+	return nil
+}
+
+// restartService is the service after a restart: grants gone, the codes file still there.
+func (f *fakeService) restartService() {
+	f.holder = &Holder{Now: func() time.Time { return f.m.now }, Procs: f.procs, OfferKeep: f.holder.OfferKeep, Vault: f.vault}
+}
 
 func (f *fakeService) Install(offer bool, out io.Writer) error {
 	f.installs = append(f.installs, offer)

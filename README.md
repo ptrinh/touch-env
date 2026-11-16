@@ -70,6 +70,7 @@ On a Mac, Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
 | Syncing keys to your other machines | `--sync`, through iCloud Keychain | No: keys stay on the PC |
 | 5-minute approvals and timed grants | Built in | After `touchenv service install`, once. While one is on, any program running as you can collect those keys |
 | Standing grants, the access log, `--password` | Yes | Not yet |
+| Grants from afar with a code from your phone (`grant --totp`) | For iCloud-synced keys | For the keys you allow (`touchenv totp allow`); the service keeps a copy of those outside Windows Hello |
 
 All of the Windows side: [docs/windows.md](docs/windows.md).
 
@@ -88,7 +89,7 @@ On Windows every key is local to the PC. On a Mac you choose per key:
 | An attacker with admin rights who turns off SIP | Still needs your finger (not when it is in a standing grant) | Can read it |
 | Another Mac on your Apple Account is taken over | Nothing to take: the key isn't there | Exposed |
 | A new or lost Mac | `export` / `import` ([docs/new-mac.md](docs/new-mac.md)). A Mac lost before an export takes the key with it | Already on the new Mac |
-| Approving away from the Mac | No, except a grant made beforehand | `--password` over SSH |
+| Approving away from the Mac | No, except a grant made beforehand | `--password` over SSH, or a code from your phone (`grant --totp`) |
 
 `touchenv sync` and `touchenv set --sync` say so on the terminal each time a key starts syncing. What each kind of
 attacker can and can't do: [docs/threat-model.md](docs/threat-model.md).
@@ -108,6 +109,10 @@ All of this is in [docs/grants.md](docs/grants.md). On Windows the first two nee
   For helpers that run unattended, such as from scheduled tasks.
 - **No sensor at hand** (Mac). `--password` on `get`, `run` or `grant` takes your Mac password, typed in the
   terminal, for iCloud-synced secrets only.
+- **From afar.** After `touchenv totp setup` at the Mac, `touchenv grant --totp 123456 --for 8h --uses 20 KEY`
+  approves a timed grant with a code from your authenticator app: you read the code to the agent you are driving
+  from your phone. On a Mac, for iCloud-synced secrets only; on Windows, for the keys you chose with
+  `touchenv totp allow` ([docs/windows.md](docs/windows.md#grants-from-afar-with-a-code-from-your-phone)).
 - `touchenv lock` ends 5-minute approvals and timed grants. To see what is allowed: `touchenv grant --list` on a
   Mac (`lock --all` ends standing grants too), `touchenv status` on Windows.
 

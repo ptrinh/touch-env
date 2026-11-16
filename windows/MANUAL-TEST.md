@@ -117,6 +117,38 @@ test, but can't use Windows Hello.
     `touchenv grant` says the service isn't installed, `touchenv lock` says nothing to lock, runs ask every time.
 35. **Arm64.** 20, 22 and 25 on an Arm PC with the arm64 build.
 
+## Codes from an authenticator app (grant --totp)
+
+Not yet tried on a real PC: every step here is new. Needs the service, installed from this build, and an
+authenticator app on a phone. `A` and `B` are test keys saved as above.
+
+50. **Where it is kept.** After `touchenv service install`, in an elevated prompt:
+    `dir C:\Windows\ServiceProfiles\touchenv\AppData\Local`. If the service account has no profile folder there,
+    `touchenv totp setup` says the service has nowhere to keep codes: note the Windows version; the design needs
+    another place for the file on that Windows.
+51. **Setup.** `touchenv totp setup --max-for 8h --max-uses 20`: a message box shows the key (and nothing of it in the
+    terminal); add it to the app by typing it; OK; type the app's code in the terminal; one Windows Hello prompt
+    naming the limits. `touchenv totp status` says on, 8 hours, 20 times, nothing allowed yet. From Claude Code,
+    `touchenv totp setup` is refused before any window.
+52. **Allow.** `touchenv totp allow A`: one Hello prompt saying a copy is kept outside Windows Hello. Status lists A.
+    In an elevated prompt, `icacls C:\Windows\ServiceProfiles\touchenv\AppData\Local\touchenv` lists the service
+    account, SYSTEM and Administrators only, and `findstr sk-test C:\...\touchenv\codes.bin` finds nothing.
+53. **Grant from afar.** Lock the PC, or connect over Remote Desktop or SSH (where `touchenv get A` refuses):
+    `touchenv grant --totp <code> --for 1h --uses 2 A` succeeds with no Hello prompt; `touchenv run A -- cmd /c echo
+    %A%` prints the key; `touchenv status` shows the grant and the use. The same code again: "already used".
+54. **Fences.** With a fresh code each time: `B` (not allowed) is refused; `--for 9h` is refused; neither uses the
+    code up. A wrong code is refused; five in a row lock codes, also for the right code; `touchenv totp unlock` asks
+    Hello and codes work again.
+55. **Restart.** Restart the PC (or `sc stop touchenv` and `sc start touchenv`, elevated): `touchenv status` shows no
+    grant, `touchenv totp status` is unchanged, and a new code grants `A` again.
+56. **Keeping in step.** `echo sk-test-2 | touchenv set A` says the copy was updated, and a grant by code then hands
+    out `sk-test-2`. `touchenv rm A` says the copy was deleted. `touchenv totp deny B` and `touchenv totp off` need no
+    Hello; after `off`, `codes.bin` is gone.
+57. **Uninstall.** `touchenv service uninstall`: `C:\Windows\ServiceProfiles\touchenv\AppData\Local\touchenv` is
+    gone. Install again: `touchenv totp status` says off.
+58. **Another user.** A second Windows account on the PC: `touchenv totp status` says off, and a code of the first
+    account's is refused there.
+
 ## SSH keys
 
 Windows' own OpenSSH client (`ssh -V`: OpenSSH_for_Windows 8.9 or later sends the server to the agent). Stop the

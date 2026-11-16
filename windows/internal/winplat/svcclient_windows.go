@@ -134,6 +134,23 @@ func (Service) AskKeep(text string) (bool, bool, error) {
 	return r == idYes || r == idNo, r == idYes, nil
 }
 
+const (
+	mbOKCancel        = 0x1
+	mbIconInformation = 0x40
+	idOK              = 1
+)
+
+// ShowKey shows the key behind the codes in a plain Windows message box, Cancel preselected.
+func (Service) ShowKey(text string) (bool, error) {
+	owner, _, _ := procGetConsoleWindow.Call()
+	r, err := windows.MessageBox(windows.HWND(owner), utf16z(text), utf16z("touchenv"),
+		mbOKCancel|mbIconInformation|mbDefButton2|mbSetForeground|mbTopmost)
+	if r == 0 {
+		return false, err
+	}
+	return r == idOK, nil
+}
+
 // StartTray starts "touchenv tray" in this session unless one runs already. Best effort.
 func (Service) StartTray() {
 	if h, err := windows.OpenMutex(windows.SYNCHRONIZE, false, utf16z(trayMutexName)); err == nil {
@@ -426,6 +443,8 @@ func uninstallService() int {
 			return 13
 		}
 	}
+	// The codes file and the copies of secrets allowed from afar go with the service.
+	os.RemoveAll(installedVaultDir())
 	dir := installDir()
 	if exe, err := os.Executable(); err == nil && strings.EqualFold(filepath.Dir(exe), dir) {
 		// Running from there: Windows removes it at the next restart.

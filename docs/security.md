@@ -98,11 +98,46 @@ synced secrets with the Mac password typed in the terminal.
   running as you can't reset; each one doubles the wait before the next try, across runs, up to an hour. If that
   count can't be read, no password is checked.
 
+## Codes from an authenticator app
+
+`grant --totp` ([grants.md](grants.md#from-afar-with-a-code-from-your-phone-synced-secrets-only)) approves a timed
+grant of synced secrets with a six-digit code (RFC 6238: HMAC-SHA1, 30 seconds), with nobody at the Mac.
+
+- **Synced secrets only**, as for `--password`: touchenv's own check is their gate either way. A local secret's
+  lock is macOS's, and a code can't open it.
+- **Weaker than a fingerprint, and than the password.** A fingerprint shows someone is at the Mac; a code shows
+  someone has the phone, or the key. And the code passes through whoever runs the command: it is in the agent's
+  conversation, on the command line and in the process list for a moment.
+- **Not tied to the request.** The code is the same whatever grant it is spent on. Whoever is handed one, an agent
+  misled by a web page included, picks the secrets, the time and the uses, among all synced secrets and up to the
+  limits of setup (`--max-for`, `--max-uses`; 12 hours and 100 uses unless you chose less). Those limits and what
+  you sync are the fence.
+- **A race.** A program running as you that reads the code where the agent keeps its conversation can try to spend
+  it first, on a grant for itself. A code works once, so yours then fails with "already used": treat that as an
+  alarm (`touchenv lock`, then the access log). Such a program can also reach any grant the agent holds
+  ([the threat model](threat-model.md)), so this adds little it did not have.
+- **The key.** 20 random bytes, in one Keychain item in touchenv's access group with the limits and the counts:
+  this device only, never synced, readable after first unlock, no Touch ID lock (codes must be checked with nobody
+  there). Other programs running as you can't read it. An attacker with admin rights who turns off SIP can, and
+  can then make codes; that attacker reads synced secrets directly anyway. The other copy is in your authenticator
+  app: whoever has that phone unlocked, or a backup of the app, can make codes. `touchenv totp setup` again replaces
+  the key; `touchenv totp off` deletes it.
+- **Setup** asks for Touch ID and shows the key only in touchenv's window, which asks macOS to leave it out of
+  screenshots, recordings and screen sharing (macOS decides whether every capture path honours that). It is
+  refused for a recognised AI assistant. Never paste the key or the QR code anywhere.
+- **Guessing.** A guess is right two times in a million. Wrong codes are counted in the same Keychain item (other
+  programs can't reset it): each doubles the wait, and the fifth in a row locks codes until `touchenv totp unlock`
+  with Touch ID. So any program running as you can lock codes on purpose with five wrong tries; you are then asked
+  to come to the Mac, nothing is opened.
+- **Once.** The step of the last accepted code is saved before the grant is made; nothing at or before it is
+  accepted again, the code typed at setup included. If it can't be saved, nothing is approved.
+
 ## The menu bar and notices
 
 The lock icon in the menu bar shows while a 5-minute approval or timed grant is on, with the time left and **Lock
 Now**; its menu also lists standing grants. Each use of an approval or grant flashes a notice at the top right.
-Standing-grant reads and `--password` reads show no notice: they are in the access log.
+Standing-grant reads and `--password` reads show no notice: they are in the access log. A grant made with a code
+shows in the menu bar like any timed grant, and each use of it flashes the notice.
 
 ## The log
 

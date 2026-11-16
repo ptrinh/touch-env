@@ -43,6 +43,10 @@ func usage() string {
                                         one Windows Hello now; then this app and what it runs read those
                                         secrets with touchenv run without asking, also while the PC is locked,
                                         until the time (24h at most) or the uses run out
+  touchenv totp setup · allow NAME ... · deny NAME ... · status · off · unlock
+                                        approve timed grants from afar with a code from an authenticator app:
+                                        touchenv grant --totp CODE --for 8h --uses 20 NAME ... (the secrets
+                                        you allowed; see docs/windows.md)
   touchenv lock                         end every approval now: 5-minute ones and grants
   touchenv status                       list grants and 5-minute approvals, and each use
 
@@ -107,18 +111,22 @@ type exitCode int
 func (e exitCode) Error() string { return fmt.Sprintf("exit %d", int(e)) }
 
 type options struct {
-	intent    string
-	hasIntent bool
-	sync      bool
-	recipient string
-	hasTo     bool
-	begin     bool
-	replace   bool
-	localOnly bool
-	length    time.Duration // grant --for
-	lengthArg string
-	uses      int // grant --uses
-	noMask    bool
+	intent        string
+	hasIntent     bool
+	sync          bool
+	recipient     string
+	hasTo         bool
+	begin         bool
+	replace       bool
+	localOnly     bool
+	length        time.Duration // grant --for
+	lengthArg     string
+	uses          int // grant --uses
+	noMask        bool
+	code          string // grant --totp
+	hasCode       bool
+	totpMaxLength time.Duration // totp setup --max-for
+	totpMaxUses   int           // totp setup --max-uses
 }
 
 func run(args []string, env *Env) error {
@@ -167,6 +175,23 @@ func run(args []string, env *Env) error {
 			}
 			o.uses = n
 			args = args[2:]
+		case option == "--totp" && command == "grant" && len(args) > 1:
+			o.code, o.hasCode = args[1], true
+			args = args[2:]
+		case option == "--max-for" && command == "totp" && len(args) > 1:
+			d, ok := ParseLength(args[1])
+			if !ok || d > MaxGrantLength {
+				return die(2, "touchenv: --max-for takes a length like 30m, 8h or 1h30m, 24h at most")
+			}
+			o.totpMaxLength = d
+			args = args[2:]
+		case option == "--max-uses" && command == "totp" && len(args) > 1:
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 1 || n > MaxGrantUses {
+				return die(2, "touchenv: --max-uses takes a number from 1 to %d", MaxGrantUses)
+			}
+			o.totpMaxUses = n
+			args = args[2:]
 		case option == "--no-mask" && command == "run":
 			o.noMask = true
 			args = args[1:]
@@ -200,6 +225,8 @@ func run(args []string, env *Env) error {
 		return c.lock(args)
 	case "status":
 		return c.status(args)
+	case "totp":
+		return c.totp(args)
 	case "service":
 		return c.service(args)
 	case "sync", "unsync":
@@ -366,6 +393,9 @@ func (c *cmd) set(args []string) error {
 		return err
 	}
 	fmt.Fprintf(c.env.Stdout, "stored %s (%d bytes)\n", name, len(data))
+	if existed {
+		c.tellCopies(name, data)
+	}
 	return nil
 }
 
@@ -437,6 +467,7 @@ func (c *cmd) rm(args []string) error {
 		os.Remove(path) // an SSH key's public half, if it was one
 	}
 	fmt.Fprintf(c.env.Stdout, "deleted %s\n", args[0])
+	c.tellCopies(args[0], nil)
 	return nil
 }
 

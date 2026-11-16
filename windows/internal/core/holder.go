@@ -1,7 +1,7 @@
 package core
 
 // The holder: what the touchenv service keeps in memory, 5-minute approvals and grants, per Windows user and
-// session, and nothing on disk. Portable, so it is tested on any OS; internal/winplat runs it inside the service and
+// session, and nothing on disk (except, once a user sets them up, codes from an authenticator app: totp.go). Portable, so it is tested on any OS; internal/winplat runs it inside the service and
 // tells it who each caller is from what Windows itself reports (the pipe client's token and pid, the system's process
 // list), never from anything the caller says about itself.
 //
@@ -176,10 +176,15 @@ type Holder struct {
 	Alloc     func(n int) []byte // memory for a held secret (the service locks it so it isn't paged out)
 	Free      func(b []byte)     // wipes and releases what Alloc gave
 	OfferKeep bool               // installed with --offer-5-minutes
+	Vault     Vault              // where codes and the secrets allowed from afar are kept (totp.go); nil: nowhere
 
 	mu       sync.Mutex
 	entries  []*entry
 	watchers map[*watcher]bool
+
+	remote       map[string]*remoteState // by Windows user (SID); totp.go
+	remoteLoaded bool
+	remoteErr    error
 }
 
 func (h *Holder) alloc(n int) []byte {
@@ -300,6 +305,11 @@ func (h *Holder) Allow(c Caller, secrets map[string][]byte, length time.Duration
 	if err := checkCaller(c, t); err != nil {
 		return "", err
 	}
+	return h.allowLocked(c, t, secrets, length, uses)
+}
+
+// allowLocked is Allow once the caller and the limits are checked. Called with mu held.
+func (h *Holder) allowLocked(c Caller, t ProcTable, secrets map[string][]byte, length time.Duration, uses int) (string, error) {
 	ref, who := t.RequesterOf(c.PID)
 	if !who.Found || t[ref.PID].Session != c.Session {
 		return "", errNoRequester

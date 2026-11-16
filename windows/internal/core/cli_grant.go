@@ -125,6 +125,9 @@ func (c *cmd) grant(args []string) error {
 		c.o.lengthArg, c.o.uses, strings.Join(wanted, " "))); err != nil {
 		return err
 	}
+	if c.o.hasCode {
+		return c.grantWithCode(wanted)
+	}
 	who := c.who()
 	// The grant covers the requester and what it runs, so there must be one to name.
 	if !who.Found {

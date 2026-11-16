@@ -28,9 +28,10 @@ the intent, and the outcome:
 | `cancelled` | cancelled at the prompt, or no password typed |
 | `failed` | a Keychain error, or the password couldn't be checked |
 
-Also logged: grants made (timed and standing: which secrets, for whom, the limits), revoked, or ended by `lock` or
-**Lock Now**; `set` and `rm`; `export` and `import`. Never a value, any part of one, or its length, and never a
-password.
+Also logged: grants made (timed and standing: which secrets, for whom, the limits, and whether a password or a
+code approved it), revoked, or ended by `lock` or **Lock Now**; `set` and `rm`; `export` and `import`; `touchenv
+totp` setup, off and unlock, and every refused code with the reason. Never a value, any part of one, or its length,
+and never a password or a code.
 
 The SSH agent keeps its own log, `~/Library/Logs/touchenv-ssh-agent.log` (see [ssh.md](ssh.md)); its signatures are
 not in this one.

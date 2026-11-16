@@ -194,13 +194,14 @@ func (p *fakePlatform) Environ() []string { return []string{"PATH=C:\\Windows", 
 
 // machine is one PC: its store folder, its Hello key, and who runs touchenv.
 type machine struct {
-	t     *testing.T
-	p     *fakePlatform
-	h     *fakeHello
-	now   time.Time
-	stdin string
-	svc   *fakeService // nil: no touchenv service
-	ssh   *fakeSSHHost // nil: no SSH agent support
+	t         *testing.T
+	p         *fakePlatform
+	h         *fakeHello
+	now       time.Time
+	stdin     string
+	stdinLate io.Reader    // when set, what touchenv reads instead of stdin (for input that depends on what it shows)
+	svc       *fakeService // nil: no touchenv service
+	ssh       *fakeSSHHost // nil: no SSH agent support
 }
 
 func newMachine(t *testing.T, keyIndex int) *machine {
@@ -224,6 +225,9 @@ func (m *machine) run(args ...string) result {
 	var out, errOut bytes.Buffer
 	env := Env{Stdin: strings.NewReader(m.stdin), Stdout: &out, Stderr: &errOut, Platform: m.p,
 		Hello: m.h, Now: func() time.Time { return m.now }}
+	if m.stdinLate != nil {
+		env.Stdin, m.stdinLate = m.stdinLate, nil
+	}
 	if m.svc != nil {
 		env.Service = m.svc
 	}
