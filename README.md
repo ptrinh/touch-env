@@ -96,8 +96,8 @@ attacker can and can't do: [docs/threat-model.md](docs/threat-model.md).
 
 ## Not being asked every time
 
-All of this is in [docs/grants.md](docs/grants.md). On Windows the first two need the touchenv service
-(`touchenv service install`, once) and the next two don't exist yet.
+All of this is in [docs/grants.md](docs/grants.md). On Windows these need the touchenv service
+(`touchenv service install`, once), and the two marked Mac don't exist yet.
 
 - **For 5 minutes.** Tick "Don't ask again for 5 minutes" on a `run` prompt: the same app gets those keys from
   `run` without asking until then.
@@ -109,12 +109,61 @@ All of this is in [docs/grants.md](docs/grants.md). On Windows the first two nee
   For helpers that run unattended, such as from scheduled tasks.
 - **No sensor at hand** (Mac). `--password` on `get`, `run` or `grant` takes your Mac password, typed in the
   terminal, for iCloud-synced secrets only.
-- **From afar.** After `touchenv totp setup` at the Mac, `touchenv grant --totp 123456 --for 8h --uses 20 KEY`
-  approves a timed grant with a code from your authenticator app: you read the code to the agent you are driving
-  from your phone. On a Mac, for iCloud-synced secrets only; on Windows, for the keys you chose with
-  `touchenv totp allow` ([docs/windows.md](docs/windows.md#grants-from-afar-with-a-code-from-your-phone)).
+- **From afar.** A code from your phone approves a grant: [the next section](#approving-from-afar).
 - `touchenv lock` ends 5-minute approvals and timed grants. To see what is allowed: `touchenv grant --list` on a
   Mac (`lock --all` ends standing grants too), `touchenv status` on Windows.
+
+## Approving from afar
+
+You are away from the machine and driving an AI agent on it from your phone (Claude Code's remote control, SSH,
+a chat): nobody is there to touch the sensor. Two ways, and they work together.
+
+**1. A grant, made before you leave.** At the machine, in the app the agent runs in (that Claude Code session, or
+the terminal it was started from):
+
+```sh
+touchenv grant --for 8h --uses 20 DEPLOY_KEY OPENAI_API_KEY
+```
+
+One touch. Until the time or the uses run out, that app and what it runs get those keys from `touchenv run`
+without asking, also while the machine is locked. It works for every key, lasts 24 hours at most, and ends when
+that app quits. Choose the fewest keys, the shortest time and the fewest uses the work needs.
+
+**2. A code from your phone, when the grant has run out.** For the second day away, or a grant you didn't think
+of. Once, at the machine, yourself:
+
+```sh
+touchenv totp setup --max-for 8h --max-uses 20     # shows a key for your authenticator app; the most one code may approve
+touchenv sync DEPLOY_KEY                           # Mac: a code grants only keys synced through iCloud
+touchenv totp allow DEPLOY_KEY                     # Windows: a code grants only the keys you allow
+```
+
+Then, from afar, open your authenticator app and give the agent the six digits it shows. The agent runs:
+
+```sh
+touchenv grant --intent "deploy the fix" --totp 123456 --for 8h --uses 20 DEPLOY_KEY
+```
+
+and has an ordinary grant, with no touch. A code works once and for about a minute. Five wrong codes in a row lock
+codes until you are back at the machine (`touchenv totp unlock`).
+
+| | A grant made beforehand | A code from your phone |
+|---|---|---|
+| You must be at the machine | When you make it, each time | Once, to set codes up |
+| Which keys | Any | Mac: iCloud-synced ones. Windows: the ones you allowed |
+| How long | 24 hours at most | Each code: up to the limits of setup, 24 hours at most; then another code |
+| What you approve | The prompt names the keys and the limits | Six digits: **the agent chooses the keys and the limits**, within those of setup |
+| Kept safe by | Touch ID or Windows Hello | The key in your authenticator app, and touchenv's own check |
+
+A code is the weaker of the two: it doesn't say what it approves, and the keys it can grant are guarded by touchenv
+rather than by the fingerprint lock ([synced keys](#local-or-synced-mac) on a Mac, a copy the touchenv service
+keeps on Windows). Keep signing keys and admin tokens out of its reach, and set the limits low. If a first try
+says the code was **already used**, something else spent it: `touchenv lock`, then look at `touchenv log` (Mac) or
+`touchenv status` (Windows).
+
+`touchenv lock` ends every grant at once, however it was approved. All of it:
+[docs/grants.md](docs/grants.md#from-afar-with-a-code-from-your-phone-synced-secrets-only) for a Mac,
+[docs/windows.md](docs/windows.md#grants-from-afar-with-a-code-from-your-phone) for Windows.
 
 ## Who read what (Mac)
 
