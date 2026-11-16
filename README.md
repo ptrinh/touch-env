@@ -40,8 +40,6 @@ The exe is signed by SENPRINTS LLC. Checking the download, and the service that 
   `touchenv service install` again with the new exe (Windows asks for administrator approval): running grants and
   5-minute approvals end, codes and the keys allowed from afar stay.
 
-A 5-minute approval or timed grant made before the update may ask again once; `touchenv lock` clears it.
-
 ## Everyday use
 
 ```sh
