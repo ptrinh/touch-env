@@ -23,7 +23,7 @@ link `touchenv.app/Contents/MacOS/touchenv` into your `PATH`.
 
 **Windows** (10 or 11, x64 or Arm, with Windows Hello set up; beta): download
 `touchenv-<version>-windows-x64.zip` (or `-arm64`) from
-[Releases](https://github.com/ptrinh/touch-env/releases/latest) and put `touchenv.exe` in a folder on your `PATH`.
+[Releases](https://github.com/ptrinh/touch-env/releases) (the newest release that has them: some are Mac-only) and put `touchenv.exe` in a folder on your `PATH`.
 The exe is signed by SENPRINTS LLC. Checking the download, and the service that grants need:
 [docs/windows.md](docs/windows.md).
 

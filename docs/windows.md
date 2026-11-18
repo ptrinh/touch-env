@@ -10,7 +10,7 @@ only run in tests so far.
 
 Windows 10 or 11, x64 or Arm, with Windows Hello set up (a PIN at least; fingerprint or face too if you like).
 Download `touchenv-<version>-windows-x64.zip` (or `-arm64`) from
-[Releases](https://github.com/ptrinh/touch-env/releases/latest), check it against the `.sha256` file
+[Releases](https://github.com/ptrinh/touch-env/releases) (the newest release that has Windows zips; some releases are Mac-only), check it against the `.sha256` file
 (`Get-FileHash touchenv-*.zip`), and put `touchenv.exe` in a folder on your `PATH`.
 
 `touchenv.exe` is code-signed by **SENPRINTS LLC** (Microsoft's Trusted Signing), with a timestamp, from the
