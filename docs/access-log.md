@@ -33,6 +33,9 @@ code approved it), revoked, or ended by `lock` or **Lock Now**; `set` and `rm`; 
 totp` setup, off and unlock, and every refused code with the reason. Never a value, any part of one, or its length,
 and never a password or a code.
 
+When an AI agent's prompt is approved, touchenv reads the last 30 minutes of the log to tell it how many Touch ID
+prompts its app had lately (see [grants.md](grants.md#for-ai-agents-ask-once)).
+
 The SSH agent keeps its own log, `~/Library/Logs/touchenv-ssh-agent.log` (see [ssh.md](ssh.md)); its signatures are
 not in this one.
 

@@ -90,7 +90,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.9.1"
+let version = "1.9.2"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -507,13 +507,102 @@ func pumpMasked(from: FileHandle, to: FileHandle, needles: [Data], done: Dispatc
 /// An AI agent must give a reason (--intent) for anything that asks for Touch ID or reads a secret, so the prompt
 /// always says why. Refused before any prompt: the agent reads the error and asks again with one.
 func requireIntent(_ intent: String?, example: String, who known: Requester? = nil) {
-    guard intent == nil else { return }
+    guard intent == nil else {
+        agentHints = agentVariables.contains { ProcessInfo.processInfo.environment[$0] != nil } || (known ?? requester()).isAgent
+        return
+    }
     let who = known ?? requester()
     if who.isAgent {
         endAttempt("refused", note: "no --intent from an agent",
                    message: "touchenv: \(who.name) must say why, in a few words: \(example)\n"
                        + "  (--intent goes right after the command; the reason is shown in the Touch ID prompt)", code: 2)
     }
+}
+
+// MARK: Hints for AI agents
+
+// An agent that asks for Touch ID now and then over a long task gets prompts nobody may be there to answer. So, to
+// an agent only (it gave --intent and requester() says it is one, or one of agentVariables is set), touchenv adds
+// one line on stderr: after an approved run prompt, to ask once for a timed grant; after a declined one, not to retry
+// in a loop. People typing touchenv see none of it. The count of recent prompts comes from the access log (names,
+// times, outcomes; never a value): nothing new is stored.
+
+/// Whether the hints below go out: set by requireIntent.
+var agentHints = false
+/// "Recently", for counting an app's Touch ID prompts.
+let recentPromptWindow: TimeInterval = 30 * 60
+let grantExample = "touchenv grant --intent \"<why>\" --for 2h --uses 20"
+let awayHint = "touchenv: the person may be away. Don't retry in a loop: finish the work that needs no secret, then ask "
+    + "them once when they are back (or ask now for one touchenv grant covering every secret still needed)."
+
+/// The Touch ID prompts `who` had for reads in the last 30 minutes, approved or not, from the access log.
+func recentPrompts(_ entries: [AccessEntry], who: String, now: Date) -> [AccessEntry] {
+    entries.filter { e in
+        e.event == "read" && e.who == who && [ReadOutcome.touchID, ReadOutcome.cancelled].contains(e.outcome)
+            && e.time > now.addingTimeInterval(-recentPromptWindow) && e.time <= now
+    }
+}
+
+/// The line after an agent's run prompt was approved: with 2 or more prompts lately, how many and for which keys;
+/// otherwise a tip to ask once for a grant. `recent` includes this prompt.
+func approvedHint(who: String, names: [String], recent: [AccessEntry]) -> String {
+    guard recent.count >= 2 else {
+        return "touchenv: tip: if this task will need more secrets later, ask once now: \(grantExample) "
+            + "\(names.joined(separator: " ")) OTHER_KEY ... (a timed grant covers this app and what it runs; run only)"
+    }
+    var keys: [String] = []
+    for e in recent { for name in e.secrets where !keys.contains(name) { keys.append(name) } }
+    return "touchenv: \(who) has asked for Touch ID \(recent.count) times in 30 minutes (\(keys.joined(separator: ", "))). "
+        + "Ask the person once for the rest: \(grantExample) KEY ..."
+}
+
+/// Why a prompt ended without approval, for "touchenv: not approved (…)"; nil when nothing more is known.
+/// `cancelled`: Cancel was clicked in touchenv's window.
+func notApprovedReason(cancelled: Bool, code: LAError.Code?, locked: Bool) -> String? {
+    if cancelled { return "declined" }
+    switch code {
+    case .userCancel?: return "declined"
+    case .systemCancel?:
+        return locked ? "the Mac locked while the prompt was open"
+            : "the system closed the prompt: another Touch ID prompt opened, or another app took over"
+    case .appCancel?, .invalidContext?: return "the prompt was closed before anyone answered"
+    case .notInteractive?: return "touchenv can't show a prompt in this session"
+    case .authenticationFailed?: return "not recognized"
+    case .biometryNotAvailable?, .biometryNotEnrolled?, .passcodeNotSet?, .biometryLockout?:
+        return "Touch ID or the Mac password can't be used now"
+    default: return locked ? "the Mac is locked" : nil
+    }
+}
+
+func notApproved(cancelled: Bool, code: LAError.Code?) -> Never {
+    let why = notApprovedReason(cancelled: cancelled, code: code, locked: screenLocked())
+    endAttempt(ReadOutcome.cancelled, note: why ?? "",
+               message: "touchenv: not approved" + (why.map { " (\($0))" } ?? "") + (agentHints ? "\n" + awayHint : ""))
+}
+
+/// While a prompt is open: touchenv stopped (a tool's time limit, Ctrl-C, the terminal closed) says so and logs it,
+/// rather than vanishing. The caller cancels the sources and restores the previous handlers when the prompt is over.
+func watchForStop() -> (sources: [DispatchSourceSignal], previous: [(Int32, sig_t?)]) {
+    var previous: [(Int32, sig_t?)] = []
+    let sources = [SIGTERM, SIGHUP, SIGINT].map { sig -> DispatchSourceSignal in
+        previous.append((sig, signal(sig, SIG_IGN)))
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+        source.setEventHandler {
+            endAttempt(ReadOutcome.cancelled, note: "stopped while the prompt was open",
+                       message: "touchenv: not approved (stopped while the prompt was open, with no answer)"
+                           + (agentHints ? "\n" + awayHint : ""), code: 128 + sig)
+        }
+        source.resume()
+        return source
+    }
+    return (sources, previous)
+}
+
+/// The access log's entries since `since`: only the monthly files that can hold them.
+func recentAccessEntries(since: Date, now: Date = accessLogNow()) -> [AccessEntry] {
+    var files: [String] = []
+    for file in [accessLogFile(for: since), accessLogFile(for: now)] where !files.contains(file) { files.append(file) }
+    return files.flatMap { logLines($0).compactMap(parseAccessLine) }.filter { $0.time >= since }
 }
 
 // MARK: Prompt
@@ -607,6 +696,8 @@ final class Prompt: NSObject, NSTextViewDelegate {
     var keepFor5Minutes: Bool { sessionBox?.state == .on }
     var chosen: Outcome?
     var outcome = Outcome.denied
+    /// Why Touch ID ended without approval, as the system said (nil when Cancel was clicked or it approved).
+    var failure: LAError.Code?
 
     /// `notes`: lines shown under the title (the SSH sign prompt: the server); `asker`: who asks, when it is not
     /// this process's parent (the SSH agent asks for the process at the other end of its socket).
@@ -842,6 +933,7 @@ final class Prompt: NSObject, NSTextViewDelegate {
             DispatchQueue.main.async {
                 finished = true
                 let code = (error as? LAError)?.code
+                if !success, self.chosen == nil { self.failure = code }
                 if success { self.outcome = .approved }
                 else if let chosen = self.chosen { self.outcome = chosen }
                 else if code == .authenticationFailed || code == .biometryLockout || code == .userFallback {
@@ -885,6 +977,8 @@ final class Prompt: NSObject, NSTextViewDelegate {
 func authenticate(_ title: String, intent: String?, detail: String? = nil, reason: String,
                   offerSession: Bool = false, asker: Requester? = nil, warnings: [String] = []) -> Bool {
     var keep = false
+    let stopWatch = watchForStop()
+    defer { stopWatch.sources.forEach { $0.cancel() }; for (sig, old) in stopWatch.previous { signal(sig, old) } }
     if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) {
         let prompt = Prompt(title: title, intent: intent, detail: detail, offerSession: offerSession, warnings: warnings,
                             asker: asker)
@@ -892,7 +986,7 @@ func authenticate(_ title: String, intent: String?, detail: String? = nil, reaso
         keep = prompt.keepFor5Minutes
         switch outcome {
         case .approved: return keep
-        case .denied: endAttempt("cancelled", message: "touchenv: not approved")
+        case .denied: notApproved(cancelled: prompt.failure == nil, code: prompt.failure)
         case .password: context = LAContext()
         }
     }
@@ -904,12 +998,14 @@ func authenticate(_ title: String, intent: String?, detail: String? = nil, reaso
     let done = DispatchSemaphore(value: 0)
     var ok = false
     let full = intent.map { "\(reason) (intent: \($0))" } ?? reason
-    context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: full) { success, _ in
+    var failure: LAError.Code?
+    context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: full) { success, error in
         ok = success
+        failure = (error as? LAError)?.code
         done.signal()
     }
     done.wait()
-    if !ok { endAttempt("cancelled", message: "touchenv: not approved") }
+    if !ok { notApproved(cancelled: false, code: failure) }
     return keep
 }
 
@@ -962,9 +1058,14 @@ func syncedNames() -> Set<String> {
                             kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
                             kSecReturnAttributes as String: true, kSecMatchLimit as String: kSecMatchLimitAll]
     var out: CFTypeRef?
-    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let found = out as? [[String: Any]] else { return [] }
+    syncedListingStatus = SecItemCopyMatching(q as CFDictionary, &out)
+    guard syncedListingStatus == errSecSuccess, let found = out as? [[String: Any]] else { return [] }
     return Set(found.compactMap { $0[kSecAttrAccount as String] as? String })
 }
+
+/// How the last syncedNames() went. Anything but errSecSuccess or errSecItemNotFound (the Mac locked: synced items are
+/// WhenUnlocked) means the list may be short, so a name missing from it is not known to be missing.
+var syncedListingStatus: OSStatus = errSecSuccess
 
 /// Whether the secret syncs through iCloud Keychain; nil when there is none. No Touch ID: a local item answers
 /// "interaction not allowed" when it exists.
@@ -1007,8 +1108,33 @@ func place(_ names: [String], among all: Set<String>? = nil) -> String {
 /// No Touch ID (see synced).
 func requireStored(_ names: [String], among all: Set<String>? = nil) {
     let all = all ?? syncedNames()
-    for name in names where synced(name, among: all) == nil {
-        endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)")
+    for name in names where synced(name, among: all) == nil { missingSecret(name) }
+}
+
+/// Exits for a secret that looks unstored: "no secret named X" only when the Keychain answered in full; otherwise why
+/// it couldn't be checked (once a locked Mac read as "no secret named" for a synced secret that was there).
+func missingSecret(_ name: String) -> Never {
+    if let why = uncheckedReason(listing: syncedListingStatus, locked: screenLocked()) {
+        endAttempt(ReadOutcome.failed, note: "couldn't check \(name): \(why)",
+                   message: "touchenv: couldn't check whether \(name) is stored: \(why)" + (agentHints ? "\n" + awayHint : ""))
+    }
+    endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)")
+}
+
+/// Why a name missing from the synced list can't be called missing: nil when the Keychain answered in full.
+func uncheckedReason(listing: OSStatus, locked: Bool) -> String? {
+    listing == errSecSuccess || listing == errSecItemNotFound ? nil : keychainProblem(listing, locked: locked)
+}
+
+/// A Keychain status other than success or "not found", in words.
+func keychainProblem(_ status: OSStatus, locked: Bool) -> String {
+    switch status {
+    case errSecInteractionNotAllowed:
+        return locked ? "the Mac is locked, and the Keychain can't be read until it is unlocked (keychain error \(status))"
+            : "the Keychain needed a prompt it couldn't show; another prompt may have been open (keychain error \(status))"
+    case errSecUserCanceled: return "the Keychain's prompt was cancelled (keychain error \(status))"
+    case errSecAuthFailed: return "not approved: declined, timed out, or replaced by another prompt (keychain error \(status))"
+    default: return (locked ? "the Mac is locked; " : "") + "keychain error \(status)"
     }
 }
 
@@ -1076,7 +1202,10 @@ func read(_ name: String) -> Data {
         if status == errSecItemNotFound {
             endAttempt("refused", note: "no secret named \(name)", message: "touchenv: no secret named \(name)")
         }
-        endAttempt("failed", note: "keychain error \(status)", message: "touchenv: keychain error \(status)")
+        let why = keychainProblem(status, locked: screenLocked())
+        let declined = status == errSecUserCanceled || status == errSecAuthFailed
+        endAttempt(declined ? ReadOutcome.cancelled : ReadOutcome.failed, note: why,
+                   message: "touchenv: couldn't read \(name): \(why)" + (agentHints && declined ? "\n" + awayHint : ""))
     }
     return data
 }
@@ -2891,7 +3020,7 @@ func approveWithPassword(names: [String], summary: [String]) {
         case true?: break
         }
     }
-    if let name = missing.first { refuse("no secret named \(name)", "touchenv: no secret named \(name)") }
+    if let name = missing.first { missingSecret(name) }
     if !local.isEmpty {
         let list = local.joined(separator: ", ")
         refuse("local secret: \(list)",
@@ -3153,7 +3282,7 @@ func approveWithTOTP(names: [String], code: String, seconds: TimeInterval, uses:
         case true?: break
         }
     }
-    if let name = missing.first { refuse("no secret named \(name)", "touchenv: no secret named \(name)") }
+    if let name = missing.first { missingSecret(name) }
     if !local.isEmpty {
         let list = local.joined(separator: ", ")
         refuse("local secret: \(list)",
@@ -5492,7 +5621,11 @@ case "ls" where syncedOnly:
     // For tools that report which secrets rest on touchenv's own check (bordercheck). Never a value.
     guard args.isEmpty else { die("usage: touchenv ls [--synced]", 2) }
     requireIntent(intent, example: "touchenv ls --intent \"<why>\" --synced")
-    syncedNames().sorted().forEach { print($0) }
+    let names = syncedNames()
+    if let why = uncheckedReason(listing: syncedListingStatus, locked: screenLocked()) {
+        die("touchenv: couldn't list the synced secrets: \(why)")
+    }
+    names.sorted().forEach { print($0) }
 
 case "ls":
     requireIntent(intent, example: "touchenv ls --intent \"<why>\"")
@@ -5568,6 +5701,12 @@ case "run":
                                 offerSession: true, asker: asker, warnings: warnings)
         for name in wanted where secrets[name] == nil { secrets[name] = read(name) }
         logAttempt(ReadOutcome.touchID, note: keep ? "\"Don't ask again for 5 minutes\" ticked" : "")
+        if agentHints {
+            let now = accessLogNow()
+            let recent = recentPrompts(recentAccessEntries(since: now.addingTimeInterval(-recentPromptWindow), now: now),
+                                       who: who, now: now)
+            FileHandle.standardError.write((approvedHint(who: who, names: wanted, recent: recent) + "\n").data(using: .utf8)!)
+        }
         if keep {
             let kept = startAgent() ? askAgent(["op": "grant", "secrets": secrets.mapValues { $0.base64EncodedString() }]) : nil
             if kept?["ok"] as? Bool != true {
@@ -5766,7 +5905,7 @@ case "grant":
     requireIntent(intent, example: "touchenv grant --intent \"<why>\" --for \(grantLengthText) --uses \(uses) \(wanted.joined(separator: " "))")
     // The grant covers the requester and what it runs, so there must be one to name.
     guard who.pid > 1 else { die("touchenv: can't tell which app is asking, so there is nothing to grant to") }
-    for name in wanted where synced(name) == nil { endAttempt(ReadOutcome.refused, note: "no secret named \(name)", message: "touchenv: no secret named \(name)") }
+    for name in wanted where synced(name) == nil { missingSecret(name) }
     let limits = "for \(spokenLength(length)), up to \(times(uses))"
     if let code = grantCode {
         approveWithTOTP(names: wanted, code: code, seconds: length, uses: uses)

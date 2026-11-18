@@ -73,6 +73,28 @@ optional; without it the prompt says **No reason given** and shows the command.
 
 On a Mac, Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
 
+### For AI agents: ask once
+
+A long task (a release: notarize, then a store upload, then signing) that asks for Touch ID now and then, spread
+over an hour, gets prompts nobody is there to answer. Ask once, up front, for everything the task needs:
+
+```sh
+touchenv grant --intent "release 2.3.0" --for 2h --uses 20 ASC_KEY_PATH MSSTORE_CLIENT_SECRET SIGNING_KEY
+```
+
+One touch; then `touchenv run` from that app (and what it runs) gets those keys without asking until the time or
+the uses run out. To an agent only (it gave `--intent`), touchenv says so on stderr, one line at a time:
+
+- after an approved `run` prompt: `touchenv: tip: if this task will need more secrets later, ask once now: touchenv
+  grant --intent "<why>" --for 2h --uses 20 KEY OTHER_KEY ... (a timed grant covers this app and what it runs; run only)`
+- from the second prompt in 30 minutes: `touchenv: Claude Code has asked for Touch ID 3 times in 30 minutes (KEY1,
+  KEY2, KEY3). Ask the person once for the rest: touchenv grant --intent "<why>" --for 2h --uses 20 KEY ...`
+- after a prompt nobody approved (declined, the Mac locked, another prompt took over, or touchenv stopped by a time
+  limit): `touchenv: the person may be away. Don't retry in a loop: finish the work that needs no secret, then ask
+  them once when they are back (or ask now for one touchenv grant covering every secret still needed).`
+
+More in [docs/grants.md](docs/grants.md#for-ai-agents-ask-once).
+
 ## Mac and Windows: what differs
 
 | | Mac | Windows (beta) |

@@ -41,6 +41,35 @@ window and pane in it.
 Until it ends, anything that app runs can take those keys, as with the 5-minute approval but for longer and with
 nobody watching. Grants also cover SSH signatures (see [ssh.md](ssh.md)).
 
+## For AI agents: ask once
+
+An agent that asks for Touch ID several times over a long task (a release: notarize, a store upload, signing)
+needs you there each time; when you aren't, prompts are declined or time out and the agent tends to retry. Better:
+the agent asks **once, up front**, for every key the task needs, with a timed grant:
+
+```sh
+touchenv grant --intent "release 2.3.0" --for 2h --uses 20 ASC_KEY_PATH MSSTORE_CLIENT_SECRET SIGNING_KEY
+```
+
+To nudge it there, touchenv adds one line on stderr, only when an agent asks (it gave `--intent` and is a known
+agent, or `CLAUDECODE` / `AI_AGENT` is set); your own terminal sees none of it:
+
+| When | The line |
+|---|---|
+| A `run` prompt was approved | `touchenv: tip: if this task will need more secrets later, ask once now: touchenv grant --intent "<why>" --for 2h --uses 20 KEY OTHER_KEY ... (a timed grant covers this app and what it runs; run only)` |
+| The same app's second (or later) prompt in 30 minutes | `touchenv: Claude Code has asked for Touch ID 3 times in 30 minutes (KEY1, KEY2, KEY3). Ask the person once for the rest: touchenv grant --intent "<why>" --for 2h --uses 20 KEY ...` |
+| Nobody approved the prompt | `touchenv: the person may be away. Don't retry in a loop: finish the work that needs no secret, then ask them once when they are back (or ask now for one touchenv grant covering every secret still needed).` |
+
+The count comes from the [access log](access-log.md) (touch-id and cancelled reads by that app in the last 30
+minutes): nothing new is kept, and never a value.
+
+`touchenv: not approved` now says why when touchenv knows: `(declined)`, `(the Mac locked while the prompt was
+open)`, `(the system closed the prompt: another Touch ID prompt opened, or another app took over)`, `(the prompt
+was closed before anyone answered)`, or `(stopped while the prompt was open, with no answer)` when touchenv was
+ended (a tool's time limit, Ctrl-C) during the prompt. And `no secret named X` now means just that: when the
+Keychain can't list the synced secrets (the Mac is locked, say), touchenv says `couldn't check whether X is
+stored: the Mac is locked, and the Keychain can't be read until it is unlocked (keychain error -25308)` instead.
+
 ## One program, from now on: standing grants
 
 Some programs read a secret over and over with nobody there: a helper script that hands Claude Code an MCP
