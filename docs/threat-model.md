@@ -31,7 +31,8 @@ system dialog). touchenv passes its evaluated context in `query()` (870). This i
 tool; touchenv relies on Apple's claim that the check is enforced below the user process (see section 6).
 
 **Synced items (macOS).** `add(..., sync: true)` sets `kSecAttrSynchronizable = true` and
-`kSecAttrAccessibleWhenUnlocked`, with **no access control** (iCloud Keychain won't accept one). The only things
+`kSecAttrAccessibleAfterFirstUnlock` (`WhenUnlocked` before 1.9.3, upgraded on the first unlocked listing), with
+**no access control** (iCloud Keychain won't accept one). The only things
 between a process and the value are:
 
 1. the **keychain access group**: the app is signed with a single `keychain-access-groups` entry
@@ -191,9 +192,10 @@ nothing it could not already read. This is the documented price of `--sync`;
 
 ### (f) A stolen or lost Mac
 
-- Locked or powered off: local items (`WhenUnlockedThisDeviceOnly`) and synced items (`WhenUnlocked`) are not
-  readable; reading needs the login password. Standing-grant items are `AfterFirstUnlock`: readable by touchenv
-  while locked but only by a process that can run as the user, which a thief at the lock screen cannot.
+- Powered off (or not logged in since boot): nothing is readable. Locked: local items (`WhenUnlockedThisDeviceOnly`)
+  are not readable; synced items and standing-grant items are `AfterFirstUnlock`: readable by touchenv while locked
+  (so a grant approved from afar works) but only by a process that can run as the user, which a thief at the lock
+  screen cannot.
 - A running agent keeps grants in memory until they expire, but needs a requester process under the granted app.
 - If the thief knows the login password: local items need that password in the system dialog (touchenv's
   fallback), so the password alone opens them; synced items too. The secrets are then theirs. Revoke and rotate.

@@ -69,6 +69,9 @@ was closed before anyone answered)`, or `(stopped while the prompt was open, wit
 ended (a tool's time limit, Ctrl-C) during the prompt. And `no secret named X` now means just that: when the
 Keychain can't list the synced secrets (the Mac is locked, say), touchenv says `couldn't check whether X is
 stored: the Mac is locked, and the Keychain can't be read until it is unlocked (keychain error -25308)` instead.
+From 1.9.3 that only happens to a synced secret stored before 1.9.3 that touchenv hasn't seen with the Mac unlocked
+since: synced secrets are now readable after the first unlock since login, so a grant approved from afar works
+with the Mac locked. Any touchenv command run once with the Mac unlocked (`touchenv ls`, say) upgrades the old ones.
 
 ## One program, from now on: standing grants
 
@@ -206,6 +209,8 @@ touchenv grant --intent "deploy" --totp 123456 --for 8h --uses 20 API_KEY
   macOS behind Touch ID, and no code opens it. Naming one refuses the whole request. `touchenv ls` marks the synced
   ones; `touchenv sync NAME` makes a secret one (read [what that gives up](security.md#local-and-synced-secrets)
   first).
+- **Works with the Mac locked** (from 1.9.3; run any touchenv command once with the Mac unlocked to upgrade
+  synced secrets stored before that).
 - **Timed grants only**: not `get`, `run`, a standing grant, `set` or `export`. The grant is the ordinary timed one:
   for the app that asked and what it runs, ended by `touchenv lock`.
 - **Within the limits of setup.** A grant longer or with more uses than `--max-for` and `--max-uses` allowed is

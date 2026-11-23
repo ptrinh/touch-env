@@ -90,7 +90,7 @@ import LocalAuthenticationEmbeddedUI
 import OpenDirectory
 import Security
 
-let version = "1.9.2"
+let version = "1.9.3"
 let service = "touchenv"
 let usage = """
 touchenv \(version) — secrets in the macOS Keychain, every read behind Touch ID
@@ -1060,12 +1060,28 @@ func syncedNames() -> Set<String> {
     var out: CFTypeRef?
     syncedListingStatus = SecItemCopyMatching(q as CFDictionary, &out)
     guard syncedListingStatus == errSecSuccess, let found = out as? [[String: Any]] else { return [] }
+    upgradeSyncedAccessibility()
     return Set(found.compactMap { $0[kSecAttrAccount as String] as? String })
 }
 
-/// How the last syncedNames() went. Anything but errSecSuccess or errSecItemNotFound (the Mac locked: synced items are
-/// WhenUnlocked) means the list may be short, so a name missing from it is not known to be missing.
+/// How the last syncedNames() went. Anything but errSecSuccess or errSecItemNotFound (the Mac locked, with synced
+/// items stored before 1.9.3 still WhenUnlocked) means the list may be short, so a name missing from it is not known
+/// to be missing.
 var syncedListingStatus: OSStatus = errSecSuccess
+
+/// Synced items stored before 1.9.3 were WhenUnlocked: a grant approved from afar (--totp, --password over SSH) found
+/// them unreadable while the Mac was locked, which is when it is needed. They become AfterFirstUnlock, as new ones are,
+/// the first time touchenv lists them with the Mac unlocked. Once per process; errors are left for the next run.
+var syncedAccessibilityUpgraded = false
+func upgradeSyncedAccessibility() {
+    guard !syncedAccessibilityUpgraded else { return }
+    syncedAccessibilityUpgraded = true
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                            kSecAttrSynchronizable as String: true, kSecUseDataProtectionKeychain as String: true,
+                            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked]
+    let change: [String: Any] = [kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock]
+    _ = SecItemUpdate(q as CFDictionary, change as CFDictionary)
+}
 
 /// Whether the secret syncs through iCloud Keychain; nil when there is none. No Touch ID: a local item answers
 /// "interaction not allowed" when it exists.
@@ -1175,8 +1191,10 @@ func add(_ name: String, _ data: Data, sync: Bool, extra: [String: Any] = [:]) {
     q.removeValue(forKey: kSecUseAuthenticationContext as String)
     if sync {
         // iCloud Keychain won't take an access control: touchenv's own prompt guards every read instead.
+        // AfterFirstUnlock, not WhenUnlocked: a timed grant approved from afar (--totp, --password) must read it while
+        // the Mac is locked. Only this signed app's access group can, as for standing grants.
         q[kSecAttrSynchronizable as String] = true
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
     } else {
         q.removeValue(forKey: kSecAttrSynchronizable as String)
         // The system asks for Touch ID (or the Mac password) on every read, whoever reads.

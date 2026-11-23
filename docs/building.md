@@ -8,7 +8,7 @@ One Swift file, [`touchenv.swift`](../touchenv.swift), kept to one (with a secon
 in a `main.swift`).
 
 - **Local keys:** Data Protection keychain, `userPresence`, `WhenUnlockedThisDeviceOnly`. **Synced keys:**
-  `kSecAttrSynchronizable`, no access control (iCloud refuses one). Both sit in an access group only the signed app
+  `kSecAttrSynchronizable`, `AfterFirstUnlock`, no access control (iCloud refuses one). Both sit in an access group only the signed app
   holds.
 - **The prompt** embeds `LAAuthenticationView` (no Allow button). The Touch ID icon comes from macOS, with a copy in
   `Resources/`.
