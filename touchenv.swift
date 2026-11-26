@@ -26,6 +26,10 @@
 //   touchenv lock [--all]      end every approval now (5-minute ones and timed grants; --all: standing ones too)
 //   touchenv log [--since 7d] [--summary] [NAME ...]
 //                              the access log: every read, who asked, the outcome; never a value; kept two years
+//   touchenv doctor [--fix [--yes]] [PATH]
+//                              reads, asks for nothing: agents' instruction files without a touchenv rule, untracked
+//                              .env files with secret-looking values (file, line, name; never a value), bordercheck's
+//                              guard; --fix appends a marked rule block to the global instruction files (not via links)
 //   touchenv import --begin    on a new Mac: make a one-time receiving key, print it as tenv1:… and a check code
 //   touchenv export --to tenv1:… [NAME ...] > keys.tenv
 //                              on the old Mac: every secret (or those named) encrypted to that key, one Touch ID
@@ -135,6 +139,12 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
   touchenv log [--since 7d] [--summary] [NAME ...]
                                         the access log: every read, who asked, the outcome; never a value.
                                         Kept two years (touchenv log --help)
+  touchenv doctor [--fix [--yes]] [PATH]
+                                        what to fix so AI agents keep secrets out of files: their instructions
+                                        without a touchenv rule, untracked .env files with secret-looking values
+                                        (names and lines only, never a value), bordercheck's guard. --fix adds
+                                        the rule to ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md, asking first.
+                                        Exit 0: nothing to fix, 1: something to fix, 2: an error
 
   SSH keys (see touchenv ssh for more):
   touchenv ssh add [--sync] [NAME] KEYFILE
@@ -5387,6 +5397,325 @@ func sshCommand(_ arguments: [String], intent globalIntent: String?) -> Never {
     }
 }
 
+// MARK: - touchenv doctor
+//
+// Reads a machine and a repository and says what to fix: AI agents' instruction files without a touchenv rule,
+// untracked .env files holding secret-looking values (file, line and name only: never a value), and whether
+// bordercheck's guard is on. --fix appends one marked block to the global instruction files, never through a link.
+
+enum DoctorLevel: String { case ok, info, fix }
+struct DoctorItem { var level: DoctorLevel; var text: String; var hint: [String] = [] }
+
+let doctorBegin = "<!-- touchenv doctor: begin -->"
+let doctorEnd = "<!-- touchenv doctor: end -->"
+let doctorRule = """
+\(doctorBegin)
+## Secrets (touchenv)
+
+- Read secrets at run time with `touchenv run --intent "<why>" NAME -- <cmd>` (`NAME:file` for key files); store new ones with `touchenv set NAME`. Never print a value.
+- Do not create or copy real `.env` files into new worktrees, clones or scratch folders; copy only `.env*.example` templates.
+- After creating a worktree or setting up an environment, run `touchenv doctor` and fix what it finds.
+\(doctorEnd)
+"""
+
+func hasTouchenvRule(_ text: String) -> Bool {
+    text.contains(doctorBegin) || text.contains("touchenv run") || text.contains("touchenv set")
+}
+
+/// .env, .env.local, .envrc…, not templates (.env.example, .env.sample, .env.template and the like).
+func isEnvFileName(_ name: String) -> Bool {
+    guard name.hasPrefix(".env") else { return false }
+    let parts = name.lowercased().split(separator: ".")
+    return !parts.contains { ["example", "sample", "template"].contains($0) }
+}
+
+let secretNameParts: Set<String> = ["KEY", "APIKEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASS", "PWD", "CREDENTIAL",
+                                    "CREDENTIALS", "AUTH", "PRIVATE", "DSN", "SALT", "SIGNATURE"]
+let secretValuePatterns = [
+    "^sk-[A-Za-z0-9_-]{20,}", "^(sk|rk)_(live|test)_[A-Za-z0-9]{10,}", "^gh[pousr]_[A-Za-z0-9]{30,}", "^github_pat_",
+    "^xox[abporsc]-[A-Za-z0-9-]{10,}", "^AKIA[0-9A-Z]{16}$", "^AIza[0-9A-Za-z_-]{30,}", "^glpat-", "^npm_[A-Za-z0-9]{30,}",
+    "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+]
+
+/// Values that stand for a secret rather than being one: empty, a variable, a path, a template, a plain word.
+func isPlaceholder(_ value: String) -> Bool {
+    let v = value.lowercased()
+    if v.isEmpty || v.allSatisfy({ $0 == v.first }) || v.allSatisfy(\.isNumber) { return true }
+    if ["$", "<", "{{", "%(", "/", "./", "../", "~/"].contains(where: { v.hasPrefix($0) }) { return true }
+    if ["true", "false", "null", "none", "nil", "localhost"].contains(v) { return true }
+    return ["your", "changeme", "change_me", "change-me", "example", "placeholder", "xxxx", "****", "dummy", "replace",
+            "todo", "redacted", "fake", "sample"].contains { v.contains($0) }
+}
+
+/// A password inside a URL (scheme://user:password@host), when it is not a placeholder.
+func urlPassword(_ value: String) -> String? {
+    let pattern = try! NSRegularExpression(pattern: "^[A-Za-z][A-Za-z0-9+.-]*://[^/:@\\s]*:([^@\\s/]+)@")
+    let text = value as NSString
+    guard let match = pattern.firstMatch(in: value, range: NSRange(location: 0, length: text.length)) else { return nil }
+    return text.substring(with: match.range(at: 1))
+}
+
+func secretLooking(name: String, value: String) -> Bool {
+    if secretValuePatterns.contains(where: { value.range(of: $0, options: .regularExpression) != nil }) { return true }
+    if let password = urlPassword(value) { return !isPlaceholder(password) }
+    let parts = Set(name.uppercased().split(separator: "_").map(String.init))
+    guard !parts.isDisjoint(with: secretNameParts), parts.isDisjoint(with: ["PUBLIC", "PUBLISHABLE"]) else { return false }
+    if value.contains("://") { return false }
+    return value.count >= 8 && !isPlaceholder(value)
+}
+
+/// The variables in an env file's text whose values look like secrets: (1-based line, name). Values are not returned.
+func envSecrets(_ text: String) -> [(line: Int, name: String)] {
+    var found: [(line: Int, name: String)] = []
+    for (index, raw) in text.components(separatedBy: "\n").enumerated() {
+        var line = raw.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("#") { continue }
+        if line.hasPrefix("export ") { line = String(line.dropFirst(7)).trimmingCharacters(in: .whitespaces) }
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let name = line[..<eq].trimmingCharacters(in: .whitespaces)
+        guard validName(name) else { continue }
+        var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        if let quote = value.first, quote == "\"" || quote == "'" {
+            value.removeFirst()
+            if let end = value.firstIndex(of: quote) { value = String(value[..<end]) }
+        } else if let comment = value.range(of: " #") {
+            value = value[..<comment.lowerBound].trimmingCharacters(in: .whitespaces)
+        }
+        if secretLooking(name: name, value: value) { found.append((index + 1, name)) }
+    }
+    return found
+}
+
+let doctorSkippedFolders: Set<String> = ["node_modules", ".git", "vendor", ".venv", "venv", "Pods", ".build", "DerivedData"]
+let doctorMaxDepth = 8, doctorMaxEntries = 100_000, doctorMaxFileSize = 1 << 20
+
+/// The env files under `root` (relative paths, sorted), skipping dependency folders and virtualenvs; `complete` is false
+/// when the walk stopped at its limit.
+func findEnvFiles(root: String) -> (files: [String], complete: Bool) {
+    let rootURL = URL(fileURLWithPath: root).standardizedFileURL
+    let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
+    guard let walk = FileManager.default.enumerator(at: rootURL, includingPropertiesForKeys: keys) else { return ([], false) }
+    var files: [String] = [], seen = 0
+    while let url = walk.nextObject() as? URL {
+        seen += 1
+        if seen > doctorMaxEntries { return (files.sorted(), false) }
+        let values = try? url.resourceValues(forKeys: Set(keys))
+        let name = url.lastPathComponent
+        if values?.isDirectory == true {
+            if doctorSkippedFolders.contains(name) || walk.level >= doctorMaxDepth
+                || FileManager.default.fileExists(atPath: url.path + "/pyvenv.cfg") { walk.skipDescendants() }
+            continue
+        }
+        guard isEnvFileName(name) else { continue }
+        let target = values?.isSymbolicLink == true ? url.resolvingSymlinksInPath() : url
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: target.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              (attributes[.size] as? Int ?? .max) <= doctorMaxFileSize else { continue }
+        files.append(String(url.standardizedFileURL.path.dropFirst(rootURL.path.count + 1)))
+    }
+    return (files.sorted(), true)
+}
+
+/// Runs a program and returns its exit status and standard output, or nil when it can't be started.
+func captureOutput(_ executable: String, _ arguments: [String]) -> (status: Int32, output: String)? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    let out = Pipe()
+    process.standardOutput = out
+    process.standardError = FileHandle.nullDevice
+    process.standardInput = FileHandle.nullDevice
+    do { try process.run() } catch { return nil }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+
+func findInPath(_ name: String) -> String? {
+    let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+    return path.split(separator: ":").map { "\($0)/\(name)" }.first { FileManager.default.isExecutableFile(atPath: $0) }
+}
+
+func gitRoot(_ path: String) -> String? {
+    guard let git = findInPath("git"), let r = captureOutput(git, ["-C", path, "rev-parse", "--show-toplevel"]),
+          r.status == 0 else { return nil }
+    let root = r.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    return root.isEmpty ? nil : root
+}
+
+/// Whether git tracks the file, asked of the repository the file is in (a nested worktree answers for itself).
+func gitTracked(_ path: String) -> Bool {
+    guard let git = findInPath("git") else { return false }
+    let url = URL(fileURLWithPath: path)
+    let r = captureOutput(git, ["-C", url.deletingLastPathComponent().path, "ls-files", "--", url.lastPathComponent])
+    return r?.status == 0 && r?.output.isEmpty == false
+}
+
+enum GuardProbe { case missing, failed, output(String) }
+
+func bordercheckGuardStatus() -> GuardProbe {
+    guard let bordercheck = findInPath("bordercheck") else { return .missing }
+    guard let r = captureOutput(bordercheck, ["guard", "status"]), r.status == 0 else { return .failed }
+    return .output(r.output)
+}
+
+func guardItem(_ probe: GuardProbe) -> DoctorItem {
+    switch probe {
+    case .missing:
+        return DoctorItem(level: .info, text: "bordercheck is not installed: its guard stops Claude Code from sending or "
+                          + "printing secrets (https://github.com/ptrinh/bordercheck)")
+    case .failed:
+        return DoctorItem(level: .info, text: "bordercheck guard status didn't answer")
+    case .output(let text):
+        if text.hasPrefix("Off.") {
+            return DoctorItem(level: .fix, text: "bordercheck guard is off for Claude Code", hint: ["bordercheck guard install"])
+        }
+        if text.contains(" off (") {
+            return DoctorItem(level: .fix, text: "some of bordercheck guard's Claude Code hooks are off",
+                              hint: ["bordercheck guard install"])
+        }
+        return DoctorItem(level: .ok, text: "bordercheck guard is on for Claude Code")
+    }
+}
+
+struct AgentRules { var agent: String; var active: Bool; var covered: [String]; var target: String }
+
+/// Which agents' instruction files (global, and the repository's) hold a touchenv rule. An agent counts only when its
+/// home folder or one of the repository's files for it is there.
+func agentRules(home: String, repo: String) -> [AgentRules] {
+    let fm = FileManager.default
+    let rules = (try? fm.contentsOfDirectory(atPath: home + "/.claude/rules"))?.filter { $0.hasSuffix(".md") }.sorted() ?? []
+    let claude = [home + "/.claude/CLAUDE.md"] + rules.map { home + "/.claude/rules/" + $0 }
+    let codex = [home + "/.codex/AGENTS.md"]
+    func check(_ agent: String, homeFolder: String, global: [String], local: [String]) -> AgentRules {
+        let files = global + local.map { repo + "/" + $0 }.filter { !global.contains($0) }
+        let covered = files.filter { (try? String(contentsOfFile: $0, encoding: .utf8)).map(hasTouchenvRule) ?? false }
+        let active = fm.fileExists(atPath: home + "/" + homeFolder) || local.contains { fm.fileExists(atPath: repo + "/" + $0) }
+        return AgentRules(agent: agent, active: active, covered: covered, target: global[0])
+    }
+    return [check("Claude Code", homeFolder: ".claude", global: claude, local: ["CLAUDE.md", ".claude/CLAUDE.md"]),
+            check("Codex", homeFolder: ".codex", global: codex, local: ["AGENTS.md"])]
+}
+
+enum RuleAppend: Equatable { case added, already, link(String) }
+
+/// Appends the standard block to `path` (created if missing), once: a file that has it is left alone, and a link is
+/// never written through (another tool manages it).
+func appendRule(to path: String) throws -> RuleAppend {
+    let fm = FileManager.default
+    if let target = try? fm.destinationOfSymbolicLink(atPath: path) { return .link(target) }
+    let existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+    if existing.contains(doctorBegin) { return .already }
+    try fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+    let fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o644)
+    guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    let lead = existing.isEmpty ? "" : existing.hasSuffix("\n\n") ? "" : existing.hasSuffix("\n") ? "\n" : "\n\n"
+    try handle.write(contentsOf: Data((lead + doctorRule + "\n").utf8))
+    return .added
+}
+
+let doctorUsage = "usage: touchenv doctor [--fix [--yes]] [PATH]"
+
+func linkedRuleHint(_ path: String, _ target: String) -> [String] {
+    ["\(tilde(path)) is a link to \(tilde(target)), kept by another tool: add these lines where that file comes from:"]
+        + doctorRule.split(separator: "\n").map { "  " + $0 }
+}
+
+/// touchenv doctor: 0 when there is nothing to fix, 1 when there is, 2 on an error. `ask` confirms each change of --fix
+/// (not asked with `yes`).
+func doctor(path: String, fix: Bool, yes: Bool, home: String = homePath,
+            ask: (String) -> Bool = { confirm($0, yes: false) }, guardStatus: () -> GuardProbe = bordercheckGuardStatus,
+            say: (String) -> Void = { print($0) }) -> Int32 {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+        FileHandle.standardError.write(Data("touchenv: \(path) is not a folder\n".utf8))
+        return 2
+    }
+    let repo = gitRoot(path)
+    let root = repo ?? URL(fileURLWithPath: path).standardizedFileURL.path
+    var sections: [(title: String, items: [DoctorItem])] = []
+
+    var instructions: [DoctorItem] = []
+    for rules in agentRules(home: home, repo: root) {
+        if !rules.covered.isEmpty {
+            instructions.append(DoctorItem(level: .ok, text: "\(rules.agent): \(rules.covered.map(tilde).joined(separator: ", "))"))
+            continue
+        }
+        guard rules.active else {
+            instructions.append(DoctorItem(level: .info, text: "\(rules.agent): not set up here"))
+            continue
+        }
+        var item = DoctorItem(level: .fix, text: "\(rules.agent): no touchenv rule in its instructions",
+                              hint: ["touchenv doctor --fix adds one to \(tilde(rules.target))"])
+        if fix {
+            if let target = try? FileManager.default.destinationOfSymbolicLink(atPath: rules.target) {
+                item.hint = linkedRuleHint(rules.target, target)
+            } else if !yes && !ask("Add touchenv's rule for \(rules.agent) to \(tilde(rules.target))?") {
+                item.hint = ["not changed; touchenv doctor --fix adds it to \(tilde(rules.target))"]
+            } else {
+                do {
+                    switch try appendRule(to: rules.target) {
+                    case .added, .already:
+                        item = DoctorItem(level: .ok, text: "\(rules.agent): added touchenv's rule to \(tilde(rules.target))")
+                    case .link(let target):
+                        item.hint = linkedRuleHint(rules.target, target)
+                    }
+                } catch {
+                    item.hint = ["couldn't write \(tilde(rules.target)): \(error.localizedDescription)"]
+                }
+            }
+        }
+        instructions.append(item)
+    }
+    sections.append(("Agent instructions", instructions))
+
+    var secrets: [DoctorItem] = []
+    if repo == nil { secrets.append(DoctorItem(level: .info, text: "not a git repository: looked through the folder")) }
+    let (files, complete) = findEnvFiles(root: root)
+    var untracked = 0
+    for file in files {
+        let full = root + "/" + file
+        guard let text = try? String(contentsOfFile: full, encoding: .utf8) else { continue }
+        let found = envSecrets(text)
+        if found.isEmpty { continue }
+        let tracked = repo != nil && gitTracked(full)
+        for secret in found {
+            if tracked {
+                secrets.append(DoctorItem(level: .info, text: "\(file):\(secret.line) \(secret.name) (tracked by git: the repository's call)"))
+            } else {
+                untracked += 1
+                secrets.append(DoctorItem(level: .fix, text: "\(file):\(secret.line) \(secret.name)"))
+            }
+        }
+    }
+    if untracked > 0 {
+        secrets.append(DoctorItem(level: .info, text: "move each into touchenv, then delete its line:", hint: [
+            "touchenv set NAME                 (paste the value; a key file: touchenv set NAME < file)",
+            "touchenv run NAME -- <command>    (the command gets it in NAME; NAME:file for a key file)"]))
+    }
+    if !complete { secrets.append(DoctorItem(level: .info, text: "stopped after \(doctorMaxEntries) files: some were not looked at")) }
+    if secrets.allSatisfy({ $0.level != .fix }) {
+        secrets.insert(DoctorItem(level: .ok, text: "no secret-looking values in untracked .env files"), at: 0)
+    }
+    sections.append(("Plain-text secrets", secrets))
+    sections.append(("Guard", [guardItem(guardStatus())]))
+
+    say("touchenv doctor: \(tilde(root))")
+    for section in sections {
+        say("")
+        say(section.title)
+        for item in section.items {
+            say("  \(item.level.rawValue.padding(toLength: 5, withPad: " ", startingAt: 0)) \(item.text)")
+            for line in item.hint { say("        \(line)") }
+        }
+    }
+    let toFix = sections.flatMap(\.items).filter { $0.level == .fix }.count
+    say("")
+    say(toFix == 0 ? "Nothing to fix." : "\(toFix) to fix.")
+    return toFix == 0 ? 0 : 1
+}
+
 #if !TOUCHENV_TESTS
 
 var args = Array(CommandLine.arguments.dropFirst())
@@ -5408,6 +5737,7 @@ var grantCode: String?
 var totpMaxLength: TimeInterval?, totpMaxUses: Int?
 var noMask = false
 var logSince: TimeInterval?, logSummary = false
+var doctorFix = false, doctorYes = false
 while let option = args.first, option.hasPrefix("--"), option != "--" {
     if option == "--synced", command == "ls" {
         syncedOnly = true
@@ -5470,6 +5800,9 @@ while let option = args.first, option.hasPrefix("--"), option != "--" {
     } else if option == "--help", command == "log" {
         print(logUsage)
         exit(0)
+    } else if command == "doctor", option == "--fix" || option == "--yes" {
+        if option == "--fix" { doctorFix = true } else { doctorYes = true }
+        args.removeFirst()
     } else if option == "--intent", args.count > 1 {
         intent = cleanIntent(args[1])
         args.removeFirst(2)
@@ -6177,6 +6510,15 @@ case "log":
     for line in accessReport(readAccessLog(), since: logSince.map { now.addingTimeInterval(-$0) }, names: args, summary: logSummary) {
         print(line)
     }
+
+case "doctor":
+    if args.first == "--" { args.removeFirst() }
+    guard args.count <= 1, !(args.first?.hasPrefix("--") ?? false) else { die(doctorUsage, 2) }
+    if doctorYes && !doctorFix { die("touchenv: --yes goes with --fix", 2) }
+    if doctorFix && !doctorYes && isatty(0) == 0 {
+        die("touchenv: doctor --fix asks before each change: run it in a terminal, or add --yes", 2)
+    }
+    exit(doctor(path: args.first ?? FileManager.default.currentDirectoryPath, fix: doctorFix, yes: doctorYes))
 
 case "agent":
     Agent().run()

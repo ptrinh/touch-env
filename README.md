@@ -73,6 +73,23 @@ optional; without it the prompt says **No reason given** and shows the command.
 
 On a Mac, Claude Code also needs `"touchenv *"` in `sandbox.excludedCommands`.
 
+### Doctor: keep agents from writing keys back into files
+
+AI agents tend to put keys back into `.env` files, or copy them into each new worktree. `touchenv doctor [PATH]`
+(the current folder by default) reads, and asks for nothing:
+
+- whether Claude Code's and Codex's instructions (`~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`,
+  `~/.codex/AGENTS.md`, and the repository's `CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`) have a touchenv rule;
+- `.env` files that git doesn't track and that hold values that look like secrets: file, line and name, never a
+  value, with the `touchenv set` / `touchenv run` to use instead (tracked ones are listed, the repository's call;
+  templates such as `.env.example` are left alone);
+- whether [bordercheck](https://github.com/ptrinh/bordercheck)'s guard is on for Claude Code.
+
+`touchenv doctor --fix` adds a short rule (between `<!-- touchenv doctor: begin -->` and `end` markers, once) to `~/.claude/CLAUDE.md`
+and `~/.codex/AGENTS.md`, asking before each; `--yes` doesn't ask (needed without a terminal). A file that is a link,
+kept by another tool, is never written through: doctor shows the lines to add there. Exit status: 0 nothing to fix,
+1 something to fix, 2 an error. Mac only for now.
+
 ### For AI agents: ask once
 
 A long task (a release: notarize, then a store upload, then signing) that asks for Touch ID now and then, spread
