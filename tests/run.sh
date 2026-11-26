@@ -6,7 +6,8 @@
 # pseudo-terminal with a fake password check (tests/password-tests.swift); masking secrets in a command's output
 # (tests/mask-tests.swift); codes from an authenticator app for grant --totp, with the key in a file and the clock
 # given (tests/totp-tests.swift); what an AI agent is told after a prompt, why a prompt ended, and when a secret is
-# called missing (tests/hints-tests.swift).
+# called missing (tests/hints-tests.swift); touchenv doctor on a throwaway repository and home folder
+# (tests/doctor-tests.swift).
 #   tests/run.sh [--sshd]
 # Everything happens in a temp folder: no key, agent, config or known_hosts of yours is read or touched (ssh runs
 # with -F /dev/null and explicit files). touchenv.swift is compiled with -D TOUCHENV_TESTS, which leaves out its
@@ -15,7 +16,7 @@ set -e
 cd "$(dirname "$0")/.."
 work=$(mktemp -d "${TMPDIR:-/tmp}/touchenv-tests.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-mkdir "$work/ssh" "$work/standing" "$work/password" "$work/mask" "$work/totp" "$work/hints"
+mkdir "$work/ssh" "$work/standing" "$work/password" "$work/mask" "$work/totp" "$work/hints" "$work/doctor"
 cat touchenv.swift tests/ssh-tests.swift > "$work/ssh/main.swift"
 swiftc -O -D TOUCHENV_TESTS "$work/ssh/main.swift" -o "$work/ssh/ssh-tests"
 cat touchenv.swift tests/standing-tests.swift > "$work/standing/main.swift"
@@ -28,6 +29,8 @@ cat touchenv.swift tests/totp-tests.swift > "$work/totp/main.swift"
 swiftc -O -D TOUCHENV_TESTS "$work/totp/main.swift" -o "$work/totp/totp-tests"
 cat touchenv.swift tests/hints-tests.swift > "$work/hints/main.swift"
 swiftc -O -D TOUCHENV_TESTS "$work/hints/main.swift" -o "$work/hints/hints-tests"
+cat touchenv.swift tests/doctor-tests.swift > "$work/doctor/main.swift"
+swiftc -O -D TOUCHENV_TESTS "$work/doctor/main.swift" -o "$work/doctor/doctor-tests"
 echo "masking tests:"
 "$work/mask/mask-tests"
 echo "ssh tests:"
@@ -40,3 +43,5 @@ echo "grant --totp tests:"
 TOUCHENV_TEST_DIR="$work/totp" "$work/totp/totp-tests"
 echo "agent hint tests:"
 TOUCHENV_TEST_DIR="$work/hints" "$work/hints/hints-tests"
+echo "doctor tests:"
+TOUCHENV_TEST_DIR="$work/doctor" "$work/doctor/doctor-tests"

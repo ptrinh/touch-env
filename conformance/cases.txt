@@ -180,3 +180,8 @@ windows: 2 | err:usage: touchenv totp setup | totp status A
 2 | err:Full instructions and updates: https://github.com/ptrinh/touch-env |
 macos: 2 | err:touchenv: unknown option --synced | get --synced A
 windows: 2 | err:touchenv: unknown option --synced | ls --synced
+macos: 2 | err:touchenv: --yes goes with --fix | doctor --yes
+macos: 2 | err:usage: touchenv doctor | doctor a b
+macos: 2 | err:touchenv: unknown option --bogus | doctor --bogus
+macos: 2 | err:is not a folder | doctor /nonexistent-touchenv-doctor
+macos: 2 | err:run it in a terminal, or add --yes | doctor --fix

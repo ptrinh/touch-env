@@ -47,6 +47,9 @@ with each test file:
   temp folders left by a killed `run`.
 - `tests/password-tests.swift` drives the `--password` prompt on a pseudo-terminal with a fake password check, and
   the typed `set` prompt (a 2,000-character paste, line editing, Ctrl-D).
+- `tests/doctor-tests.swift` checks which values look like secrets, and runs `touchenv doctor` on a throwaway git
+  repository and home folder: tracked and untracked `.env` files, a linked `CLAUDE.md` left alone, `--fix --yes` run
+  twice, no value printed.
 
 None of it reads your keys, agent, config, Keychain or password, or shows a prompt.
 
