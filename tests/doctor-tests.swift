@@ -99,7 +99,7 @@ check(r.out.contains("info  .env:1 SHARED_TOKEN (tracked by git"), "a tracked .e
 check(!r.out.contains(".env.example") && !r.out.contains("node_modules") && !r.out.contains("venv"), "skipped: \(r.out)")
 check(!r.out.contains(openai) && !r.out.contains(github) && !r.out.contains("hunter2"), "no value printed")
 check(r.out.contains("fix   Claude Code: no touchenv rule") && r.out.contains("fix   Codex: no touchenv rule"), r.out)
-check(r.out.contains("fix   bordercheck guard is off"), "guard off")
+check(r.out.contains("info  bordercheck guard is off"), "guard off is info")
 check(!fm.fileExists(atPath: home + "/.codex/AGENTS.md"), "no --fix: nothing written")
 
 // --fix, answered no: nothing written.
@@ -134,7 +134,8 @@ try! fm.removeItem(atPath: repo + "/api/.env.production")
 r = run(fix: false, guardProbe: .output("In ~/.claude/settings.json:\n  prompt   on (x)\n  command  on (y)\n  output   on (z)\n"))
 check(r.status == 0 && r.out.hasSuffix("Nothing to fix."), r.out)
 check(run(fix: false, guardProbe: .missing).status == 0, "bordercheck missing is info")
-check(run(fix: false, guardProbe: .output("In x:\n  prompt   on (a)\n  command  off (b)\n")).status == 1, "a hook off")
+check(run(fix: false, guardProbe: .output("In x:\n  prompt   on (a)\n  command  off (b)\n")).status == 0, "a hook off is info")
+check(run(fix: false, guardProbe: .output("Off. bordercheck ...")).status == 0, "guard off: exit 0")
 
 // Errors, and a folder outside git.
 check(run(fix: false, path: testDir + "/nope").status == 2, "no such folder")

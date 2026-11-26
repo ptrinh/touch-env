@@ -142,8 +142,9 @@ touchenv \(version) — secrets in the macOS Keychain, every read behind Touch I
   touchenv doctor [--fix [--yes]] [PATH]
                                         what to fix so AI agents keep secrets out of files: their instructions
                                         without a touchenv rule, untracked .env files with secret-looking values
-                                        (names and lines only, never a value), bordercheck's guard. --fix adds
-                                        the rule to ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md, asking first.
+                                        (names and lines only, never a value), bordercheck's guard (info
+                                        only). --fix adds the rule to ~/.claude/CLAUDE.md and
+                                        ~/.codex/AGENTS.md, asking first.
                                         Exit 0: nothing to fix, 1: something to fix, 2: an error
 
   SSH keys (see touchenv ssh for more):
@@ -5568,10 +5569,11 @@ func guardItem(_ probe: GuardProbe) -> DoctorItem {
         return DoctorItem(level: .info, text: "bordercheck guard status didn't answer")
     case .output(let text):
         if text.hasPrefix("Off.") {
-            return DoctorItem(level: .fix, text: "bordercheck guard is off for Claude Code", hint: ["bordercheck guard install"])
+            return DoctorItem(level: .info, text: "bordercheck guard is off for Claude Code (optional)",
+                              hint: ["bordercheck guard install"])
         }
         if text.contains(" off (") {
-            return DoctorItem(level: .fix, text: "some of bordercheck guard's Claude Code hooks are off",
+            return DoctorItem(level: .info, text: "some of bordercheck guard's Claude Code hooks are off (optional)",
                               hint: ["bordercheck guard install"])
         }
         return DoctorItem(level: .ok, text: "bordercheck guard is on for Claude Code")

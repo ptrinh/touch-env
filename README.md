@@ -83,7 +83,8 @@ AI agents tend to put keys back into `.env` files, or copy them into each new wo
 - `.env` files that git doesn't track and that hold values that look like secrets: file, line and name, never a
   value, with the `touchenv set` / `touchenv run` to use instead (tracked ones are listed, the repository's call;
   templates such as `.env.example` are left alone);
-- whether [bordercheck](https://github.com/ptrinh/bordercheck)'s guard is on for Claude Code.
+- whether [bordercheck](https://github.com/ptrinh/bordercheck)'s guard is on for Claude Code (optional: off is
+  only mentioned, not something to fix).
 
 `touchenv doctor --fix` adds a short rule (between `<!-- touchenv doctor: begin -->` and `end` markers, once) to `~/.claude/CLAUDE.md`
 and `~/.codex/AGENTS.md`, asking before each; `--yes` doesn't ask (needed without a terminal). A file that is a link,
